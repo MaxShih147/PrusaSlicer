@@ -319,7 +319,7 @@ bool process_actions(Data& cli, const DynamicPrintConfig& print_config, std::vec
             return 1;
     }
 
-    if (actions.has("slice") || actions.has("export_gcode") || actions.has("export_sla")) {
+    if (actions.has("slice") || actions.has("export_gcode") || actions.has("export_sla") || actions.has("export_support_stl")) {
         PrinterTechnology       printer_technology = Preset::printer_technology(print_config);
         if (actions.has("export_gcode") && printer_technology == ptSLA) {
             boost::nowide::cerr << "error: cannot export G-code for an FFF configuration" << std::endl;
@@ -395,6 +395,27 @@ bool process_actions(Data& cli, const DynamicPrintConfig& print_config, std::vec
                     // We need to finalize the filename beforehand because the export function sets the filename inside the zip metadata
                     outfile_final = sla_print.print_statistics().finalize_output_path(outfile);
                     sla_print.export_print(outfile_final);
+
+                    // Export support mesh as STL if requested
+                    if (actions.has("export_support_stl")) {
+                        for (const SLAPrintObject* po : sla_print.objects()) {
+                            if (po->is_step_done(slaposSupportTree)) {
+                                TriangleMesh support_mesh = po->support_mesh();
+                                if (!support_mesh.empty()) {
+                                    boost::filesystem::path support_path(outfile_final);
+                                    std::string stem = support_path.stem().string();
+                                    support_path.replace_filename(stem + "_support.stl");
+                                    if (support_mesh.write_binary(support_path.string().c_str())) {
+                                        boost::nowide::cout << "Support mesh exported to " << support_path.string() << std::endl;
+                                    } else {
+                                        boost::nowide::cerr << "Failed to export support mesh to " << support_path.string() << std::endl;
+                                    }
+                                } else {
+                                    boost::nowide::cout << "No support mesh generated (supports may be disabled)" << std::endl;
+                                }
+                            }
+                        }
+                    }
                 }
                 if (outfile != outfile_final) {
                     if (Slic3r::rename_file(outfile, outfile_final)) {

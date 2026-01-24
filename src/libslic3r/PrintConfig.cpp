@@ -5878,6 +5878,12 @@ CLIActionsConfigDef::CLIActionsConfigDef()
     def->tooltip = L("Slice the model and export toolpaths as G-code.");
     def->cli = "export-gcode|gcode|g";
     def->set_default_value(new ConfigOptionBool(false));
+
+    def = this->add("export_support_stl", coBool);
+    def->label = L("Export Support STL");
+    def->tooltip = L("Export the support mesh as STL after SLA slicing.");
+    def->cli = "export-support-stl";
+    def->set_default_value(new ConfigOptionBool(false));
 }
 
 CLITransformConfigDef::CLITransformConfigDef()
