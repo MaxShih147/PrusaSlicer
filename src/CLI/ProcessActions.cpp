@@ -396,23 +396,49 @@ bool process_actions(Data& cli, const DynamicPrintConfig& print_config, std::vec
                     outfile_final = sla_print.print_statistics().finalize_output_path(outfile);
                     sla_print.export_print(outfile_final);
 
-                    // Export support mesh as STL if requested
+                    // Export support mesh (including pad) as STL if requested
                     if (actions.has("export_support_stl")) {
                         for (const SLAPrintObject* po : sla_print.objects()) {
+                            TriangleMesh combined_mesh;
+                            bool has_support = false;
+                            bool has_pad = false;
+
+                            // Get support mesh if available
                             if (po->is_step_done(slaposSupportTree)) {
                                 TriangleMesh support_mesh = po->support_mesh();
                                 if (!support_mesh.empty()) {
-                                    boost::filesystem::path support_path(outfile_final);
-                                    std::string stem = support_path.stem().string();
-                                    support_path.replace_filename(stem + "_support.stl");
-                                    if (support_mesh.write_binary(support_path.string().c_str())) {
-                                        boost::nowide::cout << "Support mesh exported to " << support_path.string() << std::endl;
-                                    } else {
-                                        boost::nowide::cerr << "Failed to export support mesh to " << support_path.string() << std::endl;
-                                    }
-                                } else {
-                                    boost::nowide::cout << "No support mesh generated (supports may be disabled)" << std::endl;
+                                    combined_mesh.merge(support_mesh);
+                                    has_support = true;
                                 }
+                            }
+
+                            // Get pad mesh if available
+                            if (po->is_step_done(slaposPad)) {
+                                TriangleMesh pad_mesh = po->pad_mesh();
+                                if (!pad_mesh.empty()) {
+                                    combined_mesh.merge(pad_mesh);
+                                    has_pad = true;
+                                }
+                            }
+
+                            if (!combined_mesh.empty()) {
+                                boost::filesystem::path support_path(outfile_final);
+                                std::string stem = support_path.stem().string();
+                                support_path.replace_filename(stem + "_support.stl");
+                                if (combined_mesh.write_binary(support_path.string().c_str())) {
+                                    boost::nowide::cout << "Support mesh exported to " << support_path.string();
+                                    if (has_support && has_pad)
+                                        boost::nowide::cout << " (includes supports and pad)";
+                                    else if (has_support)
+                                        boost::nowide::cout << " (supports only)";
+                                    else if (has_pad)
+                                        boost::nowide::cout << " (pad only)";
+                                    boost::nowide::cout << std::endl;
+                                } else {
+                                    boost::nowide::cerr << "Failed to export support mesh to " << support_path.string() << std::endl;
+                                }
+                            } else {
+                                boost::nowide::cout << "No support/pad mesh generated" << std::endl;
                             }
                         }
                     }
