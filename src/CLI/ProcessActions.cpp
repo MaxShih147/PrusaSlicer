@@ -35,6 +35,8 @@
 #include "libslic3r/PNGReadWrite.hpp"
 #include "libslic3r/MultipleBeds.hpp"
 #include "libslic3r/BuildVolume.hpp"
+#include "libslic3r/SLA/Hollowing.hpp"
+#include "libslic3r/TriangleMesh.hpp"
 
 #include "CLI/CLI.hpp"
 #include "CLI/ProfilesSharingUtils.hpp"
@@ -317,6 +319,75 @@ bool process_actions(Data& cli, const DynamicPrintConfig& print_config, std::vec
     if (actions.has("export_3mf")) {
         if (!export_models(models, IO::TMF, output))
             return 1;
+    }
+
+    if (actions.has("export_hollow_stl")) {
+        if (models.empty()) {
+            boost::nowide::cerr << "error: cannot hollow empty models." << std::endl;
+            return 1;
+        }
+
+        for (Model& model : models) {
+            model.add_default_instances();
+            for (const ModelObject* mo : model.objects) {
+                // Get the mesh from the first volume (simplified - assumes single volume)
+                if (mo->volumes.empty()) {
+                    boost::nowide::cerr << "error: model object has no volumes." << std::endl;
+                    return 1;
+                }
+
+                TriangleMesh mesh = mo->volumes.front()->mesh();
+                if (mesh.empty()) {
+                    boost::nowide::cerr << "error: mesh is empty." << std::endl;
+                    return 1;
+                }
+
+                // Get hollowing parameters from config
+                sla::HollowingConfig hc;
+                if (print_config.has("hollowing_min_thickness"))
+                    hc.min_thickness = print_config.opt_float("hollowing_min_thickness");
+                if (print_config.has("hollowing_quality"))
+                    hc.quality = print_config.opt_float("hollowing_quality");
+                if (print_config.has("hollowing_closing_distance"))
+                    hc.closing_distance = print_config.opt_float("hollowing_closing_distance");
+
+                boost::nowide::cout << "Generating hollow interior (thickness=" << hc.min_thickness
+                                   << ", quality=" << hc.quality
+                                   << ", closing=" << hc.closing_distance << ")..." << std::endl;
+
+                // Generate the interior mesh
+                auto interior = sla::generate_interior(mesh.its, hc);
+                if (!interior) {
+                    boost::nowide::cerr << "error: failed to generate interior mesh." << std::endl;
+                    return 1;
+                }
+
+                // Get the interior mesh
+                indexed_triangle_set interior_its = sla::get_mesh(*interior);
+                if (interior_its.indices.empty()) {
+                    boost::nowide::cerr << "error: interior mesh is empty. Try reducing wall thickness for smaller models." << std::endl;
+                    return 1;
+                }
+
+                // Flip normals for proper visualization (interior faces outward in PrusaSlicer)
+                sla::swap_normals(interior_its);
+
+                // Determine output path
+                std::string outpath = output;
+                if (outpath.empty()) {
+                    boost::filesystem::path input_path(mo->input_file.empty() ? "model" : mo->input_file);
+                    outpath = input_path.stem().string() + "_hollow.stl";
+                }
+
+                // Export the interior mesh
+                if (!its_write_stl_binary(outpath.c_str(), "hollow_interior", interior_its)) {
+                    boost::nowide::cerr << "error: failed to write interior mesh to " << outpath << std::endl;
+                    return 1;
+                }
+
+                boost::nowide::cout << "Hollow interior mesh exported to " << outpath << std::endl;
+            }
+        }
     }
 
     if (actions.has("slice") || actions.has("export_gcode") || actions.has("export_sla") || actions.has("export_support_stl")) {

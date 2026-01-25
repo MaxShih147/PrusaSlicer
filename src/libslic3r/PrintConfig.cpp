@@ -5884,6 +5884,12 @@ CLIActionsConfigDef::CLIActionsConfigDef()
     def->tooltip = L("Export the support mesh as STL after SLA slicing.");
     def->cli = "export-support-stl";
     def->set_default_value(new ConfigOptionBool(false));
+
+    def = this->add("export_hollow_stl", coBool);
+    def->label = L("Export Hollow Interior STL");
+    def->tooltip = L("Generate hollow interior mesh and export as STL.");
+    def->cli = "export-hollow-stl";
+    def->set_default_value(new ConfigOptionBool(false));
 }
 
 CLITransformConfigDef::CLITransformConfigDef()
