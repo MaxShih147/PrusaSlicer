@@ -702,7 +702,7 @@ template<bool NULLABLE = false>
 class ConfigOptionFloatTempl : public ConfigOptionSingle<double, NULLABLE>
 {
 public:
-    ConfigOptionFloatTempl() : ConfigOptionSingle<double, NULLABLE>(0) {}
+    ConfigOptionFloatTempl() : ConfigOptionSingle<double, NULLABLE>(NULLABLE ? std::numeric_limits<double>::quiet_NaN() : 0) {}
     explicit ConfigOptionFloatTempl(double _value) : ConfigOptionSingle<double, NULLABLE>(_value) {}
 
     static ConfigOptionType static_type() { return coFloat; }

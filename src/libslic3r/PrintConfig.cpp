@@ -4861,8 +4861,8 @@ void PrintConfigDef::init_sla_params()
         def->max  = it_opt->second.max;
         def->mode = it_opt->second.mode;
         switch (def->type) {
-        case coFloat: def->set_default_value(new ConfigOptionFloatNullable{ it_opt->second.default_value->getFloat() }); break;
-        case coInt:   def->set_default_value(new ConfigOptionIntNullable{ it_opt->second.default_value->getInt() }); break;
+        case coFloat: def->set_default_value(new ConfigOptionFloatNullable(ConfigOptionFloatNullable::nil_value())); break;
+        case coInt:   def->set_default_value(new ConfigOptionIntNullable(ConfigOptionIntNullable::nil_value())); break;
         default: assert(false);
         }
     }
