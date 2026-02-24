@@ -328,6 +328,13 @@ static const t_config_enum_values s_keys_map_CoolingSlowdownLogicType {
 };
 CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(CoolingSlowdownLogicType)
 
+static const t_config_enum_values s_keys_map_AntiAliasingLevel {
+    { "0",    int(AntiAliasingLevel::AA_2x) },
+    { "1",    int(AntiAliasingLevel::AA_4x) },
+    { "2",    int(AntiAliasingLevel::AA_8x) }
+};
+CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(AntiAliasingLevel)
+
 static void assign_printer_technology_to_unknown(t_optiondef_map &options, PrinterTechnology printer_technology)
 {
     for (std::pair<const t_config_option_key, ConfigOptionDef> &kvp : options)
@@ -4346,6 +4353,39 @@ void PrintConfigDef::init_sla_params()
     def->min = 0;
     def->mode = comExpert;
     def->set_default_value(new ConfigOptionFloat(10.));
+
+    def = this->add("anti_aliasing", coBool);
+    def->label = L("Anti-aliasing");
+    def->tooltip = L("Enable anti-aliasing for the rasterizer");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionBool(true));
+
+    def = this->add("anti_aliasing_level", coEnum);
+    def->label = L("Anti-aliasing level");
+    def->tooltip = L("Level of anti-aliasing");
+    def->set_enum<AntiAliasingLevel>({
+        { "0", L("2x") },
+        { "1", L("4x") },
+        { "2", L("8x") }
+    });
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionEnum<AntiAliasingLevel>(AntiAliasingLevel::AA_8x));
+
+    def = this->add("gray_level", coInt);
+    def->label = L("Gray level");
+    def->tooltip = L("Controls the brightness gain of anti-aliased pixels. 0: Faithful AA (Smoth/Darker), 8: High Brightness (Hard/Brighter).");
+    def->min = 0;
+    def->max = 8;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionInt(0));
+
+    def = this->add("blur", coInt);
+    def->label = L("Blur");
+    def->tooltip = L("Apply Gaussian blur to the rasterized layer. 0 to disable.");
+    def->min = 0;
+    def->max = 10;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionInt(0));
 
     def = this->add("area_fill", coFloat);
     def->label = L("Area fill threshold");

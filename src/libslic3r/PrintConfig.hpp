@@ -245,6 +245,13 @@ enum class CoolingSlowdownLogicType
     Proportional,
 };
 
+enum class AntiAliasingLevel
+{
+    AA_2x,
+    AA_4x,
+    AA_8x,
+};
+
 #define CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(NAME) \
     template<> const t_config_enum_names& ConfigOptionEnum<NAME>::get_enum_names(); \
     template<> const t_config_enum_values& ConfigOptionEnum<NAME>::get_enum_values();
@@ -276,6 +283,7 @@ CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(PerimeterGeneratorType)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(TopOnePerimeterType)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(EnsureVerticalShellThickness)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(CoolingSlowdownLogicType)
+CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(AntiAliasingLevel)
 
 #undef CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS
 
@@ -1310,6 +1318,10 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionFloat,                      fast_tilt_time))
     ((ConfigOptionFloat,                      slow_tilt_time))
     ((ConfigOptionFloat,                      high_viscosity_tilt_time))
+    ((ConfigOptionBool,                       anti_aliasing))
+    ((ConfigOptionEnum<AntiAliasingLevel>,    anti_aliasing_level))
+    ((ConfigOptionInt,                        gray_level))
+    ((ConfigOptionInt,                        blur))
 //    ((ConfigOptionFloat,                      area_fill))
     ((ConfigOptionFloat,                      min_exposure_time))
     ((ConfigOptionFloat,                      max_exposure_time))

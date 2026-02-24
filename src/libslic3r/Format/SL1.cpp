@@ -16,6 +16,10 @@
 #include "libslic3r/MTUtils.hpp"
 #include "libslic3r/PrintConfig.hpp"
 
+#include "agg/agg_rendering_buffer.h"
+#include "agg/agg_pixfmt_gray.h"
+#include "agg/agg_blur.h"
+
 #include "libslic3r/miniz_extension.hpp" // IWYU pragma: keep
 #include <LocalesUtils.hpp>
 #include "libslic3r/GCode/ThumbnailData.hpp"
@@ -28,7 +32,6 @@
 #include "libslic3r/MarchingSquares.hpp"
 #include "libslic3r/PNGReadWrite.hpp"
 #include "libslic3r/ClipperUtils.hpp"
-#include "libslic3r/Execution/ExecutionTBB.hpp"
 
 #include "libslic3r/SLA/RasterBase.hpp"
 
@@ -272,13 +275,100 @@ std::unique_ptr<sla::RasterBase> SL1Archive::create_raster() const
     sla::RasterBase::Trafo tr{orientation, mirror};
 
     double gamma = m_cfg.gamma_correction.getFloat();
+    if (! m_cfg.anti_aliasing.getBool())
+        gamma = 0.;
 
     return sla::create_raster_grayscale_aa(res, pxdim, gamma, tr);
 }
 
 sla::RasterEncoder SL1Archive::get_encoder() const
 {
-    return sla::PNGRasterEncoder{};
+    // Optimization 1: If AA is disabled, skip post-processing entirely
+    // When AA is disabled, create_raster uses gamma=0 which produces binary output 
+    // consistent with "no AA".
+    if (! m_cfg.anti_aliasing.getBool())
+        return sla::PNGRasterEncoder{};
+
+    int  aa_level_cfg  = m_cfg.anti_aliasing_level.getInt();
+    // Map config 0, 1, 2 to 2x, 4x, 8x. 
+    int  anti_aliasing_level = 1 << (aa_level_cfg + 1);
+    
+    int  gray_level    = m_cfg.gray_level.getInt();
+    int  blur_config   = m_cfg.blur.getInt();
+
+    return [anti_aliasing_level, gray_level, blur_config]
+           (const void *ptr, size_t w, size_t h, size_t num_components) -> sla::EncodedRaster 
+    {
+        // Copy buffer to modify it
+        size_t bufsize = w * h * num_components;
+        std::vector<uint8_t> buf(static_cast<const uint8_t*>(ptr), static_cast<const uint8_t*>(ptr) + bufsize);
+        
+        double gray_interval = 255.0 / double(anti_aliasing_level);
+        const int init_val = 32 * gray_level;
+        
+        // Optimization 2: Fast skip for empty blocks
+        // Using uint64_t to check 8 bytes at a time
+        size_t i = 0;
+        
+        // Align to 8 bytes if possible (though vector data is usually aligned)
+        // We process 8 bytes at a time
+        const size_t output_len_aligned = bufsize - (bufsize % 8);
+
+        for (; i < output_len_aligned; i += 8) {
+            uint64_t* chunk = reinterpret_cast<uint64_t*>(&buf[i]);
+            if (*chunk == 0) continue; // Skip 8 empty pixels
+            if (*chunk == 0xFFFFFFFFFFFFFFFFULL) continue; // Skip 8 full white pixels (unlikely in AA but possible)
+
+            // Inner loop for these 8 bytes
+            for (size_t j = 0; j < 8; ++j) {
+                uint8_t& c = buf[i + j];
+                if (c == 0 || c == 255) continue;
+
+                if (gray_level == 8) {
+                    c = 255;
+                } else {
+                    // anti-aliasing quantization
+                    // (Simplification: AA level always > 1 here due to check above)
+                    double g = (double)c;
+                    c = (uint8_t)((unsigned((g / gray_interval) + 0.5) / (double)anti_aliasing_level * 255.0) + 0.5);
+                    
+                    // gray level brightness boost
+                    if (gray_level > 0) {
+                        c = (uint8_t)((double((256 - init_val) * ((unsigned)c + 1)) / 256.0 + init_val - 1) + 0.5);
+                    }
+                }
+            }
+        }
+        
+        // Process remaining bytes
+        for (; i < bufsize; ++i) {
+            uint8_t& c = buf[i];
+            if (c == 0 || c == 255) continue;
+            
+            if (gray_level == 8) {
+                c = 255;
+            } else {
+                double g = (double)c;
+                c = (uint8_t)((unsigned((g / gray_interval) + 0.5) / (double)anti_aliasing_level * 255.0) + 0.5);
+                
+                if (gray_level > 0) {
+                    c = (uint8_t)((double((256 - init_val) * ((unsigned)c + 1)) / 256.0 + init_val - 1) + 0.5);
+                }
+            }
+        }
+        
+        // Blur via AGG stack blur (radius = blur_config + 1, matching previous Gaussian sigma)
+        if (blur_config > 0) {
+            const unsigned radius = static_cast<unsigned>(blur_config + 1);
+            agg::rendering_buffer rbuf(buf.data(), static_cast<unsigned>(w),
+                                       static_cast<unsigned>(h),
+                                       static_cast<int>(w * num_components));
+            agg::pixfmt_gray8 pixf(rbuf);
+            agg::stack_blur_gray8(pixf, radius, radius);
+        }
+        
+        return sla::PNGRasterEncoder{}(buf.data(), w, h, num_components);
+    };
 }
 
 static void write_thumbnail(Zipper &zipper, const ThumbnailData &data)
