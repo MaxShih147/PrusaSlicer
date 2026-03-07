@@ -24,12 +24,17 @@ class SLAPrinterConfig;
 class SLAArchiveWriter {
 protected:
     std::vector<sla::EncodedRaster> m_layers;
+    std::vector<sla::EncodedRaster> m_preview_layers;
+    double m_preview_scale = 0.;  // 0 = disabled
 
     virtual std::unique_ptr<sla::RasterBase> create_raster() const = 0;
     virtual sla::RasterEncoder get_encoder() const = 0;
 
 public:
     virtual ~SLAArchiveWriter() = default;
+
+    void set_preview_scale(double s) { m_preview_scale = s; }
+    double preview_scale() const { return m_preview_scale; }
 
     // Fn have to be thread safe: void(sla::RasterBase& raster, size_t lyrid);
     template<class Fn, class CancelFn, class EP = ExecutionTBB>
@@ -40,6 +45,8 @@ public:
         const EP & ep       = {})
     {
         m_layers.resize(layer_num);
+        if (m_preview_scale > 0.)
+            m_preview_layers.resize(layer_num);
         execution::for_each(
             ep, size_t(0), m_layers.size(),
             [this, &drawfn, &cancelfn](size_t idx) {
@@ -49,6 +56,8 @@ public:
                 auto                rst = create_raster();
                 drawfn(*rst, idx);
                 enc = rst->encode(get_encoder());
+                if (m_preview_scale > 0.)
+                    m_preview_layers[idx] = rst->encode(sla::PNGPreviewEncoder{m_preview_scale});
             },
             execution::max_concurrency(ep));
     }
@@ -58,6 +67,10 @@ public:
                               const SLAPrint       &print,
                               const ThumbnailsList &thumbnails,
                               const std::string    &projectname = "") = 0;
+
+    // Export preview layers into a separate ZIP file.
+    void export_preview_zip(const std::string &fname,
+                            const std::string &projectname = "");
 
     // Factory method to create an archiver instance
     static std::unique_ptr<SLAArchiveWriter> create(

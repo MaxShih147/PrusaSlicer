@@ -5930,6 +5930,12 @@ CLIActionsConfigDef::CLIActionsConfigDef()
     def->tooltip = L("Generate hollow interior mesh and export as STL.");
     def->cli = "export-hollow-stl";
     def->set_default_value(new ConfigOptionBool(false));
+
+    def = this->add("export_preview_pngs", coFloat);
+    def->label = L("Export Preview PNGs");
+    def->tooltip = L("Generate scaled preview PNGs in a separate ZIP. Value is the scale factor (e.g. 0.25 for 1/4 size). -1 = disabled.");
+    def->cli = "export-preview-pngs";
+    def->set_default_value(new ConfigOptionFloat(-1));
 }
 
 CLITransformConfigDef::CLITransformConfigDef()

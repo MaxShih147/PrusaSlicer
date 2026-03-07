@@ -111,6 +111,12 @@ struct PNGRasterEncoder {
     EncodedRaster operator()(const void *ptr, size_t w, size_t h, size_t num_components);
 };
 
+struct PNGPreviewEncoder {
+    double scale;  // e.g. 0.25 = 1/4 size
+    explicit PNGPreviewEncoder(double s = 0.25) : scale(s) {}
+    EncodedRaster operator()(const void *ptr, size_t w, size_t h, size_t num_components);
+};
+
 struct PPMRasterEncoder {
     EncodedRaster operator()(const void *ptr, size_t w, size_t h, size_t num_components);
 };

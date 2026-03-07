@@ -390,7 +390,7 @@ bool process_actions(Data& cli, const DynamicPrintConfig& print_config, std::vec
         }
     }
 
-    if (actions.has("slice") || actions.has("export_gcode") || actions.has("export_sla") || actions.has("export_support_stl")) {
+    if (actions.has("slice") || actions.has("export_gcode") || actions.has("export_sla") || actions.has("export_support_stl") || actions.has("export_preview_pngs")) {
         PrinterTechnology       printer_technology = Preset::printer_technology(print_config);
         if (actions.has("export_gcode") && printer_technology == ptSLA) {
             boost::nowide::cerr << "error: cannot export G-code for an FFF configuration" << std::endl;
@@ -441,6 +441,12 @@ bool process_actions(Data& cli, const DynamicPrintConfig& print_config, std::vec
                 print->apply(model, print_config);
             });
 
+            if (actions.has("export_preview_pngs") && printer_technology == ptSLA) {
+                double scale = actions.opt_float("export_preview_pngs");
+                if (scale > 0.)
+                    sla_print.set_preview_scale(scale);
+            }
+
             std::string err = print->validate();
             if (!err.empty()) {
                 boost::nowide::cerr << err << std::endl;
@@ -466,6 +472,14 @@ bool process_actions(Data& cli, const DynamicPrintConfig& print_config, std::vec
                     // We need to finalize the filename beforehand because the export function sets the filename inside the zip metadata
                     outfile_final = sla_print.print_statistics().finalize_output_path(outfile);
                     sla_print.export_print(outfile_final);
+
+                    // Export preview PNGs ZIP if requested
+                    if (actions.has("export_preview_pngs") && actions.opt_float("export_preview_pngs") > 0.) {
+                        auto preview_path = boost::filesystem::path(outfile_final);
+                        preview_path.replace_filename(preview_path.stem().string() + "_preview.zip");
+                        sla_print.export_preview_zip(preview_path.string());
+                        boost::nowide::cout << "Preview ZIP exported to " << preview_path.string() << std::endl;
+                    }
 
                     // Export support mesh (including pad) as STL if requested
                     if (actions.has("export_support_stl")) {
