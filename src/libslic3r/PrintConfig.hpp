@@ -1100,8 +1100,11 @@ PRINT_CONFIG_CLASS_DEFINE(
     // The minimum distance of the pillar base from the model in mm.
     ((ConfigOptionFloat, support_base_safety_distance)) /*= 1.0*/
 
+    // Overhang angle threshold: support will not be placed on surfaces steeper than this angle (from horizontal).
+    ((ConfigOptionFloat, support_critical_angle))/*= 90*/
+
     // The default angle for connecting support sticks and junctions.
-    ((ConfigOptionFloat, support_critical_angle))/*= 45*/
+    ((ConfigOptionFloat, support_bracing_angle))/*= 45*/
 
     // The max length of a bridge in mm
     ((ConfigOptionFloat, support_max_bridge_length))/*= 15.0*/
@@ -1154,8 +1157,11 @@ PRINT_CONFIG_CLASS_DEFINE(
     // The minimum distance of the pillar base from the model in mm.
     ((ConfigOptionFloat, branchingsupport_base_safety_distance)) /*= 1.0*/
 
+    // Overhang angle threshold: support will not be placed on surfaces steeper than this angle (from horizontal).
+    ((ConfigOptionFloat, branchingsupport_critical_angle))/*= 90*/
+
     // The default angle for connecting support sticks and junctions.
-    ((ConfigOptionFloat, branchingsupport_critical_angle))/*= 45*/
+    ((ConfigOptionFloat, branchingsupport_bracing_angle))/*= 45*/
 
     // The max length of a bridge in mm
     ((ConfigOptionFloat, branchingsupport_max_bridge_length))/*= 15.0*/

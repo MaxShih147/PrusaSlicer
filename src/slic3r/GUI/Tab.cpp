@@ -5831,6 +5831,7 @@ void TabSLAPrint::build_sla_support_params(const std::vector<SamePair<std::strin
 
     optgroup = page->new_optgroup(L("Connection of the support sticks and junctions"));
     add_options_into_line(optgroup, prefixes, "support_critical_angle");
+    add_options_into_line(optgroup, prefixes, "support_bracing_angle");
     add_options_into_line(optgroup, prefixes, "support_max_bridge_length");
     add_options_into_line(optgroup, prefixes, "support_max_pillar_link_distance");
 }

@@ -454,6 +454,7 @@ void ConfigManipulation::toggle_print_sla_options(DynamicPrintConfig* config)
     toggle_field("support_base_height", supports_en && is_default_tree);
     toggle_field("support_base_safety_distance", supports_en && is_default_tree);
     toggle_field("support_critical_angle", supports_en && is_default_tree);
+    toggle_field("support_bracing_angle", supports_en && is_default_tree);
     toggle_field("support_max_bridge_length", supports_en && is_default_tree);
     toggle_field("support_enforcers_only", supports_en);
     toggle_field("support_max_pillar_link_distance", supports_en && is_default_tree);
@@ -472,6 +473,7 @@ void ConfigManipulation::toggle_print_sla_options(DynamicPrintConfig* config)
     toggle_field("branchingsupport_base_height", supports_en && is_branching_tree);
     toggle_field("branchingsupport_base_safety_distance", supports_en && is_branching_tree);
     toggle_field("branchingsupport_critical_angle", supports_en && is_branching_tree);
+    toggle_field("branchingsupport_bracing_angle", supports_en && is_branching_tree);
     toggle_field("branchingsupport_max_bridge_length", supports_en && is_branching_tree);
     toggle_field("branchingsupport_max_pillar_link_distance", false);
     toggle_field("branchingsupport_pillar_widening_factor", supports_en && is_branching_tree);

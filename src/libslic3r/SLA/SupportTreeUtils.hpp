@@ -344,6 +344,9 @@ bool optimize_pinhead_placement(Ex                     policy,
     // skip if the tilt is not sane
     if (polar < PI - m.cfg.normal_cutoff_angle) return false;
 
+    // skip if the surface is not steep enough to need support
+    if (polar < M_PI / 2.0 + m.cfg.overhang_angle_threshold) return false;
+
     // We saturate the polar angle to 3pi/4
     polar = std::max(polar, PI - m.cfg.bridge_slope);
 
