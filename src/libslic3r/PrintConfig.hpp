@@ -704,6 +704,21 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionInt,                 interlocking_beam_layer_count))
     ((ConfigOptionInt,                 interlocking_depth))
     ((ConfigOptionInt,                 interlocking_boundary_avoidance))
+
+    // SLA compensation params: declared here (PrintObjectConfig/FDM tier) rather than
+    // SLAPrintObjectConfig to avoid patching the SLA state-invalidation switch.
+    // CLI-only usage; changes detected via manual cache in SLAPrint::apply().
+    ((ConfigOptionBool,                shrinkage_compensation))
+    ((ConfigOptionFloat,               shrinkage_compensation_x))
+    ((ConfigOptionFloat,               shrinkage_compensation_y))
+    ((ConfigOptionFloat,               shrinkage_compensation_z))
+    ((ConfigOptionBool,                tolerance_compensation))
+    ((ConfigOptionFloat,               tolerance_compensation_a))
+    ((ConfigOptionFloat,               tolerance_compensation_b))
+    ((ConfigOptionBool,                bottom_tolerance_compensation))
+    ((ConfigOptionFloat,               bottom_tolerance_compensation_a))
+    ((ConfigOptionFloat,               bottom_tolerance_compensation_b))
+    ((ConfigOptionInt,                 bottom_layer_count))
 )
 
 PRINT_CONFIG_CLASS_DEFINE(

@@ -607,6 +607,23 @@ private:
     SLAMaterialConfig               m_material_config;
     SLAPrintObjectConfig            m_default_object_config;
 
+    // Shrinkage compensation values from the process preset (percentage, 100 = no change).
+    // Stored separately because they live in PrintObjectConfig (FDM), not SLAPrintObjectConfig.
+    bool   m_shrinkage_compensation        = false;
+    double m_shrinkage_compensation_x      = 100.0;
+    double m_shrinkage_compensation_y      = 100.0;
+    double m_shrinkage_compensation_z      = 100.0;
+
+    // Tolerance compensation (inner/outer diameter) from process preset.
+    // Stored separately because they live in PrintObjectConfig (FDM), not SLAPrintObjectConfig.
+    bool   m_tolerance_compensation            = false;
+    double m_tolerance_compensation_a          = 0.0;
+    double m_tolerance_compensation_b          = 0.0;
+    bool   m_bottom_tolerance_compensation     = false;
+    double m_bottom_tolerance_compensation_a   = 0.0;
+    double m_bottom_tolerance_compensation_b   = 0.0;
+    int    m_bottom_layer_count                = 6;
+
     PrintObjects                    m_objects;
 
     // Ready-made data for rasterization.

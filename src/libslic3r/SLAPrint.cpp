@@ -170,10 +170,22 @@ void SLAPrint::clear()
 // Transformation without rotation around Z and without a shift by X and Y.
 Transform3d SLAPrint::sla_trafo(const ModelObject &model_object) const
 {
+    Vec3d corr = this->relative_correction();
+
+    // Apply shrinkage compensation from process preset (cached in m_shrinkage_compensation*).
+    if (m_shrinkage_compensation) {
+        corr.x() *= m_shrinkage_compensation_x / 100.0;
+        corr.y() *= m_shrinkage_compensation_y / 100.0;
+        corr.z() *= m_shrinkage_compensation_z / 100.0;
+        BOOST_LOG_TRIVIAL(info) << "[shrinkage] applying x=" << m_shrinkage_compensation_x
+                                << " y=" << m_shrinkage_compensation_y
+                                << " z=" << m_shrinkage_compensation_z;
+    }
+
     ModelInstance &model_instance = *model_object.instances.front();
     auto trafo = Transform3d::Identity();
-    trafo.translate(Vec3d{ 0., 0., model_instance.get_offset().z() * this->relative_correction().z() });
-    trafo.linear() = Eigen::DiagonalMatrix<double, 3, 3>(this->relative_correction()) * model_instance.get_matrix().linear();
+    trafo.translate(Vec3d{ 0., 0., model_instance.get_offset().z() * corr.z() });
+    trafo.linear() = Eigen::DiagonalMatrix<double, 3, 3>(corr) * model_instance.get_matrix().linear();
     if (model_instance.is_left_handed())
         trafo = Eigen::Scaling(Vec3d(-1., 1., 1.)) * trafo;
     return trafo;
@@ -331,6 +343,65 @@ SLAPrint::ApplyStatus SLAPrint::apply(const Model &model, DynamicPrintConfig con
     m_material_config.apply_only(config, material_diff, true);
     // Handle changes to object config defaults
     m_default_object_config.apply_only(config, object_diff, true);
+
+    // Shrinkage compensation lives in PrintObjectConfig (FDM), not SLAPrintObjectConfig,
+    // so we read it from the full DynamicPrintConfig and cache it manually.
+    {
+        bool   sc   = false;
+        double sc_x = 100.0, sc_y = 100.0, sc_z = 100.0;
+        if (const auto *v = config.opt<ConfigOptionBool>("shrinkage_compensation"))
+            sc = v->value;
+        if (const auto *v = config.opt<ConfigOptionFloat>("shrinkage_compensation_x"))
+            sc_x = v->value;
+        if (const auto *v = config.opt<ConfigOptionFloat>("shrinkage_compensation_y"))
+            sc_y = v->value;
+        if (const auto *v = config.opt<ConfigOptionFloat>("shrinkage_compensation_z"))
+            sc_z = v->value;
+        if (sc != m_shrinkage_compensation || sc_x != m_shrinkage_compensation_x ||
+            sc_y != m_shrinkage_compensation_y || sc_z != m_shrinkage_compensation_z) {
+            m_shrinkage_compensation   = sc;
+            m_shrinkage_compensation_x = sc_x;
+            m_shrinkage_compensation_y = sc_y;
+            m_shrinkage_compensation_z = sc_z;
+            // Force trafo recalculation for all objects on next process().
+            update_apply_status(this->invalidate_step(slapsMergeSlicesAndEval));
+            for (SLAPrintObject *obj : m_objects) {
+                update_apply_status(obj->invalidate_all_steps());
+                obj->set_trafo(sla_trafo(*obj->m_model_object),
+                               obj->m_model_object->instances.front()->is_left_handed());
+            }
+        }
+    }
+
+    // Tolerance compensation lives in PrintObjectConfig (FDM), not SLA config → cache manually.
+    {
+        // Default false (not true as in PhrozenOrca): safe-off when key is absent from config.ini.
+        bool   tc   = false, btc  = false;
+        double tc_a = 0.0,  tc_b  = 0.0, btc_a = 0.0, btc_b = 0.0;
+        int    blc  = 6;
+        if (const auto *v = config.opt<ConfigOptionBool> ("tolerance_compensation"))          tc   = v->value;
+        if (const auto *v = config.opt<ConfigOptionFloat>("tolerance_compensation_a"))        tc_a = v->value;
+        if (const auto *v = config.opt<ConfigOptionFloat>("tolerance_compensation_b"))        tc_b = v->value;
+        if (const auto *v = config.opt<ConfigOptionBool> ("bottom_tolerance_compensation"))   btc  = v->value;
+        if (const auto *v = config.opt<ConfigOptionFloat>("bottom_tolerance_compensation_a")) btc_a = v->value;
+        if (const auto *v = config.opt<ConfigOptionFloat>("bottom_tolerance_compensation_b")) btc_b = v->value;
+        if (const auto *v = config.opt<ConfigOptionInt>  ("bottom_layer_count"))              blc  = v->value;
+        if (tc   != m_tolerance_compensation            || tc_a  != m_tolerance_compensation_a  ||
+            tc_b != m_tolerance_compensation_b          || btc   != m_bottom_tolerance_compensation ||
+            btc_a!= m_bottom_tolerance_compensation_a  || btc_b != m_bottom_tolerance_compensation_b ||
+            blc  != m_bottom_layer_count) {
+            m_tolerance_compensation            = tc;
+            m_tolerance_compensation_a          = tc_a;
+            m_tolerance_compensation_b          = tc_b;
+            m_bottom_tolerance_compensation     = btc;
+            m_bottom_tolerance_compensation_a   = btc_a;
+            m_bottom_tolerance_compensation_b   = btc_b;
+            m_bottom_layer_count                = blc;
+            update_apply_status(this->invalidate_step(slapsMergeSlicesAndEval));
+            for (SLAPrintObject *obj : m_objects)
+                update_apply_status(obj->invalidate_step(slaposObjectSlice));
+        }
+    }
 
     if (!m_archiver || !printer_diff.empty())
         m_archiver = SLAArchiveWriter::create(m_printer_config.sla_archive_format.value.c_str(), m_printer_config);

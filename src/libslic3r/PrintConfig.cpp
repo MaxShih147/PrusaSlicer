@@ -4889,6 +4889,84 @@ void PrintConfigDef::init_sla_params()
     def->mode = comExpert;
     def->set_default_value(new ConfigOptionFloat(0.001));
 
+    // SLA compensation params (live in PrintObjectConfig/FDM tier; see PrintConfig.hpp)
+    def           = this->add("shrinkage_compensation", coBool);
+    def->label    = L("Shrinkage Compensation");
+    def->category = L("Advanced");
+    def->tooltip  = L("Enable per-axis shrinkage compensation scaling before slicing.");
+    def->set_default_value(new ConfigOptionBool(false));
+
+    def           = this->add("shrinkage_compensation_x", coFloat);
+    def->label    = L("Shrinkage Compensation X");
+    def->category = L("Advanced");
+    def->tooltip  = L("X-axis shrinkage compensation (%). 100 = no change, 102 = enlarge 2%.");
+    def->sidetext = "%";
+    def->min      = 0;
+    def->set_default_value(new ConfigOptionFloat(100.0));
+
+    def           = this->add("shrinkage_compensation_y", coFloat);
+    def->label    = L("Shrinkage Compensation Y");
+    def->category = L("Advanced");
+    def->tooltip  = L("Y-axis shrinkage compensation (%). 100 = no change, 102 = enlarge 2%.");
+    def->sidetext = "%";
+    def->min      = 0;
+    def->set_default_value(new ConfigOptionFloat(100.0));
+
+    def           = this->add("shrinkage_compensation_z", coFloat);
+    def->label    = L("Shrinkage Compensation Z");
+    def->category = L("Advanced");
+    def->tooltip  = L("Z-axis shrinkage compensation (%). 100 = no change, 102 = enlarge 2%.");
+    def->sidetext = "%";
+    def->min      = 0;
+    def->set_default_value(new ConfigOptionFloat(100.0));
+
+    def           = this->add("tolerance_compensation", coBool);
+    def->label    = L("Tolerance Compensation");
+    def->category = L("Advanced");
+    def->tooltip  = L("Enable per-layer contour offset for normal layers.");
+    def->set_default_value(new ConfigOptionBool(false));
+
+    def           = this->add("tolerance_compensation_a", coFloat);
+    def->label    = L("Tolerance Compensation A");
+    def->category = L("Advanced");
+    def->tooltip  = L("Hole offset (mm). Positive = hole shrinks.");
+    def->sidetext = "mm";
+    def->set_default_value(new ConfigOptionFloat(0.0));
+
+    def           = this->add("tolerance_compensation_b", coFloat);
+    def->label    = L("Tolerance Compensation B");
+    def->category = L("Advanced");
+    def->tooltip  = L("Outer contour offset (mm). Positive = outer contour expands.");
+    def->sidetext = "mm";
+    def->set_default_value(new ConfigOptionFloat(0.0));
+
+    def           = this->add("bottom_tolerance_compensation", coBool);
+    def->label    = L("Bottom Tolerance Compensation");
+    def->category = L("Advanced");
+    def->tooltip  = L("Enable per-layer contour offset for bottom layers.");
+    def->set_default_value(new ConfigOptionBool(false));
+
+    def           = this->add("bottom_tolerance_compensation_a", coFloat);
+    def->label    = L("Bottom Tolerance Compensation A");
+    def->category = L("Advanced");
+    def->tooltip  = L("Bottom layer hole offset (mm). Positive = hole shrinks.");
+    def->sidetext = "mm";
+    def->set_default_value(new ConfigOptionFloat(0.0));
+
+    def           = this->add("bottom_tolerance_compensation_b", coFloat);
+    def->label    = L("Bottom Tolerance Compensation B");
+    def->category = L("Advanced");
+    def->tooltip  = L("Bottom layer outer contour offset (mm). Positive = outer contour expands.");
+    def->sidetext = "mm";
+    def->set_default_value(new ConfigOptionFloat(0.0));
+
+    def           = this->add("bottom_layer_count", coInt);
+    def->label    = L("Bottom Layer Count");
+    def->category = L("Advanced");
+    def->tooltip  = L("Number of bottom layers for tolerance compensation (geometric, independent of faded_layers).");
+    def->min      = 0;
+    def->set_default_value(new ConfigOptionInt(6));
+
     // Declare retract values for material profile, overriding the print and printer profiles.
     for (const char* opt_key : {
         // float
