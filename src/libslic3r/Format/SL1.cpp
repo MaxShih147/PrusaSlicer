@@ -357,14 +357,34 @@ sla::RasterEncoder SL1Archive::get_encoder() const
             }
         }
         
-        // Blur via AGG stack blur (radius = blur_config + 1, matching previous Gaussian sigma)
+        // Blur via AGG stack blur, then alpha-blend back toward the sharp
+        // original. Alpha ramps with radius so the hard center spike (1-alpha)
+        // fades out as the footprint grows, avoiding hard edges at blur >= 2:
+        //   blur=1 -> alpha 0.6 (k=154), blur=2 -> 0.8 (k=205), blur>=3 -> 1.0 (k=256)
         if (blur_config > 0) {
-            const unsigned radius = static_cast<unsigned>(blur_config + 1);
-            agg::rendering_buffer rbuf(buf.data(), static_cast<unsigned>(w),
-                                       static_cast<unsigned>(h),
-                                       static_cast<int>(w * num_components));
-            agg::pixfmt_gray8 pixf(rbuf);
-            agg::stack_blur_gray8(pixf, radius, radius);
+            const unsigned radius = static_cast<unsigned>(blur_config);
+            const int k = (blur_config == 1) ? 154 : (blur_config == 2) ? 205 : 256;
+
+            if (k >= 256) {
+                // alpha == 1.0: pure blur in place, no copy/blend (matches pre-blend cost)
+                agg::rendering_buffer rbuf(buf.data(), static_cast<unsigned>(w),
+                                           static_cast<unsigned>(h),
+                                           static_cast<int>(w * num_components));
+                agg::pixfmt_gray8 pixf(rbuf);
+                agg::stack_blur_gray8(pixf, radius, radius);
+            } else {
+                // alpha < 1.0: blur a copy, then blend toward the sharp original
+                std::vector<uint8_t> temp_buf(buf);
+                agg::rendering_buffer rbuf(temp_buf.data(), static_cast<unsigned>(w),
+                                           static_cast<unsigned>(h),
+                                           static_cast<int>(w * num_components));
+                agg::pixfmt_gray8 pixf(rbuf);
+                agg::stack_blur_gray8(pixf, radius, radius);
+
+                // out = (1 - alpha) * original + alpha * blurred
+                for (size_t p = 0; p < bufsize; ++p)
+                    buf[p] = static_cast<uint8_t>((buf[p] * (256 - k) + temp_buf[p] * k) >> 8);
+            }
         }
         
         return sla::PNGRasterEncoder{}(buf.data(), w, h, num_components);
