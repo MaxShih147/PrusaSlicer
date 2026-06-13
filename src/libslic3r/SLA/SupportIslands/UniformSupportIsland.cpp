@@ -1808,16 +1808,16 @@ void merge_island_parts(IslandParts &island_parts, size_t index, size_t remove_i
     IslandPartChanges &remove_changes = island_parts[remove_index].changes;
 
     // remove changes back to merged part
-    auto remove_changes_end = std::remove_if(remove_changes.begin(), remove_changes.end(), 
+    auto remove_changes_end = std::remove_if(remove_changes.begin(), remove_changes.end(),
         [i=index](const IslandPartChange &change) { return change.part_index == i; });
 
     // remove changes into removed part
-    changes.erase(std::remove_if(changes.begin(), changes.end(), 
+    changes.erase(std::remove_if(changes.begin(), changes.end(),
         [i=remove_index](const IslandPartChange &change) { return change.part_index == i; }),
         changes.end());
 
     // move changes from remove part to merged part
-    changes.insert(changes.end(), 
+    changes.insert(changes.end(),
         std::move_iterator(remove_changes.begin()),
         std::move_iterator(remove_changes_end));
 
@@ -1872,8 +1872,16 @@ void merge_parts_and_fix_process(IslandParts &island_parts,
         else if (p.i > remove_index)
             --p.i; // decrease index
 
-    // fix index for current item
-    if (item.i > remove_index)
+    // fix index for current item — mirror the process-queue fix above. The
+    // current item can itself point at the removed part (when remove_index was
+    // swapped to equal the caller's item.i), so it must be repointed to the
+    // merged survivor, not just decreased. Missing the `== remove_index` case
+    // left item.i pointing at a removed/out-of-bounds part; once that item was
+    // re-queued, a later loop-back passed its stale index as remove_index and
+    // island_parts.erase() ran past the end → heap corruption.
+    if (item.i == remove_index)
+        item.i = index;
+    else if (item.i > remove_index)
         --item.i; // decrease index
 }
 
@@ -1912,7 +1920,7 @@ void merge_same_neighbor_type_parts(IslandParts &island_parts) {
             const IslandPart &island_part = island_parts[island_part_index];
             assert(island_part.type != IslandPartType::middle); // only thin or thick parts        
             const IslandPartChanges &changes = island_part.changes;
-            auto change_it = std::find_if(changes.begin(), changes.end(), 
+            auto change_it = std::find_if(changes.begin(), changes.end(),
                 [&island_parts, type = island_part.type](const IslandPartChange &change) {
                     assert(change.part_index < island_parts.size());
                     return island_parts[change.part_index].type == type;});
