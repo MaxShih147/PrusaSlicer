@@ -260,6 +260,25 @@ void SLAPrint::Steps::generate_preview(SLAPrintObject &po, SLAPrintObjectStep st
 
     auto start{high_resolution_clock::now()};
 
+    // Fast path: the drill-holes step does not modify the mesh when the object
+    // has no drain holes, so its preview is identical to the previous step's.
+    // Reuse it instead of re-merging the whole model — a positive-parts merge of
+    // a large mesh costs ~as much as slicing, and was being done once for
+    // hollowing and again (redundantly) here. Saves a full duplicate merge per
+    // support generation.
+    if (step == slaposDrillHoles && po.m_model_object->sla_drain_holes.empty()) {
+        const auto &prev = po.get_mesh_to_print();
+        if (prev && !prev->empty()) {
+            po.m_preview_meshes[step] = prev;
+            for (size_t i = size_t(step) + 1; i < slaposCount; ++i)
+                po.m_preview_meshes[i] = {};
+            report_status(-2,
+                          std::string("Reload preview from step ") + std::to_string(int(step)),
+                          SlicingStatus::RELOAD_SLA_PREVIEW);
+            return;
+        }
+    }
+
     auto r = range(po.m_mesh_to_slice);
     auto m = indexed_triangle_set{};
 
