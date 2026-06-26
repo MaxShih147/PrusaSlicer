@@ -132,6 +132,13 @@ public:
     const Transform3d&          trafo()  const { return m_trafo; }
     bool                        is_left_handed() const { return m_left_handed; }
 
+    // Externally imported support mesh (--import-support-stl): when set, support
+    // points / support tree generation are skipped and this mesh is sliced as
+    // the support track. The mesh is transformed by trafo() to align with the
+    // model's print frame (Contract A: shared world origin).
+    void                        set_imported_support_mesh(const indexed_triangle_set &its);
+    bool                        has_imported_support() const { return m_imported_support; }
+
     struct Instance {
         Instance(ObjectID inst_id, const Point &shft, float rot) : instance_id(inst_id), shift(shft), rotation(rot) {}
         bool operator==(const Instance &rhs) const { return this->instance_id == rhs.instance_id && this->shift == rhs.shift && this->rotation == rhs.rotation; }
@@ -398,6 +405,15 @@ private:
 
     std::unique_ptr<SupportData>  m_supportdata;
 
+    // True when an external support mesh was imported via --import-support-stl.
+    bool                          m_imported_support = false;
+    // Persistent storage for the imported support mesh (already transformed by
+    // m_trafo). Kept OUTSIDE m_supportdata because the early pipeline steps
+    // (mesh_assembly/hollow_model/drill_holes) call m_supportdata.reset(); the
+    // mesh is (re)mounted into m_supportdata->tree_mesh in support_tree(), which
+    // runs after those resets.
+    indexed_triangle_set          m_imported_support_its;
+
     // Holds CSG operations for the printed object, prioritized by print steps.
     CSGContainer                  m_mesh_to_slice;
 
@@ -505,6 +521,10 @@ public:
     bool                finished() const override { return this->is_step_done(slaposSliceSupports) && this->Inherited::is_step_done(slapsRasterize); }
 
     const PrintObjects& objects() const { return m_objects; }
+
+    // Attach an externally imported support mesh to the (single) print object.
+    // Returns false if there is no object. Scope: single-object only.
+    bool attach_imported_support(const indexed_triangle_set &its);
     // PrintObject by its ObjectID, to be used to uniquely bind slicing warnings to their source PrintObjects
     // in the notification center.
     const SLAPrintObject* get_print_object_by_model_object_id(ObjectID object_id) const {
@@ -544,13 +564,21 @@ public:
         // The collection of slice records for the current level.
         std::vector<std::reference_wrapper<const SliceRecord>> m_slices;
 
+        // model-track (AA-rendered) — was the merged union, now model-only
         ExPolygons m_transformed_slices;
+        // support-track (binary-rendered, exempt from AA/blur)
+        ExPolygons m_transformed_support_slices;
 
         template<class Container> void transformed_slices(Container&& c)
         {
             m_transformed_slices = std::forward<Container>(c);
         }
-        
+
+        template<class Container> void transformed_support_slices(Container&& c)
+        {
+            m_transformed_support_slices = std::forward<Container>(c);
+        }
+
         friend class SLAPrint::Steps;
 
     public:
@@ -570,6 +598,10 @@ public:
 
         const ExPolygons & transformed_slices() const {
             return m_transformed_slices;
+        }
+
+        const ExPolygons & transformed_support_slices() const {
+            return m_transformed_support_slices;
         }
     };
 

@@ -680,6 +680,15 @@ SLAPrint::ApplyStatus SLAPrint::apply(const Model &model, DynamicPrintConfig con
 // Generate a recommended output file name based on the format template, default extension, and template parameters
 // (timestamps, object placeholders derived from the model, current placeholder prameters and print statistics.
 // Use the final print statistics if available, or just keep the print statistics placeholders if not available yet (before the output is finalized).
+bool SLAPrint::attach_imported_support(const indexed_triangle_set &its)
+{
+    if (m_objects.empty())
+        return false;
+    // Single-object scope (per design): attach to the first object.
+    m_objects.front()->set_imported_support_mesh(its);
+    return true;
+}
+
 std::string SLAPrint::output_filename(const std::string &filename_base) const
 {
     DynamicConfig config = this->finished() ? this->print_statistics().config() : this->print_statistics().placeholders();
@@ -1281,6 +1290,20 @@ const TriangleMesh& SLAPrintObject::support_mesh() const
         return m_supportdata->tree_mesh;
 
     return EMPTY_MESH;
+}
+
+void SLAPrintObject::set_imported_support_mesh(const indexed_triangle_set &its)
+{
+    TriangleMesh m{its};
+    // Contract A: the imported support shares the model's world origin; apply the
+    // same object transform so it lands in the model's print frame.
+    m.transform(m_trafo);
+
+    // Store only. Do NOT build m_supportdata here: ProcessActions runs before
+    // process(), and the early steps (assembly/hollow/drill) reset m_supportdata.
+    // support_tree() remounts this into m_supportdata->tree_mesh after the resets.
+    m_imported_support_its = std::move(m.its);
+    m_imported_support = true;
 }
 
 const TriangleMesh& SLAPrintObject::pad_mesh() const

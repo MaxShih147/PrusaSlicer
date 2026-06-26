@@ -65,6 +65,13 @@ struct PixelDim {
 using RasterEncoder =
     std::function<EncodedRaster(const void *ptr, size_t w, size_t h, size_t num_components)>;
 
+// Sibling of RasterEncoder: mutates the raster's pixel buffer in place (no
+// encoding, no return). Used to inject format-specific post-processing (e.g.
+// SL1's AA quantization + blur) into the generic raster without leaking the
+// recipe into the raster core.
+using RasterPostProcessor =
+    std::function<void(void *ptr, size_t w, size_t h, size_t num_components)>;
+
 class RasterBase {
 public:
     
@@ -98,7 +105,17 @@ public:
     
     /// Draw a polygon with holes.
     virtual void draw(const ExPolygon& poly) = 0;
-    
+
+    /// Draw a polygon with holes in binary (threshold) mode, bypassing AA.
+    /// Default falls back to draw(): vector rasters (e.g. SVG) have no AA to
+    /// exempt, so inheriting the default is semantically correct.
+    virtual void draw_binary(const ExPolygon& poly) { draw(poly); }
+
+    /// Apply an in-place post-process (e.g. blur / gray quantization) over the
+    /// pixel buffer. Default is a no-op: rasters without a pixel buffer (e.g.
+    /// SVG) correctly inherit no behavior.
+    virtual void apply_postprocess() {}
+
     /// Get the resolution of the raster.
 //    virtual Resolution resolution() const = 0;
 //    virtual PixelDim   pixel_dimensions() const = 0;
@@ -128,7 +145,8 @@ std::unique_ptr<RasterBase> create_raster_grayscale_aa(
     const Resolution        &res,
     const PixelDim          &pxdim,
     double                   gamma = 1.0,
-    const RasterBase::Trafo &tr    = {});
+    const RasterBase::Trafo &tr    = {},
+    RasterPostProcessor      pp    = {});
 
 }} // namespace Slic3r::sla
 

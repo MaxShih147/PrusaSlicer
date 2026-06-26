@@ -637,6 +637,19 @@ void SLAPrint::Steps::slice_model(SLAPrintObject &po)
     float   lh   = float(lhd);
     coord_t lhs  = scaled(lhd);
     double  minZ = bb3d.min(Z) - po.get_elevation();
+
+    // Imported support (--import-support-stl) is NOT part of m_mesh_to_slice, so
+    // csgmesh_positive_bb() above only sees the model and the slice grid would
+    // start at the model bottom, decapitating any support below it (raft/base).
+    // The imported mesh is already in the object trafo frame (set_imported_support_mesh
+    // applies m_trafo, same as model_to_csgmesh's po.trafo()), so we can clamp the
+    // grid floor straight to its Z minimum. std::min only lowers, never raises:
+    // supports fully within the model height leave minZ untouched (zero regression).
+    if (po.has_imported_support() && !po.m_imported_support_its.empty()) {
+        const BoundingBoxf3 sbb = bounding_box(po.m_imported_support_its);
+        minZ = std::min(minZ, sbb.min(Z));
+    }
+
     double  maxZ = bb3d.max(Z);
     auto    minZf = float(minZ);
     coord_t minZs = scaled(minZ);
@@ -761,6 +774,9 @@ static void filter_support_points_by_modifiers(sla::SupportPoints &pts,
 void SLAPrint::Steps::support_points(SLAPrintObject &po)
 {
     using namespace sla;
+    // Imported support mesh: skip auto support-point detection entirely; the
+    // support track comes from the imported mesh (see support_tree/slice_supports).
+    if (po.has_imported_support()) return;
     // If supports are disabled, we can skip the model scan.
     if(!po.m_config.supports_enable.getBool()) return;
 
@@ -892,6 +908,17 @@ void SLAPrint::Steps::support_points(SLAPrintObject &po)
 
 void SLAPrint::Steps::support_tree(SLAPrintObject &po)
 {
+    // Imported support mesh: (re)mount it as the support tree HERE. This step
+    // runs after the early m_supportdata.reset() calls (assembly/hollow/drill),
+    // so the data created here survives to slice_supports(). Skip native tree
+    // generation entirely.
+    if (po.has_imported_support()) {
+        if (!po.m_supportdata)
+            po.m_supportdata = std::make_unique<SLAPrintObject::SupportData>(
+                po.m_imported_support_its);
+        po.m_supportdata->tree_mesh = TriangleMesh{po.m_imported_support_its};
+        return;
+    }
     if(!po.m_supportdata) return;
 
     // If the zero elevation mode is engaged, we have to filter out all the
@@ -954,6 +981,13 @@ void SLAPrint::Steps::generate_pad(SLAPrintObject &po) {
     // and before the supports had been sliced. (or the slicing has to be
     // repeated)
 
+    // Imported support mesh already includes any raft/pad geometry; skip native
+    // pad generation. Without this, the slice_supports gate pulls this step in
+    // and native pad generation runs against the imported mesh — throwing
+    // "No pad can be generated..." when pad is enabled, or wrongly fabricating a
+    // pad otherwise.
+    if (po.has_imported_support()) return;
+
     if(po.m_config.pad_enable.getBool()) {
         if (!po.m_supportdata) {
             auto &meshp = po.get_mesh_to_print();
@@ -996,7 +1030,9 @@ void SLAPrint::Steps::slice_supports(SLAPrintObject &po) {
     if(sd) sd->support_slices.clear();
 
     // Don't bother if no supports and no pad is present.
-    if (!po.m_config.supports_enable.getBool() && !po.m_config.pad_enable.getBool())
+    // Imported support mesh must also pass this gate so it gets sliced.
+    if (!po.m_config.supports_enable.getBool() && !po.m_config.pad_enable.getBool()
+        && !po.has_imported_support())
         return;
 
     if(sd) {
@@ -1013,8 +1049,11 @@ void SLAPrint::Steps::slice_supports(SLAPrintObject &po) {
                        float(po.config().slice_closing_radius.value), ctl);
     }
 
-    for (size_t i = 0; i < sd->support_slices.size() && i < po.m_slice_index.size(); ++i)
-        po.m_slice_index[i].set_support_slice_idx(po, i);
+    // Guard: sd may be null (no supports/pad, or imported-but-not-yet-mounted).
+    // Without this, a null sd here dereferences a null unique_ptr -> segfault.
+    if (sd)
+        for (size_t i = 0; i < sd->support_slices.size() && i < po.m_slice_index.size(); ++i)
+            po.m_slice_index[i].set_support_slice_idx(po, i);
 
     apply_printer_corrections(po, soSupport);
 
@@ -1418,13 +1457,12 @@ void SLAPrint::Steps::merge_slices_and_eval_stats() {
         const double supports_volume = (layer_support_area < 0 || layer_support_area > 0) ? layer_support_area * l_height : 0.;
         const double layer_area = layer_model_area + layer_support_area;
 
-        // Here we can save the expensively calculated polygons for printing
-        ExPolygons trslices;
-        trslices.reserve(model_polygons.size() + supports_polygons.size());
-        for(ExPolygon& poly : model_polygons) trslices.emplace_back(std::move(poly));
-        for(ExPolygon& poly : supports_polygons) trslices.emplace_back(std::move(poly));
-
-        layer.transformed_slices(union_ex(trslices));
+        // Dual-track: keep model and support geometry on separate tracks
+        // instead of merging them with union_ex. The model-track keeps AA
+        // rendering; the support-track will be rendered binary (exempt from
+        // AA/blur) downstream in rasterize().
+        layer.transformed_slices(std::move(model_polygons));
+        layer.transformed_support_slices(std::move(supports_polygons));
 
         // Calculation of the printing time
         // + Calculation of the slow and fast layers to the future controlling those values on FW
@@ -1534,8 +1572,17 @@ void SLAPrint::Steps::rasterize()
         PrintLayer& printlayer = m_print->m_printer_input[idx];
         if(canceled()) return;
 
+        // Three-stage dual-track rasterization:
+        //  1) model track  — AA gamma (soft, anti-aliased edges)
         for (const ExPolygon& poly : printlayer.transformed_slices())
             raster.draw(poly);
+        //  2) post-process — SL1 blur + gray quantization on the MODEL ONLY
+        //     (no-op for vector rasters / when no post-processor was injected)
+        raster.apply_postprocess();
+        //  3) support track — sharp binary, composited AFTER blur so support
+        //     pixels are never softened and leave no background halo
+        for (const ExPolygon& poly : printlayer.transformed_support_slices())
+            raster.draw_binary(poly);
 
         // Status indication guarded with the spinlock
         {

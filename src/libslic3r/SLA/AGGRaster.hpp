@@ -62,7 +62,14 @@ protected:
     Trafo m_trafo;
     Scanline m_scanlines;
     Rasterizer m_rasterizer;
-    
+
+    // Injected format-specific in-place post-process (e.g. SL1 blur/quant).
+    // Empty by default -> apply_postprocess() is a no-op.
+    RasterPostProcessor m_postproc;
+    // Defensive copy of the construction-time gamma so draw_binary() can
+    // restore it after temporarily switching to a threshold LUT.
+    std::function<double(double)> m_gammafn;
+
     void flipy(agg::path_storage &path) const
     {
         path.flip_y(0, double(m_resolution.height_px));
@@ -131,7 +138,8 @@ public:
               const Trafo &     trafo,
               const TColor &    foreground,
               const TColor &    background,
-              GammaFn &&        gammafn)
+              GammaFn &&        gammafn,
+              RasterPostProcessor postproc = {})
         : m_resolution(res)
         , m_pxdim_scaled(SCALING_FACTOR, SCALING_FACTOR)
         , m_buf(res.pixels())
@@ -152,7 +160,12 @@ public:
         }
         m_renderer.color(foreground);
         clear(background);
-        
+
+        // Keep a type-erased copy of the gamma for defensive restore in
+        // draw_binary(); store the injected post-processor (may be empty).
+        m_gammafn = gammafn;
+        m_postproc = std::move(postproc);
+
         m_rasterizer.gamma(gammafn);
     }
     
@@ -165,7 +178,27 @@ public:
     }
     
     void draw(const ExPolygon &poly) override { _draw(poly); }
-    
+
+    // Binary (threshold) draw: temporarily swap the rasterizer LUT to a hard
+    // threshold so the polygon is rendered without AA, then restore the
+    // original gamma. Per-layer raster instances make this race-free.
+    void draw_binary(const ExPolygon &poly) override
+    {
+        m_rasterizer.gamma(agg::gamma_threshold(0.5));
+        _draw(poly);
+        if (m_gammafn) m_rasterizer.gamma(m_gammafn);
+    }
+
+    // Run the injected in-place post-process over the pixel buffer (no-op if
+    // none was injected). Mutates m_buf directly (no copy).
+    void apply_postprocess() override
+    {
+        if (m_postproc)
+            m_postproc(m_buf.data(),
+                       m_resolution.width_px, m_resolution.height_px,
+                       PixelRenderer::num_components);
+    }
+
     EncodedRaster encode(RasterEncoder encoder) const override
     {
         return encoder(m_buf.data(), m_resolution.width_px, m_resolution.height_px, 1);    
@@ -193,13 +226,15 @@ public:
     RasterGrayscaleAA(const Resolution        &res,
                       const PixelDim          &pd,
                       const RasterBase::Trafo &trafo,
-                      GammaFn                &&fn)
+                      GammaFn                &&fn,
+                      RasterPostProcessor      postproc = {})
         : Base(res,
                pd,
                trafo,
                Colors<TColor>::White,
                Colors<TColor>::Black,
-               std::forward<GammaFn>(fn))
+               std::forward<GammaFn>(fn),
+               std::move(postproc))
     {}
     
     uint8_t read_pixel(size_t col, size_t row) const
@@ -219,8 +254,9 @@ public:
     RasterGrayscaleAAGammaPower(const Resolution        &res,
                                 const PixelDim          &pd,
                                 const RasterBase::Trafo &trafo,
-                                double                   gamma = 1.)
-        : RasterGrayscaleAA(res, pd, trafo, agg::gamma_power(gamma))
+                                double                   gamma = 1.,
+                                RasterPostProcessor      postproc = {})
+        : RasterGrayscaleAA(res, pd, trafo, agg::gamma_power(gamma), std::move(postproc))
     {}
 };
 

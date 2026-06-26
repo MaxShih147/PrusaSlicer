@@ -441,6 +441,23 @@ bool process_actions(Data& cli, const DynamicPrintConfig& print_config, std::vec
                 print->apply(model, print_config);
             });
 
+            // Import an externally generated support mesh (--import-support-stl) and
+            // attach it to the single SLA print object so it is sliced as the support
+            // track instead of generating supports. Must run after apply() (objects
+            // exist) and before process().
+            if (printer_technology == ptSLA && cli.misc_config.has("import_support_stl")) {
+                const std::string support_path = cli.misc_config.opt_string("import_support_stl");
+                if (!support_path.empty()) {
+                    TriangleMesh support_mesh;
+                    if (!support_mesh.ReadSTLFile(support_path.c_str()) || support_mesh.empty()) {
+                        boost::nowide::cerr << "error: failed to read --import-support-stl: " << support_path << std::endl;
+                        return 1;
+                    }
+                    if (!sla_print.attach_imported_support(support_mesh.its))
+                        boost::nowide::cerr << "warning: --import-support-stl provided but no SLA object to attach to." << std::endl;
+                }
+            }
+
             if (actions.has("export_preview_pngs") && printer_technology == ptSLA) {
                 double scale = actions.opt_float("export_preview_pngs");
                 if (scale > 0.)

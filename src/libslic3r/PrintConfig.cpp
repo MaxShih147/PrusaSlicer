@@ -6124,6 +6124,11 @@ CLIMiscConfigDef::CLIMiscConfigDef()
     def->tooltip = L("The file where the output will be written (if not specified, it will be based on the input file).");
     def->cli = "output|o";
 
+    def = this->add("import_support_stl", coString);
+    def->label = L("Import Support STL");
+    def->tooltip = L("Load an externally generated support mesh (STL) and use it as the SLA support track instead of generating supports. The mesh must share the model's world coordinate origin.");
+    def->cli = "import-support-stl";
+
     def = this->add("datadir", coString);
     def->label = L("Data directory");
     def->tooltip = L("Load and store settings at the given directory. This is useful for maintaining different profiles or including configurations from a network storage.");
