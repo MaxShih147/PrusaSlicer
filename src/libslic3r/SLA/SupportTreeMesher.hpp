@@ -36,7 +36,7 @@ indexed_triangle_set sphere(double  rho,
 // sp: starting point
 inline indexed_triangle_set cylinder(double       r,
                               double       h,
-                              size_t       steps = 45)
+                              size_t       steps = 16)
 {
     return its_make_cylinder(r, h, 2 * PI / steps);
 }
@@ -44,13 +44,13 @@ inline indexed_triangle_set cylinder(double       r,
 indexed_triangle_set pinhead(double r_pin,
                              double r_back,
                              double length,
-                             size_t steps = 45);
+                             size_t steps = 16);
 
 indexed_triangle_set halfcone(double       baseheight,
                               double       r_bottom,
                               double       r_top,
                               const Vec3d &pt    = Vec3d::Zero(),
-                              size_t       steps = 45);
+                              size_t       steps = 16);
 
 indexed_triangle_set get_mesh(const Head &h, size_t steps);
 

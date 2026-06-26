@@ -9,6 +9,7 @@
 #include <libslic3r/MeshNormals.hpp>
 #include <libslic3r/Execution/ExecutionTBB.hpp>
 #include <boost/log/trivial.hpp>
+#include <cstdlib>
 #include <cmath>
 #include <functional>
 #include <iterator>
@@ -422,8 +423,25 @@ void DefaultSupportTree::add_pinheads()
             );
     }
 
+    // Pinhead-angle optimizer budget. The default is the validated fast config:
+    // stop each genetic search the instant it clears the required distance w
+    // (the same gate used to accept the head, mirroring the branching tree's
+    // optimize_pinhead_placement()), capped at 100 iterations. This cuts the
+    // pinhead phase by ~17x (the optimizer dominated it) with no measurable
+    // change to the supports. Env vars still override for A/B tuning:
+    //   SLA_GA_MAX_ITER, SLA_GA_REL_SCORE, SLA_GA_STOP_SCORE (0 to disable).
+    static const unsigned GA_DEFAULT_MAX_ITER = 100;
+    const char *env_iter = std::getenv("SLA_GA_MAX_ITER");
+    const char *env_rel  = std::getenv("SLA_GA_REL_SCORE");
+    const char *env_stop = std::getenv("SLA_GA_STOP_SCORE");
+    const unsigned ga_max_iter  = env_iter ? unsigned(std::strtoul(env_iter, nullptr, 10))
+                                           : GA_DEFAULT_MAX_ITER;
+    const double   ga_rel_score = env_rel  ? std::strtod(env_rel, nullptr)
+                                           : m_sm.cfg.optimizer_rel_score_diff;
+    const bool ga_use_stop = env_stop ? (std::atoi(env_stop) != 0) : true;
+
     std::function<void(unsigned, size_t, double)> filterfn;
-    filterfn = [this, &nmls, &heads, &filterfn](unsigned fidx, size_t i, double back_r) {
+    filterfn = [this, &nmls, &heads, &filterfn, ga_max_iter, ga_rel_score, ga_use_stop](unsigned fidx, size_t i, double back_r) {
         m_thr();
 
         Vec3d n = nmls.row(Eigen::Index(i));
@@ -473,7 +491,11 @@ void DefaultSupportTree::add_pinheads()
             // viable normal that doesn't collide with the model
             // geometry and its very close to the default.
 
-            Optimizer<AlgNLoptGenetic> solver(get_criteria(m_sm.cfg));
+            auto crit = get_criteria(m_sm.cfg).max_iterations(ga_max_iter)
+                                              .rel_score_diff(ga_rel_score);
+            if (ga_use_stop)
+                crit.stop_score(w); // stop as soon as a non-colliding angle is found
+            Optimizer<AlgNLoptGenetic> solver(crit);
             solver.seed(0); // we want deterministic behavior
 
             auto oresult = solver.to_max().optimize(

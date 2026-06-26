@@ -477,6 +477,23 @@ bool process_actions(Data& cli, const DynamicPrintConfig& print_config, std::vec
             else
                 try {
                 std::string outfile_final;
+
+                // Support-only fast path: when the caller asked solely for the
+                // support STL (no SLA archive / preview / gcode), stop the SLA
+                // pipeline right after the pad step. This skips slice-supports,
+                // merge-and-eval and rasterization + sl1 packing, none of which
+                // the support/pad mesh depends on.
+                const bool support_stl_only = printer_technology == ptSLA
+                    && actions.has("export_support_stl")
+                    && !actions.has("export_sla")
+                    && !actions.has("slice")
+                    && !actions.has("export_gcode")
+                    && !actions.has("export_preview_pngs");
+                if (support_stl_only) {
+                    PrintBase::TaskParams task_params;
+                    task_params.to_object_step = slaposPad;
+                    sla_print.set_task(task_params);
+                }
                 print->process();
                 if (printer_technology == ptFFF) {
                     // The outfile is processed by a PlaceholderParser.
@@ -486,16 +503,23 @@ bool process_actions(Data& cli, const DynamicPrintConfig& print_config, std::vec
                 }
                 else {
                     outfile = sla_print.output_filepath(outfile);
-                    // We need to finalize the filename beforehand because the export function sets the filename inside the zip metadata
-                    outfile_final = sla_print.print_statistics().finalize_output_path(outfile);
-                    sla_print.export_print(outfile_final);
+                    if (support_stl_only) {
+                        // No sl1 archive in this mode; keep a filename stem for
+                        // the *_support.stl output below.
+                        outfile_final = outfile;
+                    }
+                    else {
+                        // We need to finalize the filename beforehand because the export function sets the filename inside the zip metadata
+                        outfile_final = sla_print.print_statistics().finalize_output_path(outfile);
+                        sla_print.export_print(outfile_final);
 
-                    // Export preview PNGs ZIP if requested
-                    if (actions.has("export_preview_pngs") && actions.opt_float("export_preview_pngs") > 0.) {
-                        auto preview_path = boost::filesystem::path(outfile_final);
-                        preview_path.replace_filename(preview_path.stem().string() + "_preview.zip");
-                        sla_print.export_preview_zip(preview_path.string());
-                        boost::nowide::cout << "Preview ZIP exported to " << preview_path.string() << std::endl;
+                        // Export preview PNGs ZIP if requested
+                        if (actions.has("export_preview_pngs") && actions.opt_float("export_preview_pngs") > 0.) {
+                            auto preview_path = boost::filesystem::path(outfile_final);
+                            preview_path.replace_filename(preview_path.stem().string() + "_preview.zip");
+                            sla_print.export_preview_zip(preview_path.string());
+                            boost::nowide::cout << "Preview ZIP exported to " << preview_path.string() << std::endl;
+                        }
                     }
 
                     // Export support mesh (including pad) as STL if requested
@@ -545,16 +569,18 @@ bool process_actions(Data& cli, const DynamicPrintConfig& print_config, std::vec
                         }
                     }
                 }
-                if (outfile != outfile_final) {
-                    if (Slic3r::rename_file(outfile, outfile_final)) {
-                        boost::nowide::cerr << "Renaming file " << outfile << " to " << outfile_final << " failed" << std::endl;
-                        return false;
+                if (!support_stl_only) {
+                    if (outfile != outfile_final) {
+                        if (Slic3r::rename_file(outfile, outfile_final)) {
+                            boost::nowide::cerr << "Renaming file " << outfile << " to " << outfile_final << " failed" << std::endl;
+                            return false;
+                        }
+                        outfile = outfile_final;
                     }
-                    outfile = outfile_final;
+                    // Run the post-processing scripts if defined.
+                    run_post_process_scripts(outfile, fff_print.full_print_config());
+                    boost::nowide::cout << "Slicing result exported to " << outfile << std::endl;
                 }
-                // Run the post-processing scripts if defined.
-                run_post_process_scripts(outfile, fff_print.full_print_config());
-                boost::nowide::cout << "Slicing result exported to " << outfile << std::endl;
             }
             catch (const std::exception& ex) {
                 boost::nowide::cerr << ex.what() << std::endl;

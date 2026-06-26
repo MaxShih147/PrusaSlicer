@@ -433,7 +433,10 @@ public:
     }
 
     // WITHOUT THE PAD!!!
-    const indexed_triangle_set &merged_mesh(size_t steps = 45) const;
+    // steps = facet count of support cylinders/cones/spheres. Lowered from 45
+    // to 16 to speed up support mesh generation/merge (visually negligible for
+    // thin support pillars).
+    const indexed_triangle_set &merged_mesh(size_t steps = 16) const;
     
     // Intended to be called after the generation is fully complete
     const indexed_triangle_set & merge_and_cleanup();
