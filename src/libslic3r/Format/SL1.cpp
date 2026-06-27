@@ -30,6 +30,7 @@
 #include "ZipperArchiveImport.hpp"
 
 #include "libslic3r/MarchingSquares.hpp"
+#include <cstdlib>  // [layer-rle] getenv
 #include "libslic3r/PNGReadWrite.hpp"
 #include "libslic3r/ClipperUtils.hpp"
 
@@ -283,8 +284,14 @@ std::unique_ptr<sla::RasterBase> SL1Archive::create_raster() const
 
 sla::RasterEncoder SL1Archive::get_encoder() const
 {
+    // [layer-rle] PoC: emit layers directly as PRZ-compatible RLE instead of
+    // PNG, so the backend PRZ encoder consumes them without a PNG round-trip.
+    // Opt-in via SLA_LAYER_RLE so the default PNG path is untouched (A/B compare).
+    if (std::getenv("SLA_LAYER_RLE"))
+        return sla::RLERasterEncoder{};
+
     // Optimization 1: If AA is disabled, skip post-processing entirely
-    // When AA is disabled, create_raster uses gamma=0 which produces binary output 
+    // When AA is disabled, create_raster uses gamma=0 which produces binary output
     // consistent with "no AA".
     if (! m_cfg.anti_aliasing.getBool())
         return sla::PNGRasterEncoder{};

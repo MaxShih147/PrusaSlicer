@@ -117,6 +117,14 @@ struct PNGPreviewEncoder {
     EncodedRaster operator()(const void *ptr, size_t w, size_t h, size_t num_components);
 };
 
+// [layer-rle] Encode a grayscale layer to the PRZ V3.0 RLE format (row-major,
+// 0x55 header, BLACK/WHITE/GRAY runs, trailing ~sum checksum). Must stay
+// byte-identical to agent/prz_encoder.py:_rle_encode_layer so the backend can
+// consume it directly and produce a bit-for-bit identical PRZ.
+struct RLERasterEncoder {
+    EncodedRaster operator()(const void *ptr, size_t w, size_t h, size_t num_components);
+};
+
 struct PPMRasterEncoder {
     EncodedRaster operator()(const void *ptr, size_t w, size_t h, size_t num_components);
 };

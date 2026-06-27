@@ -10,6 +10,9 @@
 #include <memory>
 #include <string>
 #include <cstddef>
+#include <atomic>   // [raster-prof]
+#include <chrono>   // [raster-prof]
+#include <boost/log/trivial.hpp>  // [raster-prof]
 
 #include "libslic3r/SLA/RasterBase.hpp"
 #include "libslic3r/Execution/ExecutionTBB.hpp"
@@ -47,19 +50,30 @@ public:
         m_layers.resize(layer_num);
         if (m_preview_scale > 0.)
             m_preview_layers.resize(layer_num);
+        std::atomic<long long> t_create{0}, t_draw{0}, t_enc{0}, t_prev{0};  // [raster-prof]
         execution::for_each(
             ep, size_t(0), m_layers.size(),
-            [this, &drawfn, &cancelfn](size_t idx) {
+            [this, &drawfn, &cancelfn, &t_create, &t_draw, &t_enc, &t_prev](size_t idx) {
                 if (cancelfn()) return;
+                using clk = std::chrono::steady_clock;  // [raster-prof]
+                auto ns = [](clk::time_point a, clk::time_point b){ return std::chrono::duration_cast<std::chrono::nanoseconds>(b-a).count(); };
 
                 sla::EncodedRaster &enc = m_layers[idx];
+                auto t0 = clk::now();
                 auto                rst = create_raster();
+                auto t1 = clk::now(); t_create += ns(t0,t1);
                 drawfn(*rst, idx);
+                auto t2 = clk::now(); t_draw += ns(t1,t2);
                 enc = rst->encode(get_encoder());
+                auto t3 = clk::now(); t_enc += ns(t2,t3);
                 if (m_preview_scale > 0.)
                     m_preview_layers[idx] = rst->encode(sla::PNGPreviewEncoder{m_preview_scale});
+                auto t4 = clk::now(); t_prev += ns(t3,t4);
             },
             execution::max_concurrency(ep));
+        BOOST_LOG_TRIVIAL(error) << "[raster-prof] (summed over threads) create="
+            << t_create/1000000 << "ms draw=" << t_draw/1000000 << "ms encode_main="
+            << t_enc/1000000 << "ms encode_preview=" << t_prev/1000000 << "ms";
     }
 
     // Export the print into an archive using the provided filename.
