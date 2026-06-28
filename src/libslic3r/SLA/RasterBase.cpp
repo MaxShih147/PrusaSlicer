@@ -24,7 +24,7 @@ EncodedRaster PNGRasterEncoder::operator()(const void *ptr, size_t w, size_t h,
 {
     std::vector<uint8_t> buf;
     size_t s = 0;
-    
+
     void *rawdata = tdefl_write_image_to_png_file_in_memory(
         ptr, int(w), int(h), int(num_components), &s);
     
@@ -95,6 +95,55 @@ EncodedRaster PNGPreviewEncoder::operator()(const void *ptr, size_t w, size_t h,
     MZ_FREE(rawdata);
 
     return EncodedRaster(std::move(buf), "png");
+}
+
+// [layer-rle] PRZ V3.0 RLE encoder. Byte-for-byte mirror of
+// agent/prz_encoder.py:_rle_encode_layer (row-major over the grayscale samples).
+EncodedRaster RLERasterEncoder::operator()(const void *ptr, size_t w, size_t h,
+                                           size_t      num_components)
+{
+    static const uint8_t PRZ_LAYER_HEADER = 0x55;
+    static const uint8_t RLE_BLACK = 0x00, RLE_WHITE = 0xC0, RLE_GRAY = 0x40;
+
+    const uint8_t *src    = static_cast<const uint8_t *>(ptr);
+    const size_t   n      = w * h;
+    const size_t   stride = num_components ? num_components : 1;
+
+    std::vector<uint8_t> out;
+    out.reserve(n / 8 + 64);
+    out.push_back(PRZ_LAYER_HEADER);
+
+    auto emit_run = [&out](uint8_t value, uint32_t run_len) {
+        uint8_t color_type = (value == 0) ? RLE_BLACK
+                           : (value == 255) ? RLE_WHITE : RLE_GRAY;
+        uint8_t bcb; int extra;
+        if      (run_len < 16)      { bcb = 0x00; extra = 0; }
+        else if (run_len < 4096)    { bcb = 0x10; extra = 1; }
+        else if (run_len < 1048576) { bcb = 0x20; extra = 2; }
+        else                        { bcb = 0x30; extra = 3; }
+        out.push_back(uint8_t(color_type | bcb | (run_len & 0x0F)));
+        if (color_type == RLE_GRAY) out.push_back(value);
+        uint32_t shifted = run_len >> 4;             // big-endian extra bytes
+        for (int b = extra - 1; b >= 0; --b)
+            out.push_back(uint8_t((shifted >> (8 * b)) & 0xFF));
+    };
+
+    if (n > 0) {
+        uint8_t  cur = src[0];
+        uint32_t run = 1;
+        for (size_t p = 1; p < n; ++p) {
+            uint8_t v = src[p * stride];
+            if (v == cur) ++run;
+            else { emit_run(cur, run); cur = v; run = 1; }
+        }
+        emit_run(cur, run);
+    }
+
+    uint32_t sum = 0;                                 // checksum excludes header
+    for (size_t k = 1; k < out.size(); ++k) sum += out[k];
+    out.push_back(uint8_t((~sum) & 0xFF));
+
+    return EncodedRaster(std::move(out), "rle");
 }
 
 std::ostream &operator<<(std::ostream &stream, const EncodedRaster &bytes)

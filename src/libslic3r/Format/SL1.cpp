@@ -30,6 +30,7 @@
 #include "ZipperArchiveImport.hpp"
 
 #include "libslic3r/MarchingSquares.hpp"
+#include <cstdlib>  // [layer-rle] getenv
 #include "libslic3r/PNGReadWrite.hpp"
 #include "libslic3r/ClipperUtils.hpp"
 
@@ -347,6 +348,14 @@ std::unique_ptr<sla::RasterBase> SL1Archive::create_raster() const
 
 sla::RasterEncoder SL1Archive::get_encoder() const
 {
+    // [layer-rle] Emit layers directly as PRZ-compatible RLE when requested
+    // (PRZ fast path: the backend reads them verbatim, no PNG round-trip).
+    // Opt-in via SLA_LAYER_RLE; the default PNG path is untouched. Any AA/blur
+    // post-processing already ran in the raster (see create_raster), so the
+    // pixel buffer is final regardless of which encoder we pick.
+    if (std::getenv("SLA_LAYER_RLE"))
+        return sla::RLERasterEncoder{};
+
     // Post-processing (AA quantization + blur) now runs in the raster via the
     // injected RasterPostProcessor (see create_raster), applied before the binary
     // support is drawn. The encoder is therefore a plain PNG writer.
