@@ -19,25 +19,14 @@
 
 namespace Slic3r { namespace sla {
 
-// [png-level] miniz default is level 6 (slow); binary SLA layers compress
-// nearly as small at level 1-2 but much faster. Tunable via SLA_PNG_LEVEL.
-static int sla_png_level()
-{
-    static int lvl = []() {
-        const char *e = std::getenv("SLA_PNG_LEVEL");
-        return e ? std::atoi(e) : 6;
-    }();
-    return lvl;
-}
-
 EncodedRaster PNGRasterEncoder::operator()(const void *ptr, size_t w, size_t h,
                                            size_t      num_components)
 {
     std::vector<uint8_t> buf;
     size_t s = 0;
 
-    void *rawdata = tdefl_write_image_to_png_file_in_memory_ex(
-        ptr, int(w), int(h), int(num_components), &s, sla_png_level(), MZ_FALSE);
+    void *rawdata = tdefl_write_image_to_png_file_in_memory(
+        ptr, int(w), int(h), int(num_components), &s);
     
     // On error, data() will return an empty vector. No other info can be
     // retrieved from miniz anyway...
@@ -95,8 +84,8 @@ EncodedRaster PNGPreviewEncoder::operator()(const void *ptr, size_t w, size_t h,
     // Encode downscaled buffer to PNG
     std::vector<uint8_t> buf;
     size_t s = 0;
-    void *rawdata = tdefl_write_image_to_png_file_in_memory_ex(
-        dst.data(), int(new_w), int(new_h), int(num_components), &s, sla_png_level(), MZ_FALSE);
+    void *rawdata = tdefl_write_image_to_png_file_in_memory(
+        dst.data(), int(new_w), int(new_h), int(num_components), &s);
 
     if (rawdata == nullptr) return EncodedRaster({}, "png");
 
