@@ -135,6 +135,12 @@ if (MINGW)
     set_target_properties(PrusaSlicer PROPERTIES PREFIX "")
 endif (MINGW)
 
+if (APPLE)
+    # Keep target name PrusaSlicer for CMake graph; ship as slicer-engine (de-id L1).
+    set_target_properties(PrusaSlicer PROPERTIES OUTPUT_NAME "slicer-engine")
+    target_compile_options(PrusaSlicer PRIVATE -fvisibility=hidden -fvisibility-inlines-hidden)
+endif ()
+
 if (NOT WIN32 AND NOT APPLE)
     # Binary name on unix like systems (Linux, Unix)
     set_target_properties(PrusaSlicer PROPERTIES OUTPUT_NAME "prusa-slicer")

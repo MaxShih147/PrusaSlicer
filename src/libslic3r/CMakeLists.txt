@@ -546,6 +546,12 @@ endif ()
 
 add_library(libslic3r STATIC ${SLIC3R_SOURCES})
 
+# De-id PoC (macOS): hide symbols so consumer strip can remove brand-readable names from .ips stacks.
+# Result-oriented; revisit allowlist if link/runtime breaks.
+if (APPLE)
+    target_compile_options(libslic3r PRIVATE -fvisibility=hidden -fvisibility-inlines-hidden)
+endif ()
+
 if (WIN32)
     target_compile_definitions(libslic3r PUBLIC NOMINMAX)
 endif()

@@ -207,7 +207,7 @@ static bool read(Data& data, int argc, const char* const argv[])
 static bool setup_common()
 {
     // Mark the main thread for the debugger and for runtime checks.
-    set_current_thread_name("slic3r_main");
+    set_current_thread_name("slicer-worker");
     // Save the thread ID of the main thread.
     save_main_thread_id();
 

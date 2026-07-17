@@ -15,6 +15,12 @@
 #include "Geometry.hpp"
 #include "Thread.hpp"
 
+#include <cstdlib>
+#include <cstring>
+#include <cstdio>
+#include <typeinfo>
+#include <stdexcept>
+#include <exception>
 #include <unordered_set>
 #include <numeric>
 
@@ -817,8 +823,64 @@ bool SLAPrint::invalidate_step(SLAPrintStep step)
     return invalidated;
 }
 
+// PoC / QA crash harness (runtime env). MUST NOT ship in consumer release
+// without compile-time isolation (see crash-harness-forensics.md).
+// Modes via BUNDLE_QA_CRASH_MODE=overflow|segfault|exception
+// Compat: BUNDLE_FORCE_PRUSA_STACK_OVERFLOW=1 → overflow
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((noinline, optnone))
+#endif
+static void bundle_force_stack_overflow()
+{
+    volatile char pad[8192];
+    pad[0] = 1;
+    bundle_force_stack_overflow();
+}
+
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((noinline, optnone))
+#endif
+static void bundle_force_segfault()
+{
+    volatile int *p = nullptr;
+    *p = 1;
+}
+
+namespace qa {
+struct BundleQaForcedException : public std::runtime_error
+{
+    BundleQaForcedException() : std::runtime_error("bundle qa forced exception") {}
+};
+} // namespace qa
+
+static void bundle_qa_maybe_force_crash()
+{
+    const char *mode = std::getenv("BUNDLE_QA_CRASH_MODE");
+    const char *legacy = std::getenv("BUNDLE_FORCE_PRUSA_STACK_OVERFLOW");
+    if ((!mode || !mode[0]) && legacy && legacy[0] == '1')
+        mode = "overflow";
+    if (!mode || !mode[0])
+        return;
+
+    if (std::strcmp(mode, "overflow") == 0) {
+        bundle_force_stack_overflow();
+    } else if (std::strcmp(mode, "segfault") == 0) {
+        bundle_force_segfault();
+    } else if (std::strcmp(mode, "exception") == 0) {
+        // CLI top-level catches std::exception; throwing from noexcept forces
+        // std::terminate → abort so ReportCrash still produces an .ips, while
+        // RTTI/typeinfo for BundleQaForcedException remains testable in the binary.
+        auto boom = []() noexcept {
+            throw qa::BundleQaForcedException();
+        };
+        boom();
+    }
+}
+
 void SLAPrint::process()
 {
+    bundle_qa_maybe_force_crash();
+
     if (m_objects.empty())
         return;
 

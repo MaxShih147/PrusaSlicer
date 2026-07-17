@@ -269,7 +269,7 @@ void name_tbb_thread_pool_threads_set_locale()
 			} else {
 				assert(range.begin() > 0);
 				std::ostringstream name;
-		        name << "slic3r_tbb_" << range.begin();
+		        name << "slicer-tbb-" << range.begin();
 		        set_current_thread_name(name.str().c_str());
                 // Set locales of the worker thread to "C".
                 set_c_locales();
