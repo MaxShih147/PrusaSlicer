@@ -1,0 +1,23 @@
+1 VERSIONINFO
+FILEVERSION @SLIC3R_RC_VERSION@
+PRODUCTVERSION @SLIC3R_RC_VERSION@
+{
+ BLOCK "StringFileInfo"
+ {
+  BLOCK "040904E4"
+  {
+   VALUE "CompanyName", "@SLIC3R_COMPANY_NAME@"
+   VALUE "FileDescription", "@SLIC3R_APP_NAME@"
+   VALUE "FileVersion", "@SLIC3R_BUILD_ID@"
+   VALUE "ProductName", "@SLIC3R_APP_NAME@"
+   VALUE "ProductVersion", "@SLIC3R_BUILD_ID@"
+   VALUE "InternalName", "slicer_core"
+   VALUE "LegalCopyright", "@SLIC3R_COPYRIGHT@"
+   VALUE "OriginalFilename", "slicer_core.dll"
+  }
+ }
+ BLOCK "VarFileInfo"
+ {
+   VALUE "Translation", 0x409, 1252
+ }
+}

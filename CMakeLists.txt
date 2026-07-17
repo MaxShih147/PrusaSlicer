@@ -496,6 +496,14 @@ if (NOT TARGET cereal::cereal)
 else()
     target_link_libraries(libcereal INTERFACE cereal::cereal)
 endif()
+# Monolithic engine: neutralize cereal StaticObject dllexport / default visibility
+# so Windows export table stays at exactly slicer_run_cli (tasks 5.3 / W-EXP-1).
+# Must be GLOBAL — every TU that includes cereal (libslic3r, libseqarrange,
+# slic3r-arrange, …) otherwise emits /EXPORT:StaticObject… into the DLL.
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/PatchCerealForceStatic.cmake)
+slicer_patch_cereal_force_static()
+target_compile_definitions(libcereal INTERFACE CEREAL_FORCE_STATIC)
+add_compile_definitions(CEREAL_FORCE_STATIC)
 
 # l10n
 set(L10N_DIR "${SLIC3R_RESOURCES_DIR}/localization")

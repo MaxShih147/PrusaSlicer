@@ -1,6 +1,6 @@
-; Consumer / QA export surface (windows-policy.md W-EXP-1).
-; Prefer a single public entry. Residual __declspec(dllexport) from
-; third-party templates may still appear until cereal export hygiene (5.3).
+; Consumer / QA export surface (windows-policy.md W-EXP-1 / tasks 5.3).
+; Exactly one public entry. Cereal StaticObject dllexport is neutralized via
+; CEREAL_FORCE_STATIC (see cmake/PatchCerealForceStatic.cmake).
 LIBRARY slicer_core
 EXPORTS
     slicer_run_cli

@@ -95,6 +95,7 @@ endif()
 # Create a slic3r executable
 # Process mainfests for various platforms.
 configure_file(${CMAKE_CURRENT_SOURCE_DIR}/platform/msw/PrusaSlicer.rc.in ${CMAKE_CURRENT_BINARY_DIR}/PrusaSlicer.rc @ONLY)
+configure_file(${CMAKE_CURRENT_SOURCE_DIR}/platform/msw/slicer_core.rc.in ${CMAKE_CURRENT_BINARY_DIR}/slicer_core.rc @ONLY)
 configure_file(${CMAKE_CURRENT_SOURCE_DIR}/platform/msw/PrusaSlicer-gcodeviewer.rc.in ${CMAKE_CURRENT_BINARY_DIR}/PrusaSlicer-gcodeviewer.rc @ONLY)
 configure_file(${CMAKE_CURRENT_SOURCE_DIR}/platform/msw/PrusaSlicer.manifest.in ${CMAKE_CURRENT_BINARY_DIR}/PrusaSlicer.manifest @ONLY)
 configure_file(${CMAKE_CURRENT_SOURCE_DIR}/platform/osx/Info.plist.in ${CMAKE_CURRENT_BINARY_DIR}/Info.plist @ONLY)
@@ -133,8 +134,8 @@ if (WIN32)
         target_link_options(PrusaSlicer PRIVATE
             "$<$<CONFIG:RELEASE>:/DEBUG>"
             "$<$<CONFIG:RELEASE>:/PDBALTPATH:slicer_core.pdb>")
-        # Attach VERSIONINFO to DLL (baseline DLL had empty resources)
-        target_sources(PrusaSlicer PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/PrusaSlicer.rc)
+        # DLL-specific VERSIONINFO (OriginalFilename=slicer_core.dll)
+        target_sources(PrusaSlicer PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/slicer_core.rc)
     endif ()
 else ()
     set(_prusaslicer_sources PrusaSlicer.cpp ${SLIC3R_CLI_SOURCES})

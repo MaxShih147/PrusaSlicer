@@ -71,8 +71,10 @@ extern "C" {
 #endif
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
+// Export via slicer_core.def only (no __declspec) so cereal residuals cannot
+// share the export surface with an extra dllexport on this entry (W-EXP-1).
 extern "C" {
-    __declspec(dllexport) int __stdcall slicer_run_cli(int argc, wchar_t **argv)
+    int __stdcall slicer_run_cli(int argc, wchar_t **argv)
     {
 #ifdef BUNDLE_QA_CRASH_HARNESS
         Slic3r::BundleQa::maybe_force_crash();
