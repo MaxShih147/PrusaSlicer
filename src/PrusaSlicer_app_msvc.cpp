@@ -304,25 +304,23 @@ int wmain(int argc, wchar_t **argv)
 
     wchar_t path_to_slic3r[MAX_PATH + 1] = { 0 };
     wcscpy(path_to_slic3r, path_to_exe);
-    wcscat(path_to_slic3r, L"PrusaSlicer.dll");
-//	printf("Loading Slic3r library: %S\n", path_to_slic3r);
+    wcscat(path_to_slic3r, L"slicer_core.dll");
     HINSTANCE hInstance_Slic3r = LoadLibraryExW(path_to_slic3r, nullptr, 0);
     if (hInstance_Slic3r == nullptr) {
-        printf("PrusaSlicer.dll was not loaded\n");
+        printf("Failed to load slicing engine module\n");
         return -1;
     }
 
     // resolve function address here
     slic3r_main = (Slic3rMainFunc)GetProcAddress(hInstance_Slic3r,
 #ifdef _WIN64
-        // there is just a single calling conversion, therefore no mangling of the function name.
-        "slic3r_main"
-#else	// stdcall calling convention declaration
-        "_slic3r_main@8"
+        "slicer_run_cli"
+#else
+        "_slicer_run_cli@8"
 #endif
         );
     if (slic3r_main == nullptr) {
-        printf("could not locate the function slic3r_main in PrusaSlicer.dll\n");
+        printf("could not locate slicer_run_cli in slicing engine module\n");
         return -1;
     }
     // argc minus the trailing nullptr of the argv

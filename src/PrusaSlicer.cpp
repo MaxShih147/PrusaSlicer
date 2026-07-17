@@ -30,6 +30,10 @@
 #include <boost/nowide/args.hpp>
 
 #include "libslic3r/libslic3r.h"
+#include "CLI/CLI.hpp"
+#ifdef BUNDLE_QA_CRASH_HARNESS
+#include "bundle_qa_crash_probe.hpp"
+#endif
 
 #include "PrusaSlicer.hpp"
 
@@ -68,8 +72,11 @@ extern "C" {
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
 extern "C" {
-    __declspec(dllexport) int __stdcall slic3r_main(int argc, wchar_t **argv)
+    __declspec(dllexport) int __stdcall slicer_run_cli(int argc, wchar_t **argv)
     {
+#ifdef BUNDLE_QA_CRASH_HARNESS
+        Slic3r::BundleQa::maybe_force_crash();
+#endif
         // Convert wchar_t arguments to UTF8.
         std::vector<std::string> 	argv_narrow;
         std::vector<char*>			argv_ptrs(argc + 1, nullptr);
@@ -84,6 +91,9 @@ extern "C" {
 #else /* _MSC_VER */
 int main(int argc, char **argv)
 {
+#ifdef BUNDLE_QA_CRASH_HARNESS
+    Slic3r::BundleQa::maybe_force_crash();
+#endif
     return Slic3r::CLI::run(argc, argv);
 }
 #endif /* _MSC_VER */

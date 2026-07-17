@@ -84,6 +84,8 @@ endif ()
 
 option(SLIC3R_BUILD_SANDBOXES   "Build development sandboxes" OFF)
 option(SLIC3R_BUILD_TESTS       "Build unit tests" ON)
+# QA-only compile-time crash harness (REQ-DEID-009). Consumer builds MUST keep OFF.
+option(BUNDLE_QA_CRASH_HARNESS  "Compile QA crash probe (overflow/segfault/exception)" OFF)
 
 if (IS_CROSS_COMPILE)
     message("Detected cross compilation setup. Tests and encoding checks will be forcedly disabled!")
@@ -107,6 +109,10 @@ if (SLIC3R_REPO_URL)
 endif()
 if (SLIC3R_GUI)
     add_definitions(-DSLIC3R_GUI)
+endif ()
+if (BUNDLE_QA_CRASH_HARNESS)
+    add_definitions(-DBUNDLE_QA_CRASH_HARNESS)
+    message(STATUS "BUNDLE_QA_CRASH_HARNESS: ON (QA flavor — do not ship as consumer)")
 endif ()
 
 if (SLIC3R_OPENGL_ES)

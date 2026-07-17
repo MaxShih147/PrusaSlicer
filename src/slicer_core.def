@@ -1,0 +1,6 @@
+; Consumer / QA export surface (windows-policy.md W-EXP-1).
+; Prefer a single public entry. Residual __declspec(dllexport) from
+; third-party templates may still appear until cereal export hygiene (5.3).
+LIBRARY slicer_core
+EXPORTS
+    slicer_run_cli

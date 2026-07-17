@@ -119,9 +119,29 @@ if (SLIC3R_GUI)
 endif ()
 
 if (WIN32)
-    add_library(PrusaSlicer SHARED PrusaSlicer.cpp ${SLIC3R_CLI_SOURCES})
+    set(_prusaslicer_sources PrusaSlicer.cpp ${SLIC3R_CLI_SOURCES})
+    if (BUNDLE_QA_CRASH_HARNESS)
+        list(APPEND _prusaslicer_sources bundle_qa_crash_probe.cpp)
+    endif ()
+    add_library(PrusaSlicer SHARED ${_prusaslicer_sources})
+    # windows-policy.md: neutral DLL name + single intentional export entry
+    set_target_properties(PrusaSlicer PROPERTIES OUTPUT_NAME "slicer_core")
+    target_sources(PrusaSlicer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/slicer_core.def)
+    if (MSVC)
+        target_link_options(PrusaSlicer PRIVATE "/DEF:${CMAKE_CURRENT_SOURCE_DIR}/slicer_core.def")
+        # PDB produce + short alt path (no brand build-tree path in PE)
+        target_link_options(PrusaSlicer PRIVATE
+            "$<$<CONFIG:RELEASE>:/DEBUG>"
+            "$<$<CONFIG:RELEASE>:/PDBALTPATH:slicer_core.pdb>")
+        # Attach VERSIONINFO to DLL (baseline DLL had empty resources)
+        target_sources(PrusaSlicer PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/PrusaSlicer.rc)
+    endif ()
 else ()
-    add_executable(PrusaSlicer PrusaSlicer.cpp ${SLIC3R_CLI_SOURCES})
+    set(_prusaslicer_sources PrusaSlicer.cpp ${SLIC3R_CLI_SOURCES})
+    if (BUNDLE_QA_CRASH_HARNESS)
+        list(APPEND _prusaslicer_sources bundle_qa_crash_probe.cpp)
+    endif ()
+    add_executable(PrusaSlicer ${_prusaslicer_sources})
 endif ()
 
 foreach(_source IN ITEMS ${SLIC3R_CLI_SOURCES})
@@ -202,11 +222,13 @@ if (WIN32)
     add_executable(PrusaSlicer_app_console PrusaSlicer_app_msvc.cpp ${CMAKE_CURRENT_BINARY_DIR}/PrusaSlicer.rc)
     # Generate debug symbols even in release mode.
     if (MSVC)
-        target_link_options(PrusaSlicer_app_console PUBLIC "$<$<CONFIG:RELEASE>:/DEBUG>")
+        target_link_options(PrusaSlicer_app_console PUBLIC
+            "$<$<CONFIG:RELEASE>:/DEBUG>"
+            "$<$<CONFIG:RELEASE>:/PDBALTPATH:slicer-engine.pdb>")
     endif ()
     target_compile_definitions(PrusaSlicer_app_console PRIVATE -DSLIC3R_WRAPPER_CONSOLE)
     add_dependencies(PrusaSlicer_app_console PrusaSlicer)
-    set_target_properties(PrusaSlicer_app_console PROPERTIES OUTPUT_NAME "prusa-slicer-console")
+    set_target_properties(PrusaSlicer_app_console PROPERTIES OUTPUT_NAME "slicer-engine")
     target_link_libraries(PrusaSlicer_app_console PRIVATE boost_headeronly)
 
     add_executable(PrusaSlicer_app_gcodeviewer WIN32 PrusaSlicer_app_msvc.cpp ${CMAKE_CURRENT_BINARY_DIR}/PrusaSlicer-gcodeviewer.rc)
