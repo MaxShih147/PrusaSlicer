@@ -22,6 +22,8 @@
 #endif /* WIN32 */
 
 #include <cstdio>
+#include <cstdlib>
+#include <exception>
 #include <string>
 #include <cstring>
 #include <iostream>
@@ -36,6 +38,24 @@
 #endif
 
 #include "PrusaSlicer.hpp"
+
+namespace {
+
+// REQ-DEID-006 / tasks 5.1b: libc++abi's default terminate handler prints
+// demangled type names (e.g. Slic3r::…). Replace with a brand-neutral abort.
+[[noreturn]] void slicer_engine_neutral_terminate() noexcept
+{
+    std::fputs("slicer-engine: fatal error\n", stderr);
+    std::fflush(stderr);
+    std::abort();
+}
+
+void slicer_engine_install_exception_guards()
+{
+    std::set_terminate(slicer_engine_neutral_terminate);
+}
+
+} // namespace
 
 // __has_feature() is used later for Clang, this is for compatibility with other compilers (such as GCC and MSVC)
 #ifndef __has_feature
@@ -76,26 +96,36 @@ extern "C" {
 extern "C" {
     int __stdcall slicer_run_cli(int argc, wchar_t **argv)
     {
+        slicer_engine_install_exception_guards();
+        try {
 #ifdef BUNDLE_QA_CRASH_HARNESS
-        Slic3r::BundleQa::maybe_force_crash();
+            Slic3r::BundleQa::maybe_force_crash();
 #endif
-        // Convert wchar_t arguments to UTF8.
-        std::vector<std::string> 	argv_narrow;
-        std::vector<char*>			argv_ptrs(argc + 1, nullptr);
-        for (size_t i = 0; i < argc; ++ i)
-            argv_narrow.emplace_back(boost::nowide::narrow(argv[i]));
-        for (size_t i = 0; i < argc; ++ i)
-            argv_ptrs[i] = argv_narrow[i].data();
-        // Call the UTF8 main.
-        return Slic3r::CLI::run(argc, argv_ptrs.data());
+            // Convert wchar_t arguments to UTF8.
+            std::vector<std::string> 	argv_narrow;
+            std::vector<char*>			argv_ptrs(argc + 1, nullptr);
+            for (size_t i = 0; i < argc; ++ i)
+                argv_narrow.emplace_back(boost::nowide::narrow(argv[i]));
+            for (size_t i = 0; i < argc; ++ i)
+                argv_ptrs[i] = argv_narrow[i].data();
+            // Call the UTF8 main.
+            return Slic3r::CLI::run(argc, argv_ptrs.data());
+        } catch (...) {
+            slicer_engine_neutral_terminate();
+        }
     }
 }
 #else /* _MSC_VER */
 int main(int argc, char **argv)
 {
+    slicer_engine_install_exception_guards();
+    try {
 #ifdef BUNDLE_QA_CRASH_HARNESS
-    Slic3r::BundleQa::maybe_force_crash();
+        Slic3r::BundleQa::maybe_force_crash();
 #endif
-    return Slic3r::CLI::run(argc, argv);
+        return Slic3r::CLI::run(argc, argv);
+    } catch (...) {
+        slicer_engine_neutral_terminate();
+    }
 }
 #endif /* _MSC_VER */
