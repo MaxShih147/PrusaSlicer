@@ -226,7 +226,7 @@ void BackgroundSlicingProcess::process_sla()
 
 void BackgroundSlicingProcess::thread_proc()
 {
-	set_current_thread_name("slicer-bg");
+	set_current_thread_name("slicer-bg-slc");
     name_tbb_thread_pool_threads_set_locale();
 
     // Set "C" locales and enforce OSX QoS level on all threads entering an arena.

@@ -32,3 +32,8 @@ add_library(slic3r-arrange STATIC
 target_include_directories(slic3r-arrange PRIVATE src)
 target_include_directories(slic3r-arrange PUBLIC include)
 target_link_libraries(slic3r-arrange PUBLIC libslic3r)
+
+if (APPLE)
+    # De-id C′ (5.1): hide arr2 / NFP symbols that otherwise remain global after strip.
+    target_compile_options(slic3r-arrange PRIVATE -fvisibility=hidden -fvisibility-inlines-hidden)
+endif ()

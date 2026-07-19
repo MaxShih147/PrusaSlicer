@@ -3,17 +3,17 @@
 <plist version="1.0">
 <dict>
   <key>CFBundleExecutable</key>
-  <string>@SLIC3R_APP_KEY@</string>
+  <string>slicer-engine</string>
   <key>CFBundleGetInfoString</key>
-  <string>@SLIC3R_APP_NAME@ Copyright (C) 2011-2019 Alessandro Ranellucci, (C) 2016-2025 Prusa Reseach</string>
+  <string>@SLIC3R_APP_NAME@ — based on AGPL-licensed upstream; see bundled licenses</string>
   <key>CFBundleIconFile</key>
-  <string>PrusaSlicer.icns</string>
+  <string>slicer-engine.icns</string>
   <key>CFBundleName</key>
-  <string>@SLIC3R_APP_KEY@</string>
+  <string>slicer-engine</string>
   <key>CFBundleShortVersionString</key>
-  <string>@SLIC3R_APP_NAME@ @SLIC3R_BUILD_ID@</string>
+  <string>@SLIC3R_APP_NAME@ @SLIC3R_VERSION@</string>
   <key>CFBundleIdentifier</key>
-  <string>com.prusa3d.slic3r/</string>
+  <string>slicer-engine</string>
   <key>CFBundleInfoDictionaryVersion</key>
   <string>6.0</string>
   <key>CFBundlePackageType</key>
@@ -30,14 +30,10 @@
         <string>stl</string>
         <string>STL</string>
       </array>
-      <key>CFBundleTypeIconFile</key>
-      <string>stl.icns</string>
       <key>CFBundleTypeName</key>
       <string>STL</string>
       <key>CFBundleTypeRole</key>
       <string>Viewer</string>
-      <key>LISsAppleDefaultForType</key>
-      <true/>
       <key>LSHandlerRank</key>
       <string>Alternate</string>
     </dict>
@@ -47,14 +43,10 @@
         <string>obj</string>
         <string>OBJ</string>
       </array>
-      <key>CFBundleTypeIconFile</key>
-      <string>PrusaSlicer.icns</string>
       <key>CFBundleTypeName</key>
-      <string>STL</string>
+      <string>OBJ</string>
       <key>CFBundleTypeRole</key>
       <string>Viewer</string>
-      <key>LISsAppleDefaultForType</key>
-      <true/>
       <key>LSHandlerRank</key>
       <string>Alternate</string>
     </dict>
@@ -64,14 +56,10 @@
         <string>amf</string>
         <string>AMF</string>
       </array>
-      <key>CFBundleTypeIconFile</key>
-      <string>PrusaSlicer.icns</string>
       <key>CFBundleTypeName</key>
       <string>AMF</string>
       <key>CFBundleTypeRole</key>
       <string>Viewer</string>
-      <key>LISsAppleDefaultForType</key>
-      <true/>
       <key>LSHandlerRank</key>
       <string>Alternate</string>
     </dict>
@@ -81,14 +69,10 @@
         <string>3mf</string>
         <string>3MF</string>
       </array>
-      <key>CFBundleTypeIconFile</key>
-      <string>PrusaSlicer.icns</string>
       <key>CFBundleTypeName</key>
       <string>3MF</string>
       <key>CFBundleTypeRole</key>
       <string>Viewer</string>
-      <key>LISsAppleDefaultForType</key>
-      <true/>
       <key>LSHandlerRank</key>
       <string>Alternate</string>
     </dict>
@@ -98,14 +82,10 @@
         <string>gcode</string>
         <string>GCODE</string>
       </array>
-      <key>CFBundleTypeIconFile</key>
-      <string>gcode.icns</string>
       <key>CFBundleTypeName</key>
       <string>GCODE</string>
       <key>CFBundleTypeRole</key>
       <string>Viewer</string>
-      <key>LISsAppleDefaultForType</key>
-      <true/>
       <key>LSHandlerRank</key>
       <string>Alternate</string>
     </dict>
@@ -115,29 +95,14 @@
         <string>bgcode</string>
         <string>BGCODE</string>
       </array>
-      <key>CFBundleTypeIconFile</key>
-      <string>bgcode.icns</string>
       <key>CFBundleTypeName</key>
       <string>BGCODE</string>
       <key>CFBundleTypeRole</key>
       <string>Viewer</string>
-      <key>LISsAppleDefaultForType</key>
-      <true/>
       <key>LSHandlerRank</key>
       <string>Alternate</string>
     </dict>
   </array>
-  <key>CFBundleURLTypes</key>
-    <array>
-      <dict>
-        <key>CFBundleURLName</key>
-        <string>PrusaSlicer Downloads</string>
-        <key>CFBundleURLSchemes</key>
-        <array>
-          <string>prusaslicer</string>
-        </array>
-      </dict>
-    </array>
   <key>LSMinimumSystemVersion</key>
   <string>10.13</string>
   <key>NSPrincipalClass</key>

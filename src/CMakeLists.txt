@@ -160,6 +160,9 @@ if (APPLE)
     # Keep target name PrusaSlicer for CMake graph; ship as slicer-engine (de-id L1).
     set_target_properties(PrusaSlicer PROPERTIES OUTPUT_NAME "slicer-engine")
     target_compile_options(PrusaSlicer PRIVATE -fvisibility=hidden -fvisibility-inlines-hidden)
+    # Extra nm converge (5.1): headless CLI only needs _main in the dynamic symbol table.
+    # Complements visibility+strip; not a substitute for them (design.md D3).
+    target_link_options(PrusaSlicer PRIVATE -Wl,-exported_symbol,_main)
 endif ()
 
 if (NOT WIN32 AND NOT APPLE)
@@ -287,13 +290,16 @@ if (WIN32)
 
 else ()
     if (APPLE)
-        # On OSX, the name of the binary matches the name of the Application.
+        # De-id L1: OUTPUT_NAME is slicer-engine. Do not create branded PrusaSlicer /
+        # prusa-slicer / prusa-gcodeviewer symlinks (naming-manifest §3.1).
+        # Remove any stale brand names left from earlier builds in the same output dir.
         add_custom_command(TARGET PrusaSlicer POST_BUILD
-            COMMAND ln -sf PrusaSlicer prusa-slicer
-            COMMAND ln -sf PrusaSlicer prusa-gcodeviewer
-            COMMAND ln -sf PrusaSlicer PrusaGCodeViewer
-            WORKING_DIRECTORY "$<TARGET_FILE_DIR:PrusaSlicer>"
-            COMMENT "Symlinking the G-code viewer to PrusaSlicer, symlinking to prusa-slicer and prusa-gcodeviewer"
+            COMMAND ${CMAKE_COMMAND} -E rm -f
+                "$<TARGET_FILE_DIR:PrusaSlicer>/PrusaSlicer"
+                "$<TARGET_FILE_DIR:PrusaSlicer>/prusa-slicer"
+                "$<TARGET_FILE_DIR:PrusaSlicer>/prusa-gcodeviewer"
+                "$<TARGET_FILE_DIR:PrusaSlicer>/PrusaGCodeViewer"
+            COMMENT "Removing branded macOS engine symlinks/stale names from build tree"
             VERBATIM)
     else ()
         add_custom_command(TARGET PrusaSlicer POST_BUILD
@@ -321,6 +327,9 @@ if (WIN32)
         install(TARGETS PrusaSlicer_app_gui RUNTIME DESTINATION "${CMAKE_INSTALL_PREFIX}")
         install(TARGETS PrusaSlicer_app_console RUNTIME DESTINATION "${CMAKE_INSTALL_PREFIX}")
     endif ()
+elseif (APPLE)
+    # Headless CLI: install as slicer-engine only (no branded gcodeviewer symlink).
+    install(TARGETS PrusaSlicer RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
 else ()
     install(TARGETS PrusaSlicer RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
 

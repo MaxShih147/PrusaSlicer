@@ -584,6 +584,9 @@ add_library(libslic3r_cgal STATIC
     Triangulation.hpp Triangulation.cpp
     SLA/SupportIslands/VoronoiDiagramCGAL.hpp SLA/SupportIslands/VoronoiDiagramCGAL.cpp
 )
+if (APPLE)
+    target_compile_options(libslic3r_cgal PRIVATE -fvisibility=hidden -fvisibility-inlines-hidden)
+endif ()
 target_include_directories(libslic3r_cgal PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 target_include_directories(libslic3r_cgal PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
 

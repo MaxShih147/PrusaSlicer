@@ -33,3 +33,8 @@ add_library(slic3r-arrange-wrapper STATIC
 target_include_directories(slic3r-arrange-wrapper PRIVATE src)
 target_include_directories(slic3r-arrange-wrapper PUBLIC include)
 target_link_libraries(slic3r-arrange-wrapper PUBLIC slic3r-arrange)
+
+if (APPLE)
+    # De-id C′ (5.1): Arrangeable*/Task vtables & boost instantiations with Slic3r mangling.
+    target_compile_options(slic3r-arrange-wrapper PRIVATE -fvisibility=hidden -fvisibility-inlines-hidden)
+endif ()
