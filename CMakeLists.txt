@@ -152,6 +152,8 @@ if (MSVC)
     add_compile_options(/wd4244 /wd4267)
     # Enforce strict C++ conformance, so our code that compiles on MSVC also compiles on GCC and clang.
     add_compile_options(/permissive-)
+    # C1041: multiple CL writing to same .PDB when building in parallel; /FS forces synchronous PDB writes.
+    add_compile_options(/FS)
 endif ()
 
 if (MINGW)
