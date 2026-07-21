@@ -123,12 +123,6 @@ if (APPLE)
     )
 endif ()
 
-# CMake 4.x: subprojects with cmake_minimum_required < 3.5 need this to configure
-if (NOT DEFINED DEP_CMAKE_OPTS)
-  set(DEP_CMAKE_OPTS "")
-endif ()
-list(APPEND DEP_CMAKE_OPTS "-DCMAKE_POLICY_VERSION_MINIMUM=3.5")
-
 list_projects(FOUND_PACKAGES ${CMAKE_CURRENT_LIST_DIR})
 
 dep_message(STATUS "Found external package definitions: ${FOUND_PACKAGES}")
