@@ -17,6 +17,11 @@ include(CMakeDependentOption)
 
 set(SLIC3R_RESOURCES_DIR "${CMAKE_CURRENT_SOURCE_DIR}/resources")
 file(TO_NATIVE_PATH "${SLIC3R_RESOURCES_DIR}" SLIC3R_RESOURCES_DIR_WIN)
+# Windows PE icon SoT (must exist under resources/; wired into PrusaSlicer.rc.in)
+set(SLIC3R_APP_ICON "${SLIC3R_RESOURCES_DIR}/icons/slicer-engine.ico")
+if(WIN32 AND NOT EXISTS "${SLIC3R_APP_ICON}")
+    message(FATAL_ERROR "Missing SLIC3R_APP_ICON (PE icon SoT): ${SLIC3R_APP_ICON}")
+endif()
 
 if (NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   message(STATUS "No build type selected, default to Release")

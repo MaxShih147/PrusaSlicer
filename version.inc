@@ -12,3 +12,5 @@ set(SLIC3R_COMPANY_NAME "Phrozen")
 set(SLIC3R_INTERNAL_NAME "slicer-engine")
 set(SLIC3R_ORIGINAL_FILENAME "slicer-engine.exe")
 set(SLIC3R_COPYRIGHT "Copyright (c) Phrozen Tech Co., Ltd.")
+# SLIC3R_APP_ICON is set in root CMakeLists.txt after SLIC3R_RESOURCES_DIR
+# (resources/icons/slicer-engine.ico — PE icon SoT for PrusaSlicer.rc.in).
