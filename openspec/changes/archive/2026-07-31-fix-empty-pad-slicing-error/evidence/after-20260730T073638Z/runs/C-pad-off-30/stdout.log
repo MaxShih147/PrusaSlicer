@@ -1,0 +1,26 @@
+  0% => Assembling model from parts
+  9% => Hollowing model
+ 18% => Drilling holes into model.
+ 27% => Slicing model
+ 36% => Generating support points
+ 37% => Generating support points
+[2026-07-30 15:36:44.790166] [0x00004604] [error]   Detected missing Voronoi vertex even after the rotation of input.
+ 38% => Generating support points
+ 39% => Generating support points
+ 40% => Generating support points
+ 41% => Generating support points
+ 42% => Generating support points
+ 43% => Generating support points
+ 44% => Generating support points
+ 45% => Generating support points
+ 46% => Generating support points
+ 46% => Generating support tree
+ 48% => Generating support tree
+ 50% => Generating support tree
+ 51% => Generating support tree
+ 52% => Generating support tree
+ 53% => Generating support tree
+ 55% => Generating support tree
+ 55% => Generating pad
+100% => Slicing done
+Support mesh exported to D:/repos/web_slicer_core/third_party/prusaslicer_fork/openspec/changes/fix-empty-pad-slicing-error/evidence/after-20260730T073638Z/runs/C-pad-off-30/output/model_support.stl (supports only)

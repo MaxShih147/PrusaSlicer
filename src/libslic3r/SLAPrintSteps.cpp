@@ -1027,10 +1027,35 @@ void SLAPrint::Steps::generate_pad(SLAPrintObject &po) {
         ctl.cancelfn = [this]() { throw_if_canceled(); };
         po.m_supportdata->create_pad(ctl);
 
-        if (!validate_pad(po.m_supportdata->pad_mesh.its, pcfg))
-            throw Slic3r::SlicingError(
-                    _u8L("No pad can be generated for this model with the "
-                      "current configuration"));
+        if (!validate_pad(po.m_supportdata->pad_mesh.its, pcfg)) {
+            // Outside zero-elevation mode a pad can only be grown from the
+            // support tree's footprint. When supports were requested but not a
+            // single pillar came out, an empty pad is not a failure — there is
+            // simply nothing to build a pad from. Throwing here aborts
+            // process() before the support STL export runs, so the whole run
+            // loses every downstream signal (no marker on stdout, no STL on
+            // disk) and gets reported as a hard error. Degrade instead: land in
+            // the same end state as the pad_enable=0 branch below, let the run
+            // finish, and let the exporter emit its neutral
+            // "No support/pad mesh generated" marker.
+            //
+            // Every other cause of an invalid pad stays fail-closed.
+            const bool nothing_to_build_pad_from =
+                po.m_supportdata->pad_mesh.its.empty() &&
+                po.m_config.supports_enable.getBool() &&
+                po.m_supportdata->tree_mesh.empty();
+
+            if (!nothing_to_build_pad_from)
+                throw Slic3r::SlicingError(
+                        _u8L("No pad can be generated for this model with the "
+                          "current configuration"));
+
+            BOOST_LOG_TRIVIAL(warning)
+                << "Pad skipped: the support tree is empty, so there is no "
+                   "footprint to grow a pad from.";
+
+            po.m_supportdata->pad_mesh = {};
+        }
 
     } else if(po.m_supportdata) {
         po.m_supportdata->pad_mesh = {};
