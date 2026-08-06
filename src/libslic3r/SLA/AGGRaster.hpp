@@ -69,6 +69,9 @@ protected:
     // Defensive copy of the construction-time gamma so draw_binary() can
     // restore it after temporarily switching to a threshold LUT.
     std::function<double(double)> m_gammafn;
+    // Background the buffer was cleared to at construction; reset() needs it to
+    // put a reused instance back into its as-constructed state.
+    TColor m_background;
 
     void flipy(agg::path_storage &path) const
     {
@@ -159,7 +162,8 @@ public:
             m_pxdim_scaled.h_mm /= pd.h_mm;
         }
         m_renderer.color(foreground);
-        clear(background);
+        m_background = background;
+        clear(m_background);
 
         // Keep a type-erased copy of the gamma for defensive restore in
         // draw_binary(); store the injected post-processor (may be empty).
@@ -181,7 +185,16 @@ public:
 
     // Binary (threshold) draw: temporarily swap the rasterizer LUT to a hard
     // threshold so the polygon is rendered without AA, then restore the
-    // original gamma. Per-layer raster instances make this race-free.
+    // original gamma.
+    //
+    // The window between the two gamma() calls is only safe because a raster
+    // instance is never touched by two threads at once. Rasters are reused
+    // across layers (see SLAArchiveWriter::draw_layers), so that is no longer
+    // guaranteed by construction the way per-layer instances used to guarantee
+    // it -- it now rests on the instances being THREAD-BOUND. Anything that
+    // hands the same raster to a second thread, such as a shared pool that
+    // work-stealing can dip into, reintroduces the race here. This is a
+    // correctness requirement, not a performance preference.
     void draw_binary(const ExPolygon &poly) override
     {
         m_rasterizer.gamma(agg::gamma_threshold(0.5));
@@ -199,9 +212,25 @@ public:
                        PixelRenderer::num_components);
     }
 
+    // Put a reused instance back into its as-constructed state.
+    void reset() override
+    {
+        // The WHOLE buffer, not just the region drawn last time. The SL1
+        // post-process scans every 8-byte chunk and the encoders walk every
+        // pixel, so a survivor anywhere is wrong output rather than a stale
+        // corner nobody looks at. Clearing only a dirty region would need those
+        // consumers to agree on the same region; that is a later optimization,
+        // not something to assume here.
+        clear(m_background);
+        // draw_binary() leaves the threshold LUT installed if no gamma was
+        // captured to restore. Re-applying unconditionally makes the reused
+        // state exact no matter how the previous layer happened to be drawn.
+        if (m_gammafn) m_rasterizer.gamma(m_gammafn);
+    }
+
     EncodedRaster encode(RasterEncoder encoder) const override
     {
-        return encoder(m_buf.data(), m_resolution.width_px, m_resolution.height_px, 1);    
+        return encoder(m_buf.data(), m_resolution.width_px, m_resolution.height_px, 1);
     }
     
     void clear(const TColor color) { m_raw_renderer.clear(color); }

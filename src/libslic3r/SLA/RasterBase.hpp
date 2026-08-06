@@ -116,6 +116,18 @@ public:
     /// SVG) correctly inherit no behavior.
     virtual void apply_postprocess() {}
 
+    /// Return the raster to the state a freshly constructed one would be in, so
+    /// that one instance can serve consecutive layers instead of being rebuilt
+    /// for each of them.
+    ///
+    /// Deliberately has no default. Unlike draw_binary() and apply_postprocess()
+    /// above, "do nothing" is not a safe fallback here: an implementation that
+    /// forgets to clear what it accumulates would emit the previous layer's
+    /// content on top of the current one, and that is silently wrong output
+    /// rather than a missing feature. Making it pure turns the omission into a
+    /// compile error.
+    virtual void reset() = 0;
+
     /// Get the resolution of the raster.
 //    virtual Resolution resolution() const = 0;
 //    virtual PixelDim   pixel_dimensions() const = 0;
