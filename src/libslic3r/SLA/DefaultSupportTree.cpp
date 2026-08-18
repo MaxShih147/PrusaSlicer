@@ -167,6 +167,14 @@ bool DefaultSupportTree::execute(SupportTreeBuilder    &builder,
         program[pc]();
     }
 
+    // Both the pinhead pass and the model-body anchors report into the same
+    // counter, so one line covers the whole tree. Skipped on abort: the run was
+    // cancelled, the numbers are partial, and the user is not waiting on a
+    // diagnostic for work they just stopped.
+    if (pc != ABORT)
+        report_penetration_failsafes(alg.m_penetration_stats,
+                                     "Default support tree");
+
     return pc == ABORT;
 }
 
@@ -530,6 +538,23 @@ void DefaultSupportTree::add_pinheads()
             h.dir       = nn;
             h.width_mm  = lmin;
             h.r_back_mm = back_r;
+
+            // Thin wall protection, applied here and nowhere earlier. The angle
+            // search above - including the optimizer objective - runs entirely
+            // on the configured penetration, so the direction is picked exactly
+            // as it was before; only the committed head is trimmed. Measuring
+            // inside the objective would make the clamp depend on the direction
+            // while the direction is being scored through the clamp.
+            //
+            // This has to sit before the junction and pillar phases rather than
+            // after: junction() is pos + (fullwidth() - r_back) * dir and
+            // fullwidth() is real_width() - penetration, so shrinking the
+            // penetration pushes the junction outwards. Doing it later would
+            // leave the pillar starting at the old junction while the head mesh
+            // ends at the new one - a gap of up to the configured penetration.
+            h.penetration_mm = clamped_head_penetration(m_sm.emesh, hp, nn,
+                                                        m_sm.cfg.head_penetration_mm,
+                                                        &m_penetration_stats);
         } else if (back_r > m_sm.cfg.head_fallback_radius_mm) {
             filterfn(fidx, i, m_sm.cfg.head_fallback_radius_mm);
         }
@@ -729,8 +754,47 @@ bool DefaultSupportTree::connect_to_model_body(Head &head)
     long pillar_id = m_builder.add_pillar(head.id, hjp.z() - endp.z());
     Pillar &pill = m_builder.pillar(pillar_id);
 
-    Vec3d taildir = endp - hitp;
-    double dist = (hitp - endp).norm() + m_sm.cfg.head_penetration_mm;
+    // Direction of the anchor pin, pointing from the model surface up towards
+    // the pillar end. Head stores this vector verbatim and multiplies by it in
+    // junction(): pos + (fullwidth() - r_back_mm) * dir. A non-unit dir therefore
+    // stretches the junction by |dir| - and |endp - hitp| here is the anchor's
+    // own length in millimetres, not 1, so the junction lands far past where it
+    // belongs. Upstream 2.9.6 normalizes at this exact spot (see PrusaSlicer
+    // DefaultSupportTree.cpp:706); this fork predates that fix. #5 also needs a
+    // unit dir to cast its wall thickness ray, which is why this has to land
+    // before it. Note the length is not taken from this vector: `dist` below
+    // recomputes it from the same two points, so normalizing changes nothing else.
+    //
+    // The zero-length guard is ours, not upstream's. endp and hitp coincide when
+    // a mini pillar's tail width collapses to zero on a straight down scan, and
+    // Eigen's normalized() turns that into a NaN direction silently, which would
+    // then flow into the anchor mesh. The old code degenerated to a zero vector
+    // instead - equally meaningless, but at least finite. Fall back to straight
+    // up, the direction this vector provably has whenever it is not degenerate
+    // (endp.z() - hitp.z() == h >= 0 with the x/y components equal).
+    const Vec3d taildiff = endp - hitp;
+    const Vec3d taildir  = taildiff.squaredNorm() > EPSILON * EPSILON ?
+                               Vec3d{taildiff.normalized()} : Vec3d{-DOWN};
+    // Thin wall protection for the anchor, mirroring what add_pinheads() does
+    // for the main heads. An anchor is a reverse pinhead: its pin travels along
+    // the head's local +z, which maps to -taildir, and taildir points from the
+    // model surface up towards the pillar end - so -taildir goes down into the
+    // model body and hitp/taildir are exactly the contact point and head axis
+    // the measurement wants.
+    //
+    // There is no angle search to protect here (taildir falls straight out of
+    // the geometry, no optimizer is involved), so unlike the main pinhead the
+    // clamp is applied before `dist` rather than after a search - and it has to
+    // be, because `dist` and the `w` derived from it both carry the penetration.
+    // Handing add_anchor() a clamped penetration together with a `w` sized for
+    // the configured one would leave the anchor's length disagreeing with its
+    // bite by exactly the amount that was trimmed.
+    const double anchor_penetration =
+        clamped_head_penetration(m_sm.emesh, hitp, taildir,
+                                 m_sm.cfg.head_penetration_mm,
+                                 &m_penetration_stats);
+
+    double dist = (hitp - endp).norm() + anchor_penetration;
     double w = dist - 2 * head.r_pin_mm - head.r_back_mm;
 
     if (w < 0.) {
@@ -739,7 +803,7 @@ bool DefaultSupportTree::connect_to_model_body(Head &head)
     }
 
     m_builder.add_anchor(head.r_back_mm, head.r_pin_mm, w,
-                         m_sm.cfg.head_penetration_mm, taildir, hitp);
+                         anchor_penetration, taildir, hitp);
 
     m_pillar_index.guarded_insert(pill.endpoint(), pill.id);
 

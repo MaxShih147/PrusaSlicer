@@ -106,6 +106,11 @@ class DefaultSupportTree {
     // When bridging heads to pillars... TODO: find a cleaner solution
     execution::BlockingMutex<ExecutionTBB> m_bridge_mutex;
 
+    // How many thin wall penetration measurements found no exit surface. Filled
+    // from add_pinheads(), which runs its filter across worker threads, so the
+    // counter inside is atomic.
+    PenetrationClampStats m_penetration_stats;
+
     inline AABBMesh::hit_result ray_mesh_intersect(const Vec3d& s,
                                                       const Vec3d& dir)
     {

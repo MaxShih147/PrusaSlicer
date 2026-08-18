@@ -148,6 +148,11 @@ public:
         : m_builder{builder}, m_sm{sm}, m_cloud{cloud}
     {}
 
+    // Where add_mesh_bridge() reports thin wall measurements that found no exit
+    // surface. Owned by create_branching_tree() so the pinhead pass and the
+    // anchor pass accumulate into the same counter; left null it just discards.
+    PenetrationClampStats *penetration_stats = nullptr;
+
     bool add_bridge(const branchingtree::Node &from,
                     const branchingtree::Node &to) override;
 
@@ -295,6 +300,28 @@ bool BranchingTreeBuilder::add_mesh_bridge(const branchingtree::Node &from,
 
         if (hit.distance() > distance(fromj.pos, toj.pos)) {
             m_builder.add_diffbridge(fromj.pos, toj.pos, fromj.r, toj.r);
+
+            // Thin wall protection for the anchor.
+            //
+            // ORDER IS LOAD BEARING: this must stay below the toj line above.
+            // toj is built from anchor->junction_point(), which is
+            // pos + (fullwidth() - r_back) * dir, and fullwidth() is
+            // real_width() - penetration. Trimming the penetration makes
+            // fullwidth() larger, so clamping before toj is computed would push
+            // the bridge endpoint outwards, change the beam_mesh_hit() test
+            // right below it, and alter which bridges are accepted at all -
+            // destroying the search stability that applying the clamp last is
+            // meant to preserve. Do not "tidy" this up the line.
+            //
+            // Clamping after toj is geometrically safe: the larger fullwidth()
+            // makes the anchor mesh reach further out than toj, so the bridge
+            // endpoint ends up inside the anchor body. That is an overlap, not
+            // a gap.
+            anchor->penetration_mm =
+                clamped_head_penetration(m_sm.emesh, anchor->pos, anchor->dir,
+                                         m_sm.cfg.head_penetration_mm,
+                                         penetration_stats);
+
             m_builder.add_anchor(*anchor);
 
             build_subtree(from.id);
@@ -379,11 +406,16 @@ void create_branching_tree(SupportTreeBuilder &builder, const SupportableMesh &s
     std::vector<std::optional<Head>> heads(nondup_idx.size());
     auto leafs = reserve_vector<branchingtree::Node>(nondup_idx.size());
 
+    // One counter for the whole tree: the pinhead pass below and the anchor pass
+    // in add_mesh_bridge() both feed it, so a single summary covers both.
+    PenetrationClampStats penetration_stats;
+
     execution::for_each(
         ex_tbb, size_t(0), nondup_idx.size(),
-        [&sm, &heads, &nondup_idx, &builder](size_t i) {
+        [&sm, &heads, &nondup_idx, &builder, &penetration_stats](size_t i) {
             if (!builder.ctl().stopcondition())
-                heads[i] = calculate_pinhead_placement(ex_seq, sm, nondup_idx[i]);
+                heads[i] = calculate_pinhead_placement(ex_seq, sm, nondup_idx[i],
+                                                       &penetration_stats);
         },
         execution::max_concurrency(ex_tbb)
     );
@@ -423,6 +455,7 @@ void create_branching_tree(SupportTreeBuilder &builder, const SupportableMesh &s
                                     std::move(leafs), props};
 
     BranchingTreeBuilder vbuilder{builder, sm, nodes};
+    vbuilder.penetration_stats = &penetration_stats;
 
     execution::for_each(ex_tbb,
                         size_t(0),
@@ -439,6 +472,9 @@ void create_branching_tree(SupportTreeBuilder &builder, const SupportableMesh &s
     for (size_t id : vbuilder.unroutable_pinheads())
         builder.head(id).invalidate();
 
+    // Same counter for the pinhead pass above and the anchors placed inside
+    // add_mesh_bridge(), so this single line covers the whole tree.
+    report_penetration_failsafes(penetration_stats, "Branching support tree");
 }
 
 }} // namespace Slic3r::sla

@@ -5,6 +5,8 @@
 #ifndef SLASUPPORTTREEUTILS_H
 #define SLASUPPORTTREEUTILS_H
 
+#include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <optional>
 
@@ -322,10 +324,128 @@ std::vector<size_t> non_duplicate_suppt_indices(const PtIndex &index,
     return ret;
 }
 
+// ---------------------------------------------------------------------------
+// Thin wall penetration clamping (see openspec change
+// fix-sla-thin-model-support-points, decisions D4/D5/D7)
+// ---------------------------------------------------------------------------
+//
+// A pinhead's tip reaches exactly `Head::penetration_mm` below the surface it
+// sits on - independent of r_pin, r_back and width. Proof: get_mesh() shifts the
+// mesh down by fullwidth() - r_back = 2*r_pin + width + r_back - penetration,
+// and the pin sphere's top before that shift is at real_width() - r_back, so
+// after the shift it lands at exactly `penetration`. Clamping penetration is
+// therefore both necessary and sufficient to keep the tip inside the material,
+// and everything downstream (fullwidth(), junction()) follows automatically.
+//
+// Counter for rays that found no exit surface. Shared across the worker threads
+// that place pinheads, hence atomic. A miss means the mesh is not a closed
+// manifold - on a sound one a ray fired from just inside a surface always exits
+// again - so the fail safe drives penetration to zero and this counter lets the
+// tree report how often that happened instead of letting supports quietly
+// shrink (the exact failure mode #3 inflicted on this investigation).
+struct PenetrationClampStats {
+    std::atomic<size_t> ray_misses{0};
+};
+
+// Step taken along the ray before measuring, to clear the surface the head is
+// standing on: query_ray_hit() applies no facing filter, so a ray started
+// exactly on that surface reports a hit at distance 0. 10 um is two orders of
+// magnitude below the thinnest wall SLA can print (~0.2 mm) and well under a
+// typical XY pixel (35-50 um), so stepping over it cannot skip past a real
+// wall, and the step is added back to the measurement afterwards.
+static constexpr double PENETRATION_RAY_EPSILON = 0.01;
+
+// Returns the penetration depth to actually use for a head that touches
+// `contact_pos` and points along `head_dir`, limited so the tip stays buried:
+//
+//     penetration = min(configured, local_thickness * 0.5)
+//
+// The half factor is the "zero top surface puncture" policy - the tip is kept
+// at the midplane of the wall at worst, trading bite depth (and with it some
+// risk of the support letting go during the print) for never breaking through
+// the far side.
+//
+// The measurement runs along the head axis rather than along the surface
+// normal, because `penetration` itself is defined along that axis. A tilted
+// head slicing diagonally through a plate therefore gets the longer axial
+// distance it actually has available, instead of a needlessly conservative
+// perpendicular thickness.
+//
+// DISCIPLINE: call this exactly once per head, at the point where the head is
+// committed - never from inside an optimizer objective. The angle search must
+// run entirely on the configured value, otherwise the clamp depends on the
+// direction while the direction is being chosen from a score that depends on
+// the clamp.
+inline double clamped_head_penetration(const AABBMesh &mesh,
+                                       const Vec3d    &contact_pos,
+                                       const Vec3d    &head_dir,
+                                       double          configured_penetration,
+                                       PenetrationClampStats *stats = nullptr)
+{
+    if (!(configured_penetration > 0.))
+        return 0.;
+
+    // get_mesh() maps the head's local -z onto h.dir, so its local +z - the way
+    // the tip travels into the model - maps onto -h.dir. Normalizing here rather
+    // than asserting: query_ray_hit() interprets the returned parameter as a
+    // multiple of the direction's length, so a non-unit vector would silently
+    // scale every distance below, and asserts are compiled out of the release
+    // builds this ships as.
+    const double dirnorm = head_dir.norm();
+    if (!(dirnorm > EPSILON)) {   // also catches NaN, which fails every compare
+        if (stats) ++stats->ray_misses;
+        return 0.;
+    }
+
+    const Vec3d dir_in = -head_dir / dirnorm;
+
+    // Start inside the material, past the entry face, and measure to the exit
+    // face; the skipped step is added back.
+    const auto hit = mesh.query_ray_hit(contact_pos + PENETRATION_RAY_EPSILON * dir_in,
+                                        dir_in);
+
+    if (!hit.is_hit()) {   // is_hit() already rejects an infinite parameter
+        if (stats) ++stats->ray_misses;
+        return 0.;
+    }
+
+    const double local_thickness = hit.distance() + PENETRATION_RAY_EPSILON;
+
+    return std::min(configured_penetration, local_thickness * 0.5);
+}
+
+// One summary line per finished tree, and nothing at all when every measurement
+// found its exit surface - a normal slice must not pay for this diagnostic in
+// log noise, so the zero case returns before touching the log.
+//
+// Warning level, unlike the debug used for the modifier clamp: a miss means the
+// mesh is not closed, the affected supports silently lost all of their bite, and
+// the only person who can act on it is the user. Leaving it undiagnosed would
+// reproduce exactly what made #3 so expensive to track down - supports quietly
+// going away with nothing in the log to point at.
+inline void report_penetration_failsafes(const PenetrationClampStats &stats,
+                                         const char *tree_name)
+{
+    const size_t misses = stats.ray_misses.load();
+
+    if (misses == 0)
+        return;
+
+    BOOST_LOG_TRIVIAL(warning)
+        << tree_name << ": thin wall measurement found no exit surface for "
+        << misses << " support head(s)/anchor(s). Their penetration was set to 0 "
+        << "as a fail-safe, so those supports rest on the surface instead of "
+        << "biting into it and may let go while printing. A ray fired from just "
+        << "inside a closed surface always exits again, so this indicates the "
+        << "model mesh is not closed near those points - holes, non-manifold "
+        << "edges or self intersections. Repairing the mesh should clear it.";
+}
+
 template<class Ex>
 bool optimize_pinhead_placement(Ex                     policy,
                                 const SupportableMesh &m,
-                                Head                  &head)
+                                Head                  &head,
+                                PenetrationClampStats *stats = nullptr)
 {
     Vec3d n = get_normal(m.emesh, head.pos);
     assert(std::abs(n.norm() - 1.0) < EPSILON);
@@ -411,10 +531,26 @@ bool optimize_pinhead_placement(Ex                     policy,
         head.width_mm  = lmin;
         head.r_back_mm = back_r;
 
+        // Thin wall protection, the branching tree's counterpart to the block in
+        // DefaultSupportTree::add_pinheads(). Applied here, on the committed
+        // head, and never inside the optimizer objective above - the angle
+        // search has to run on the configured penetration or the clamp would
+        // depend on the direction while the direction is scored through the
+        // clamp.
+        //
+        // create_branching_tree() reads junction_point() right after this to
+        // seed the branch leaf node, and fullwidth() feeds that. Clamping here
+        // therefore moves the leaf outwards along with the head, which is what
+        // keeps the branch attached; clamping any later would leave the branch
+        // ending where the head no longer is.
+        head.penetration_mm = clamped_head_penetration(m.emesh, hp, nn,
+                                                       m.cfg.head_penetration_mm,
+                                                       stats);
+
         ret = true;
     } else if (back_r > m.cfg.head_fallback_radius_mm) {
         head.r_back_mm = m.cfg.head_fallback_radius_mm;
-        ret = optimize_pinhead_placement(policy, m, head);
+        ret = optimize_pinhead_placement(policy, m, head, stats);
     }
 
     return ret;
@@ -423,7 +559,8 @@ bool optimize_pinhead_placement(Ex                     policy,
 template<class Ex>
 std::optional<Head> calculate_pinhead_placement(Ex                     policy,
                                                 const SupportableMesh &sm,
-                                                size_t suppt_idx)
+                                                size_t                 suppt_idx,
+                                                PenetrationClampStats *stats = nullptr)
 {
     if (suppt_idx >= sm.pts.size())
         return {};
@@ -438,7 +575,7 @@ std::optional<Head> calculate_pinhead_placement(Ex                     policy,
         sp.pos.cast<double>() // displacement
     };
 
-    if (optimize_pinhead_placement(policy, sm, head)) {
+    if (optimize_pinhead_placement(policy, sm, head, stats)) {
         head.id = long(suppt_idx);
 
         return head;
@@ -797,6 +934,14 @@ bool optimize_anchor_placement(Ex                     policy,
 
     double sd = sm.cfg.safety_distance(anchor.r_back_mm);
 
+    // fullwidth() here is deliberately the unclamped one: the anchor still
+    // carries cfg.head_penetration_mm at this point, and the thin wall clamp is
+    // applied only once the anchor is committed, in BranchingTreeSLA's
+    // add_mesh_bridge(). Do not clamp before this search - the stop score and
+    // the acceptance test at the end both key off fullwidth(), so trimming the
+    // penetration first would widen the anchor, raise the bar the search has to
+    // clear, and change which placements are accepted. Keeping the search on
+    // the configured value is what makes the clamp a pure post-step.
     Optimizer<AlgNLoptGenetic> solver(get_criteria(sm.cfg)
                                           .stop_score(anchor.fullwidth())
                                           .max_iterations(100));
