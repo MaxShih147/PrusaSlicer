@@ -1584,7 +1584,8 @@ SupportPoints move_on_mesh_surface(
             Vec3d p_double = p.cast<double>();
             const Vec3d up_vec(0., 0., 1.);
             const Vec3d down_vec(0., 0., -1.);
-            // Project the point upward and downward and choose the closer intersection with the mesh.
+            // Project the point upward and downward and choose the surface the
+            // support is supposed to hold up (see the face selection below).
             AABBMesh::hit_result hit_up = mesh.query_ray_hit(p_double, up_vec);
             AABBMesh::hit_result hit_down = mesh.query_ray_hit(p_double, down_vec);
 
@@ -1594,9 +1595,40 @@ SupportPoints move_on_mesh_surface(
             if (!up && !down)
                 return;
 
-            AABBMesh::hit_result &hit = (!down || hit_up.distance() < hit_down.distance()) ?
-                hit_up :
-                hit_down;
+            // A support point holds the model from below, so it belongs on a
+            // downward facing surface. Selecting purely by proximity - as this
+            // code used to - picks the *top* surface of a thin plate whenever
+            // the island sampling layer happens to sit above the mid-plane,
+            // which drops every support point on the wrong side of the part.
+            // The resulting points are then either discarded by the modifier
+            // filter or rejected by normal_cutoff_angle in add_pinheads(),
+            // leaving thin models with no supports at all.
+            //
+            // normal() is the geometric normal of the hit triangle and is NOT
+            // flipped to oppose the ray, so a top face hit from inside the
+            // solid still reports +Z here and is correctly rejected.
+            auto faces_down = [](const AABBMesh::hit_result &h) {
+                return h.is_hit() && h.normal().z() < 0.;
+            };
+            const bool up_faces_down   = faces_down(hit_up);
+            const bool down_faces_down = faces_down(hit_down);
+
+            bool take_up;
+            if (up_faces_down != down_faces_down) {
+                // Exactly one candidate is a downward facing surface: take it,
+                // regardless of which one happens to be nearer.
+                take_up = up_faces_down;
+            } else {
+                // Both or neither face downward - fall back to proximity. The
+                // "neither" case covers vertical walls and degenerate geometry;
+                // keeping the original rule there guarantees that models whose
+                // nearest hit already was the correct downward face (i.e. every
+                // ordinary part, since support points originate on the lowest
+                // layer of the island) keep their existing placement.
+                take_up = (!down || hit_up.distance() < hit_down.distance());
+            }
+
+            AABBMesh::hit_result &hit = take_up ? hit_up : hit_down;
             if (hit.distance() <= allowed_move) {
                 p[2] += static_cast<float>(hit.distance() * hit.direction()[2]);
                 return;

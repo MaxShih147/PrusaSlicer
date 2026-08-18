@@ -688,10 +688,29 @@ void SLAPrint::Steps::slice_model(SLAPrintObject &po)
     auto slindex_it =
         po.closest_slice_record(po.m_slice_index, float(bb3d.min(Z)));
 
-    if(slindex_it == po.m_slice_index.end())
-        //TRN To be shown at the status bar on SLA slicing error.
-        throw Slic3r::RuntimeError(format("Model named: %s can not be sliced. This can be caused by the model mesh being broken. "
-                                          "Repairing it might fix the problem.", po.model_object()->name));
+    if(slindex_it == po.m_slice_index.end()) {
+        // This is not a broken mesh. The slice index above is always populated;
+        // what failed is finding a record whose slice level reaches the model at
+        // all. Every record sits at h - layer_height/2, and h only advances in
+        // layer_height steps from the grid floor, so once the object is shorter
+        // than roughly 1.5 layers the topmost level can still land below the
+        // object's bottom - whether it actually does depends on where the grid
+        // phase falls. The old message blamed a broken mesh and told the user to
+        // repair it, sending them off to fix geometry that is perfectly fine,
+        // while the one setting that would help went unmentioned.
+        const double model_height = bb3d.max(Z) - bb3d.min(Z);
+        // The TRN note has to sit directly above the line carrying the _u8L
+        // keyword: xgettext --add-comments only picks up a comment that ends on
+        // the immediately preceding line, so parking it above the throw (where
+        // it reads more naturally) silently drops it from the catalog.
+        throw Slic3r::RuntimeError(format(
+            //TRN To be shown at the status bar on SLA slicing error. %1% is the
+            //    object name, %2% the object height and %3% the layer height in mm.
+            _u8L("Model named: %1% can not be sliced: no slice level falls inside the "
+                 "model. The layer height (%3% mm) is too large relative to the height "
+                 "of the object (%2% mm). Try lowering the layer height."),
+            po.model_object()->name, model_height, lhd));
+    }
 
     po.m_model_height_levels.clear();
     po.m_model_height_levels.reserve(po.m_slice_index.size());
@@ -745,45 +764,80 @@ static void filter_support_points_by_modifiers(sla::SupportPoints &pts,
 
     auto new_pts = reserve_vector<sla::SupportPoint>(pts.size());
 
+    // Points sitting above the top of the slice grid used to be dropped here
+    // without a trace: lower_bound returned end() and the whole body below was
+    // skipped, so the point silently disappeared instead of being tested
+    // against the modifier masks. That turned a lookup miss into a deletion,
+    // which is not what this filter is for - it exists to apply blockers and
+    // enforcers, not to discard geometry. Clamp to the last layer instead, so
+    // the point is still evaluated (and, absent a blocker, kept).
+    size_t clamped_count = 0;
+    float  clamped_zmin  = std::numeric_limits<float>::max();
+    float  clamped_zmax  = std::numeric_limits<float>::lowest();
+
     for (size_t i = 0; i < pts.size(); ++i) {
         const sla::SupportPoint &sp = pts[i];
         Point sp2d = scaled(to_2d(sp.pos));
 
         auto it = std::lower_bound(slice_grid.begin(), slice_grid.end(), sp.pos.z());
-        if (it != slice_grid.end()) {
-            size_t idx = std::distance(slice_grid.begin(), it);
-            bool is_enforced = false;
-            if (idx < mask.enforcers.size()) {
-                for (size_t enf_idx = 0;
-                     !is_enforced && enf_idx < mask.enforcers[idx].size();
-                     ++enf_idx)
-                {
-                    if (mask.enforcers[idx][enf_idx].contains(sp2d))
-                        is_enforced = true;
-                }
-            }
 
-            bool is_blocked = false;
-            if (!is_enforced) {
-                if (!mask.enforcers_only) {
-                    if (idx < mask.blockers.size()) {
-                        for (size_t blk_idx = 0;
-                             !is_blocked && blk_idx < mask.blockers[idx].size();
-                             ++blk_idx)
-                        {
-                            if (mask.blockers[idx][blk_idx].contains(sp2d))
-                                is_blocked = true;
-                        }
-                    }
-                } else {
-                    is_blocked = true;
-                }
-            }
+        size_t idx = size_t(std::distance(slice_grid.begin(), it));
+        if (it == slice_grid.end()) {
+            // An empty grid leaves idx at 0; the masks are empty too in that
+            // case (see the assert above), so every mask lookup below is a
+            // no-op and no out of range access can happen.
+            if (!slice_grid.empty())
+                idx = slice_grid.size() - 1;
 
-            if (!is_blocked)
-                new_pts.emplace_back(sp);
+            ++clamped_count;
+            clamped_zmin = std::min(clamped_zmin, sp.pos.z());
+            clamped_zmax = std::max(clamped_zmax, sp.pos.z());
         }
+
+        bool is_enforced = false;
+        if (idx < mask.enforcers.size()) {
+            for (size_t enf_idx = 0;
+                 !is_enforced && enf_idx < mask.enforcers[idx].size();
+                 ++enf_idx)
+            {
+                if (mask.enforcers[idx][enf_idx].contains(sp2d))
+                    is_enforced = true;
+            }
+        }
+
+        bool is_blocked = false;
+        if (!is_enforced) {
+            if (!mask.enforcers_only) {
+                if (idx < mask.blockers.size()) {
+                    for (size_t blk_idx = 0;
+                         !is_blocked && blk_idx < mask.blockers[idx].size();
+                         ++blk_idx)
+                    {
+                        if (mask.blockers[idx][blk_idx].contains(sp2d))
+                            is_blocked = true;
+                    }
+                }
+            } else {
+                is_blocked = true;
+            }
+        }
+
+        if (!is_blocked)
+            new_pts.emplace_back(sp);
     }
+
+    // Summary only - one line per call, and only when something was actually
+    // clamped. Logging per point would flood the log on a model where the
+    // condition is systematic rather than incidental.
+    if (clamped_count > 0)
+        BOOST_LOG_TRIVIAL(debug)
+            << "filter_support_points_by_modifiers: " << clamped_count << " of "
+            << pts.size() << " support point(s) lie above the slice grid and were "
+            << "clamped to the last layer; point z range ["
+            << clamped_zmin << ", " << clamped_zmax << "], slice grid ["
+            << (slice_grid.empty() ? 0.f : slice_grid.front()) << ", "
+            << (slice_grid.empty() ? 0.f : slice_grid.back())
+            << "] (grid layers: " << slice_grid.size() << ")";
 
     pts.swap(new_pts);
 }
@@ -879,12 +933,32 @@ void SLAPrint::Steps::support_points(SLAPrintObject &po)
     StatusFunction status = statuscb;
     LayerSupportPoints layer_support_points = generate_support_points(data, config, cancel, status);
 
-    // Maximal move of support point to mesh surface,
-    // no more than height of layer
-    assert(po.m_model_height_levels.size() > 1);
-    double allowed_move = (po.m_model_height_levels[1] - po.m_model_height_levels[0]) +
-        std::numeric_limits<float>::epsilon();
-    SupportPoints support_points = 
+    // Maximal move of support point to mesh surface, no more than height of
+    // layer. A model thin enough to span a single slice level leaves just one
+    // entry here, and the old code read [1] unconditionally - an out of bounds
+    // access guarded only by an assert, which is compiled out of the release
+    // builds this ships as. Fall back to the configured layer height instead.
+    //
+    // The fallback reads m_objects.front()'s layer height rather than po's,
+    // because that is the option slice_model() built the (print-global) slice
+    // grid from; anything else would not match the actual grid pitch.
+    //
+    // The former assert(size() > 1) is intentionally gone: a single level is a
+    // supported input now, so asserting on it would abort debug builds on
+    // perfectly valid thin models.
+    //
+    // ORDER DEPENDENCY: this must land *after* the downward-facing surface
+    // selection in move_on_mesh_surface(). The uninitialised read happened to
+    // yield a negative limit, which forced the projection into the
+    // squared_distance branch and accidentally kept those points on the correct
+    // side of thin plates. Repairing the limit on its own would turn the phases
+    // that currently work into failures too.
+    assert(!po.m_model_height_levels.empty());
+    const double grid_pitch = po.m_model_height_levels.size() > 1 ?
+        double(po.m_model_height_levels[1] - po.m_model_height_levels[0]) :
+        m_print->m_objects.front()->m_config.layer_height.getFloat();
+    double allowed_move = grid_pitch + std::numeric_limits<float>::epsilon();
+    SupportPoints support_points =
         move_on_mesh_surface(layer_support_points, emesh, allowed_move, cancel);
 
     // The Generator count with permanent support positions but do not convert to LayerSupportPoints.

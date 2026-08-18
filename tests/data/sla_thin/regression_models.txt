@@ -1,0 +1,20 @@
+# 迴歸基準模型清單 —— openspec/changes/fix-sla-thin-model-support-points 任務 1.4
+#
+# 欄位：<相對於 repo 根目錄的路徑>|<類別>|<基準支撐點數>|<說明>
+#
+# 類別 zero-change：厚度 ÷ layer_height ≥ 2 且局部壁厚 ≥ 0.8 mm。
+#   六項修改完成後，其支撐點數量、座標與支撐網格 MUST 與基準快照逐點一致。
+#   （spec: sla-support-point-placement「常態模型的支撐點產出必須維持不變」、
+#     sla-support-head-penetration「局部壁厚充足時夾限必須完全失效」）
+#
+# 類別 observe：局部壁厚可能落在 (0, 2 × support_head_penetration) 的中間帶。
+#   預期會因 #5 的動態夾限而改變，MUST NOT 列入零變化驗收，僅作行為觀察。
+#   （spec: sla-support-head-penetration「中間帶壁厚被夾限為預期行為」）
+#
+# 基準支撐點數以 cfg_base.ini（layer_height 0.15、elevation 5.0、
+# support_head_penetration 0.3、density 150）於未修改的 baseline binary 量得。
+
+tests/data/20mm_cube.obj|zero-change|20|實心 20×20×20 立方體，壁厚等同本體
+tests/data/cube_with_hole.obj|zero-change|14|20×20×10 帶孔立方體，驗證孔洞附近的支撐
+tests/data/sla_thin/reg_cyl25x30.stl|zero-change|47|25×25×30 產線實件（取自 job 01f58de4）
+tests/data/frog_legs.obj|observe|66|52×50×2.08 薄殼有機件，局部壁厚可能低於 0.8 mm

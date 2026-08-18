@@ -1,0 +1,8 @@
+model	class	points	triangles	sha256
+tests/data/20mm_cube.obj	zero-change	20	11232	60cb3dc9379701753a4c8301b040c30d7aa9c9aed02d9be5e5a80e403a7520ab
+tests/data/cube_with_hole.obj	zero-change	14	8080	9cc71f1e3d8734d20bb57d717ea24f6023ca9381e84c55ec3f9eaadbeb0d2588
+tests/data/sla_thin/reg_cyl25x30.stl	zero-change	47	24096	c9da88c24f561ae7fd3a6456e51c2d5d541c54ae180282df7fd99b256c294a85
+tests/data/frog_legs.obj	observe	66	31476	fd706303e0e0eb5631e471a9f0f80148a90d328f4cdb782ec1742feab38b04cf
+tests/data/sla_thin/m020.stl	thin	0	0	-
+tests/data/sla_thin/m030.stl	thin	19	10596	50a951ad6eab985bc76cb11e7d4edb4dd68291afab654bb2d47ad62b48c8e14e
+tests/data/sla_thin/m050.stl	thin	19	10596	2735804db51052039726ae8a2130a95465823ebe1f117d899ee983184eeffa1d
