@@ -19,13 +19,24 @@ SLA 切片原本的 `support_critical_angle` 參數控制的是支撐柱橋接�
 | SLA `support_critical_angle`（新） | 從水平面量起 | 0°–90° | 超過閾值的面不放置支撐頭 |
 | SLA polar angle | 從 +Z 軸量起 | 0°–180° | π=法向朝下（水平面），π/2=法向朝側面（垂直壁） |
 
-**轉換公式：** `polar_min = π/2 + threshold_rad`
+**轉換公式：** `polar_min = π/2 + threshold_rad`（放支撐的條件為 `polar >= polar_min`）
 
-| threshold（從水平） | SLA polar 最小值 | 效果 |
-|--------------------|----------------|------|
-| 90°（預設） | π（180°） | 不過濾，所有懸空面都放支撐頭 |
-| 45° | 3π/4（135°） | 只對接近水平（< 45° 坡度）的懸空面放支撐 |
-| 0° | π/2（90°） | 所有懸空面（垂直壁除外） |
+由於懸空面的坡度 = `π − polar`，上式等價於「**坡度 ≤ π/2 − threshold 才放支撐頭**」。
+因此 **threshold 數值越小，生成的支撐越多**。
+
+| threshold（從水平） | SLA polar 最小值 | 實際放支撐的坡度上限 | 效果 |
+|--------------------|----------------|--------------------|------|
+| 90°（預設） | π（180°） | 0° | **僅對完全水平朝下的面放支撐**（幾乎不過濾即通過的只有正下方面） |
+| 45° | 3π/4（135°） | 45° | 只對接近水平（≤ 45° 坡度）的懸空面放支撐 |
+| 0° | π/2（90°） | 90° | **所有朝下的懸空面都放支撐**（垂直壁除外） |
+
+> ⚠️ **方向注意**：本表的 0° 與 90° 兩列曾被誤記為相反的效果。以上為實作的真實行為，
+> 已由實測驗證（3DBenchy 繞 Y 軸 -40° 時，90° 得到零支撐；30° 的支撐量大於 45°）。
+>
+> 另一種可能的語意是 `polar_min = π − threshold_rad`（即「90° = 不過濾」）。該式與現行式
+> **僅在 threshold = 45° 時等值**，其餘閾值全部鏡射為 `90° − t`。改採該式會使所有非 45°
+> 的既有專案支撐密度改變，屬**破壞性變更**，須附遷移計畫，不得逕行修改。
+> 詳見 capability `sla-overhang-threshold-semantics`。
 
 ---
 
@@ -61,9 +72,11 @@ SLA 切片原本的 `support_critical_angle` 參數控制的是支撐柱橋接�
 在 `SupportTreeConfig` struct 新增欄位：
 
 ```cpp
-// Overhang angle threshold in radians (measured from horizontal plane).
-// Support heads will not be placed on surfaces whose angle from horizontal
-// exceeds this value. PI/2 means all overhangs get support (no filtering).
+// Overhang angle threshold in radians. A support head is placed only where
+// the surface's slope from the horizontal plane is at most
+// (PI/2 - overhang_angle_threshold), so a SMALLER value supports MORE
+// surfaces: 0 supports every overhang, PI/2 (the default) supports only
+// perfectly horizontal down-facing surfaces.
 double overhang_angle_threshold = M_PI / 2;
 ```
 
@@ -100,8 +113,11 @@ scfg.overhang_angle_threshold = c.branchingsupport_critical_angle.getFloat() * P
 // skip if the tilt is not sane
 if (polar < PI - m_sm.cfg.normal_cutoff_angle) return;
 
-// skip if the surface is not steep enough to need support
-// overhang_angle_threshold measured from horizontal: 0=only flat, PI/2=all overhangs
+// Skip surfaces that tilt too far from horizontal to count as an overhang.
+// Rearranged, this places a head only where the surface's slope from the
+// horizontal plane is at most (PI/2 - overhang_angle_threshold) -- so a
+// SMALLER threshold supports MORE surfaces: 0 supports every overhang,
+// PI/2 supports only perfectly horizontal down-facing surfaces.
 if (polar < M_PI / 2.0 + m_sm.cfg.overhang_angle_threshold) return;
 ```
 

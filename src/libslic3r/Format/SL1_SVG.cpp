@@ -140,6 +140,9 @@ class SVGRaster : public sla::RasterBase {
     Vec2d           m_sc;
 
     std::string m_svg;
+    // Length of the constant header written in the constructor. reset() truncates
+    // back to it; everything past it belongs to the layer just finished.
+    size_t m_header_size = 0;
 
 public:
     SVGRaster(const BoundingBox &svgarea, sla::Resolution res, Trafo tr = {})
@@ -168,6 +171,8 @@ public:
             "<svg height=\"" + hf + "mm" + "\" width=\"" + wf + "mm" + "\" viewBox=\"0 0 " + w + " " + h +
             "\" style=\"fill: white; stroke: none; fill-rule: nonzero\" "
             "xmlns=\"http://www.w3.org/2000/svg\" xmlns:svg=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\">\n";
+
+        m_header_size = m_svg.size();
     }
 
     void draw(const ExPolygon& poly) override
@@ -196,6 +201,11 @@ public:
     }
 
     Trafo trafo() const override { return m_trafo; }
+
+    // Drop the paths accumulated for the previous layer, keeping the header.
+    // Rasters are reused across layers now (SLAArchiveWriter::draw_layers);
+    // without this every SVG would carry every earlier layer as well.
+    void reset() override { m_svg.resize(m_header_size); }
 
     // The encoder is ignored here, the svg text does not need any further
     // encoding.

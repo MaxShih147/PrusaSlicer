@@ -620,8 +620,10 @@ public:
                       const std::string    &projectname = "");
 
     void set_preview_scale(double s) { if (m_archiver) m_archiver->set_preview_scale(s); }
-    void export_preview_zip(const std::string &fname, const std::string &projectname = "") {
-        if (m_archiver) m_archiver->export_preview_zip(fname, projectname);
+    // False means the preview ZIP was not written; see SLAArchiveWriter for why
+    // that is reported rather than thrown. No archiver at all is not a failure.
+    bool export_preview_zip(const std::string &fname, const std::string &projectname = "") {
+        return m_archiver ? m_archiver->export_preview_zip(fname, projectname) : true;
     }
 
     static bool is_prusa_print(const std::string& printer_model);

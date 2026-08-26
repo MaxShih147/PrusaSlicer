@@ -31,6 +31,9 @@
 
 #include "libslic3r/MarchingSquares.hpp"
 #include <cstdlib>  // [layer-rle] getenv
+#include <algorithm> // std::min / std::fill_n in the strip-wise blur
+#include <cstdint>
+#include <vector>
 #include "libslic3r/PNGReadWrite.hpp"
 #include "libslic3r/ClipperUtils.hpp"
 
@@ -245,6 +248,124 @@ void fill_slicerconf(ConfMap &m, const SLAPrint &print)
     
 }
 
+// Vertical half of agg::stack_blur_gray8, walking the image in narrow column
+// strips instead of one column at a time.
+//
+// WHY. agg_blur.h runs the vertical pass as `for x { for y }`. On a 15120-wide
+// canvas that touches one byte per cache line and then moves a whole row away, so
+// every one of the 94.2 M pixels costs its own line fill: roughly 6 GB of DRAM
+// traffic for a pass that only needs to read 94 MB. Processing STRIP_COLS columns
+// together makes each line fill serve all the bytes in it, which is the entire
+// point of this rewrite.
+//
+// WHAT IS NOT CHANGED. The arithmetic is copied from agg_blur.h unaltered --
+// same unsigned accumulators, same stack update order, same `(sum + whalf) / wsum`
+// truncating division, same border clamping. Only the order in which columns are
+// visited differs, and the vertical pass is column-independent (column x reads and
+// writes nothing but column x), so visiting them in strips cannot change a single
+// output byte. That is what makes the bit-exactness requirement satisfiable here;
+// re-deriving the filter as a convolution would not have been.
+//
+// `stack_ptr` and `yp` are kept as scalars rather than per-column state on
+// purpose: they are seeded identically for every column and advance identically
+// on every row, so they carry no column-specific information.
+static void stack_blur_gray8_vertical_strips(uint8_t *buf,
+                                             unsigned w,
+                                             unsigned h,
+                                             size_t   stride,
+                                             unsigned ry)
+{
+    if (ry == 0 || w == 0 || h == 0) return;
+    if (ry > 254) ry = 254;                       // same cap as agg_blur.h
+
+    // One cache line wide. Wider strips would not cut traffic any further (a line
+    // is already fully consumed at 64) and only enlarge the per-strip state.
+    constexpr unsigned STRIP_COLS = 64;
+
+    const unsigned hm    = h - 1;
+    const unsigned div   = ry * 2 + 1;
+    const unsigned wsum  = (ry + 1) * (ry + 1);
+    const unsigned whalf = wsum >> 1;
+
+    // stack[i * STRIP_COLS + j] = stack slot i of the strip's column j, so the
+    // inner loop over j stays contiguous.
+    std::vector<uint8_t>  stack(size_t(div) * STRIP_COLS);
+    std::vector<unsigned> sum(STRIP_COLS), sum_in(STRIP_COLS), sum_out(STRIP_COLS);
+
+    for (unsigned x0 = 0; x0 < w; x0 += STRIP_COLS) {
+        const unsigned kw = std::min(STRIP_COLS, w - x0);
+
+        std::fill_n(sum.begin(), kw, 0u);
+        std::fill_n(sum_in.begin(), kw, 0u);
+        std::fill_n(sum_out.begin(), kw, 0u);
+
+        // Left half of the stack: row 0 repeated, exactly as the scalar version
+        // reads img.pixel(x, 0) once and reuses it for i = 0..ry.
+        const uint8_t *row0 = buf + x0;
+        for (unsigned i = 0; i <= ry; ++i) {
+            uint8_t *slot = stack.data() + size_t(i) * STRIP_COLS;
+            for (unsigned j = 0; j < kw; ++j) {
+                const unsigned v = row0[j];
+                slot[j]     = uint8_t(v);
+                sum[j]     += v * (i + 1);
+                sum_out[j] += v;
+            }
+        }
+
+        // Right half: rows 1..ry, clamped to the last row.
+        for (unsigned i = 1; i <= ry; ++i) {
+            const uint8_t *row  = buf + size_t(i > hm ? hm : i) * stride + x0;
+            uint8_t       *slot = stack.data() + size_t(ry + i) * STRIP_COLS;
+            for (unsigned j = 0; j < kw; ++j) {
+                const unsigned v = row[j];
+                slot[j]    = uint8_t(v);
+                sum[j]    += v * (ry + 1 - i);
+                sum_in[j] += v;
+            }
+        }
+
+        unsigned stack_ptr = ry;
+        unsigned yp        = ry > hm ? hm : ry;
+        // agg_blur.h reads img.pixel(x, yp) here; that value is overwritten before
+        // any use inside the row loop below, so the read is dropped.
+
+        for (unsigned y = 0; y < h; ++y) {
+            unsigned stack_start = stack_ptr + div - ry;
+            if (stack_start >= div) stack_start -= div;
+
+            if (++yp > hm) yp = hm;
+
+            unsigned next_ptr = stack_ptr + 1;
+            if (next_ptr >= div) next_ptr = 0;
+
+            uint8_t       *out_row  = buf + size_t(y) * stride + x0;
+            const uint8_t *in_row   = buf + size_t(yp) * stride + x0;
+            uint8_t       *out_slot = stack.data() + size_t(stack_start) * STRIP_COLS;
+            const uint8_t *nxt_slot = stack.data() + size_t(next_ptr) * STRIP_COLS;
+
+            for (unsigned j = 0; j < kw; ++j) {
+                // Write before reading in_row: on the last row the clamp makes
+                // yp == y, and the scalar version reads the byte it has just
+                // written. Keeping the order preserves that behaviour.
+                out_row[j] = uint8_t((sum[j] + whalf) / wsum);
+
+                sum[j]     -= sum_out[j];
+                sum_out[j] -= out_slot[j];
+
+                const unsigned v = in_row[j];
+                out_slot[j] = uint8_t(v);
+                sum_in[j]  += v;
+                sum[j]     += sum_in[j];
+
+                sum_out[j] += nxt_slot[j];
+                sum_in[j]  -= nxt_slot[j];
+            }
+
+            stack_ptr = next_ptr;
+        }
+    }
+}
+
 } // namespace
 
 std::unique_ptr<sla::RasterBase> SL1Archive::create_raster() const
@@ -322,20 +443,26 @@ std::unique_ptr<sla::RasterBase> SL1Archive::create_raster() const
 
             // Blur via AGG stack blur, alpha-blended back toward the sharp
             // original (k: blur=1 -> 0.6/154, blur=2 -> 0.8/205, blur>=3 -> 1.0/256).
+            // The two passes are issued separately: agg::stack_blur_gray8 keeps the
+            // horizontal one (it already walks rows and is cache-friendly), and the
+            // vertical one goes through the strip version, which is the same
+            // arithmetic in a memory order that does not thrash the cache. Passing
+            // ry = 0 makes AGG skip its own vertical pass.
             if (blur_config > 0) {
                 const unsigned radius = static_cast<unsigned>(blur_config);
                 const int k = (blur_config == 1) ? 154 : (blur_config == 2) ? 205 : 256;
+                const size_t stride = w * num_components;
                 if (k >= 256) {
-                    agg::rendering_buffer rbuf(buf, (unsigned)w, (unsigned)h,
-                                               (int)(w * num_components));
+                    agg::rendering_buffer rbuf(buf, (unsigned)w, (unsigned)h, (int)stride);
                     agg::pixfmt_gray8 pixf(rbuf);
-                    agg::stack_blur_gray8(pixf, radius, radius);
+                    agg::stack_blur_gray8(pixf, radius, 0);
+                    stack_blur_gray8_vertical_strips(buf, (unsigned)w, (unsigned)h, stride, radius);
                 } else {
                     std::vector<uint8_t> temp_buf(buf, buf + bufsize);
-                    agg::rendering_buffer rbuf(temp_buf.data(), (unsigned)w, (unsigned)h,
-                                               (int)(w * num_components));
+                    agg::rendering_buffer rbuf(temp_buf.data(), (unsigned)w, (unsigned)h, (int)stride);
                     agg::pixfmt_gray8 pixf(rbuf);
-                    agg::stack_blur_gray8(pixf, radius, radius);
+                    agg::stack_blur_gray8(pixf, radius, 0);
+                    stack_blur_gray8_vertical_strips(temp_buf.data(), (unsigned)w, (unsigned)h, stride, radius);
                     for (size_t p = 0; p < bufsize; ++p)
                         buf[p] = (uint8_t)((buf[p] * (256 - k) + temp_buf[p] * k) >> 8);
                 }

@@ -4227,7 +4227,7 @@ void PrintConfigDef::init_sla_support_params(const std::string &prefix)
     def = this->add(prefix + "support_critical_angle", coFloat);
     def->label = L("Overhang threshold");
     def->category = L("Supports");
-    def->tooltip = L("Support will not be placed on surfaces whose slope angle (measured from the horizontal plane) is above this value. Set to 90° to support all overhangs.");
+    def->tooltip = L("A support head is placed only on a down-facing surface whose slope from the horizontal plane is at most (90° minus this value). Lower values therefore give more supports: set to 0° to support every overhang, or to 90° to support only perfectly horizontal down-facing surfaces.");
     def->sidetext = L("°");
     def->min = 0;
     def->max = 90;

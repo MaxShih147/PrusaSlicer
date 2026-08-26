@@ -41,18 +41,12 @@ EncodedRaster PNGRasterEncoder::operator()(const void *ptr, size_t w, size_t h,
     return EncodedRaster(std::move(buf), "png");
 }
 
-EncodedRaster PNGPreviewEncoder::operator()(const void *ptr, size_t w, size_t h,
-                                             size_t      num_components)
+// Box filter downscale, generic case: the source block for a destination pixel
+// is derived per pixel from the scale, which is what makes any ratio work.
+static void preview_box_downscale(const uint8_t *src, size_t w, size_t h,
+                                  uint8_t *dst, size_t new_w, size_t new_h,
+                                  size_t num_components, double inv_scale)
 {
-    size_t new_w = static_cast<size_t>(w * scale);
-    size_t new_h = static_cast<size_t>(h * scale);
-    if (new_w == 0) new_w = 1;
-    if (new_h == 0) new_h = 1;
-
-    // Box filter downscale
-    std::vector<uint8_t> dst(new_w * new_h * num_components, 0);
-    double inv_scale = 1.0 / scale;
-
     for (size_t dy = 0; dy < new_h; ++dy) {
         size_t sy0 = static_cast<size_t>(dy * inv_scale);
         size_t sy1 = static_cast<size_t>((dy + 1) * inv_scale);
@@ -69,7 +63,7 @@ EncodedRaster PNGPreviewEncoder::operator()(const void *ptr, size_t w, size_t h,
                 unsigned sum = 0;
                 unsigned count = 0;
                 for (size_t sy = sy0; sy < sy1; ++sy) {
-                    const auto *row = static_cast<const uint8_t *>(ptr) + (sy * w + sx0) * num_components + c;
+                    const auto *row = src + (sy * w + sx0) * num_components + c;
                     for (size_t sx = sx0; sx < sx1; ++sx) {
                         sum += *row;
                         row += num_components;
@@ -80,12 +74,82 @@ EncodedRaster PNGPreviewEncoder::operator()(const void *ptr, size_t w, size_t h,
             }
         }
     }
+}
 
-    // Encode downscaled buffer to PNG
+// Box filter downscale by an exact 1/N. Every destination pixel maps to a fixed
+// N x N source block, so the per-pixel boundary arithmetic above collapses into
+// loop induction and the divisor becomes loop-invariant. The averaging itself is
+// unchanged -- same pixels, same sum, same truncating division -- so this stays
+// byte-for-byte equal to the generic path (see the exactness guard at the call
+// site for why that equality actually holds).
+static void preview_box_downscale_integer(const uint8_t *src, size_t w,
+                                          uint8_t *dst, size_t new_w, size_t new_h,
+                                          size_t num_components, size_t n)
+{
+    const unsigned area        = static_cast<unsigned>(n * n);
+    const size_t   src_stride  = w * num_components;
+
+    for (size_t dy = 0; dy < new_h; ++dy) {
+        const uint8_t *block_row = src + (dy * n) * src_stride;
+        for (size_t dx = 0; dx < new_w; ++dx) {
+            const uint8_t *block = block_row + dx * n * num_components;
+            for (size_t c = 0; c < num_components; ++c) {
+                unsigned sum = 0;
+                const uint8_t *row = block + c;
+                for (size_t sy = 0; sy < n; ++sy) {
+                    const uint8_t *p = row;
+                    for (size_t sx = 0; sx < n; ++sx) {
+                        sum += *p;
+                        p += num_components;
+                    }
+                    row += src_stride;
+                }
+                dst[(dy * new_w + dx) * num_components + c] = static_cast<uint8_t>(sum / area);
+            }
+        }
+    }
+}
+
+EncodedRaster PNGPreviewEncoder::operator()(const void *ptr, size_t w, size_t h,
+                                             size_t      num_components)
+{
+    size_t new_w = static_cast<size_t>(w * scale);
+    size_t new_h = static_cast<size_t>(h * scale);
+    if (new_w == 0) new_w = 1;
+    if (new_h == 0) new_h = 1;
+
+    std::vector<uint8_t> dst(new_w * new_h * num_components, 0);
+    const auto  *src       = static_cast<const uint8_t *>(ptr);
+    const double inv_scale = 1.0 / scale;
+
+    // Take the fixed-block path only when 1/scale is EXACTLY an integer. The
+    // generic path derives its block bounds from `dy * inv_scale`, and for an
+    // exact integer that product is representable to the last bit, so both paths
+    // land on the same blocks and emit the same bytes. Accepting a near-integer
+    // would break that: a reciprocal a hair under N truncates a row early on some
+    // dy and silently shifts the output. The trailing bounds checks cover the case
+    // where the source is not a whole number of blocks wide or tall -- there the
+    // generic path clamps the last block and averages over fewer pixels, which the
+    // fixed-block path cannot reproduce.
+    const size_t n = static_cast<size_t>(inv_scale);
+    const bool   fixed_block = n >= 1 &&
+                               inv_scale == static_cast<double>(n) &&
+                               new_w * n <= w && new_h * n <= h;
+
+    if (fixed_block)
+        preview_box_downscale_integer(src, w, dst.data(), new_w, new_h, num_components, n);
+    else
+        preview_box_downscale(src, w, h, dst.data(), new_w, new_h, num_components, inv_scale);
+
+    // Encode downscaled buffer to PNG. Level 1 rather than the level 6 that the
+    // plain tdefl_write_image_to_png_file_in_memory() hardcodes: preview layers are
+    // overwhelmingly black, so the extra levels buy very little size for several
+    // times the encoding time. Only the preview goes through here -- the .sl1 layer
+    // encoders above are untouched.
     std::vector<uint8_t> buf;
     size_t s = 0;
-    void *rawdata = tdefl_write_image_to_png_file_in_memory(
-        dst.data(), int(new_w), int(new_h), int(num_components), &s);
+    void *rawdata = tdefl_write_image_to_png_file_in_memory_ex(
+        dst.data(), int(new_w), int(new_h), int(num_components), &s, 1, MZ_FALSE);
 
     if (rawdata == nullptr) return EncodedRaster({}, "png");
 

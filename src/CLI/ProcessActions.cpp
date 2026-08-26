@@ -1,7 +1,11 @@
 #include <cstdio>
+#include <cstdint>
 #include <string>
 #include <cstring>
 #include <iostream>
+#include <iomanip>
+#include <sstream>
+#include <unordered_set>
 #include <math.h>
 #include <boost/algorithm/string/predicate.hpp>
 #include <boost/filesystem.hpp>
@@ -262,6 +266,68 @@ static void update_instances_outside_state(Model& model, const DynamicPrintConfi
     model.update_print_volume_state(build_volume);
 }
 
+// Drop exactly duplicated triangles from a mesh imported via --import-support-stl.
+// Returns the number of faces removed; the mesh is left untouched when nothing is
+// duplicated (including the face order, which callers downstream rely on).
+//
+// THIS IS A DEFENSIVE NET, NOT THE ROOT FIX. The duplication it removes is produced
+// upstream by the DS-Online support exporter, which walks the scene graph and picks
+// up every mesh it finds -- including the stencil clipping passes that are attached
+// as children of each support host and share the host's geometry. The same triangles
+// therefore get written out five times. Only the exporter can actually fix that; all
+// we can do here is stop a malformed upload from making slicing several times slower.
+// The limit is worth spelling out: if the upstream ever emits near-duplicates whose
+// coordinates are nudged rather than copied verbatim, nothing below will catch them
+// and the bad geometry goes straight into the slicer.
+//
+// Duplicates are matched on the exact bits of the three vertex coordinates, in the
+// order they are stored. No tolerance, no nearby merge, no winding or rotation
+// canonicalisation. The asymmetry is the whole argument: a tolerant match could
+// silently delete legitimate coplanar geometry -- touching support pillars, the
+// raft/pillar junction -- and a missing support is a failed print, whereas leaving a
+// near-duplicate in place merely costs some speed.
+static size_t remove_duplicate_faces(indexed_triangle_set &its)
+{
+    struct FaceKey {
+        uint32_t bits[9];
+        bool operator==(const FaceKey &rhs) const { return std::memcmp(bits, rhs.bits, sizeof(bits)) == 0; }
+    };
+    struct FaceKeyHash {
+        size_t operator()(const FaceKey &key) const {
+            uint64_t h = 1469598103934665603ull; // FNV-1a over the raw coordinate bits
+            for (uint32_t word : key.bits) { h ^= word; h *= 1099511628211ull; }
+            return size_t(h);
+        }
+    };
+
+    if (its.indices.size() < 2)
+        return 0;
+
+    std::unordered_set<FaceKey, FaceKeyHash> seen;
+    seen.reserve(its.indices.size());
+    std::vector<stl_triangle_vertex_indices> kept;
+    kept.reserve(its.indices.size());
+
+    for (const stl_triangle_vertex_indices &face : its.indices) {
+        FaceKey key;
+        for (int v = 0; v < 3; ++ v) {
+            const stl_vertex &p = its.vertices[face(v)];
+            for (int c = 0; c < 3; ++ c)
+                std::memcpy(&key.bits[v * 3 + c], &p(c), sizeof(uint32_t));
+        }
+        if (seen.insert(key).second)
+            kept.emplace_back(face);
+    }
+
+    size_t removed = its.indices.size() - kept.size();
+    if (removed > 0)
+        its.indices = std::move(kept);
+    // Vertices are deliberately left alone: any that the dropped faces no longer
+    // reference are simply unreferenced, and since every duplicate carried identical
+    // coordinates the mesh bounding box is unchanged either way.
+    return removed;
+}
+
 bool process_actions(Data& cli, const DynamicPrintConfig& print_config, std::vector<Model>& models)
 {
     DynamicPrintConfig& actions     = cli.actions_config;
@@ -453,6 +519,21 @@ bool process_actions(Data& cli, const DynamicPrintConfig& print_config, std::vec
                         boost::nowide::cerr << "error: failed to read --import-support-stl: " << support_path << std::endl;
                         return 1;
                     }
+                    // Strip exact duplicate faces before the mesh reaches the slicer, so that
+                    // slice_supports() and merge_slices_and_eval_stats() both work on a single
+                    // copy instead of N. See remove_duplicate_faces() for why this is a
+                    // defensive net and not a fix for the duplication itself.
+                    const size_t faces_before = support_mesh.its.indices.size();
+                    if (remove_duplicate_faces(support_mesh.its) > 0) {
+                        const size_t faces_after = support_mesh.its.indices.size();
+                        // Formatted apart so the fixed/precision flags do not stick to cerr.
+                        std::ostringstream ratio;
+                        ratio << std::fixed << std::setprecision(2) << double(faces_before) / double(faces_after);
+                        boost::nowide::cerr << "warning: --import-support-stl contained duplicate faces: "
+                                            << faces_before << " -> " << faces_after << " (" << ratio.str()
+                                            << "x). Deduplicated for slicing; the upstream exporter still needs fixing."
+                                            << std::endl;
+                    }
                     if (!sla_print.attach_imported_support(support_mesh.its))
                         boost::nowide::cerr << "warning: --import-support-stl provided but no SLA object to attach to." << std::endl;
                 }
@@ -513,12 +594,24 @@ bool process_actions(Data& cli, const DynamicPrintConfig& print_config, std::vec
                         outfile_final = sla_print.print_statistics().finalize_output_path(outfile);
                         sla_print.export_print(outfile_final);
 
-                        // Export preview PNGs ZIP if requested
+                        // Export preview PNGs ZIP if requested. A failure here is
+                        // reported and then dropped: the .sl1 above is already
+                        // written, and the preview is only ever consumed by the UI,
+                        // so failing the whole slice over it would throw away work
+                        // the printer file no longer depends on.
                         if (actions.has("export_preview_pngs") && actions.opt_float("export_preview_pngs") > 0.) {
                             auto preview_path = boost::filesystem::path(outfile_final);
                             preview_path.replace_filename(preview_path.stem().string() + "_preview.zip");
-                            sla_print.export_preview_zip(preview_path.string());
-                            boost::nowide::cout << "Preview ZIP exported to " << preview_path.string() << std::endl;
+                            if (sla_print.export_preview_zip(preview_path.string()))
+                                boost::nowide::cout << "Preview ZIP exported to " << preview_path.string() << std::endl;
+                            else
+                                // Deliberately not the line above: that one is the
+                                // agent's archive-done marker, and claiming a file
+                                // that is not there would put a false statement into
+                                // the job log. The slice still ends successfully.
+                                boost::nowide::cerr << "warning: preview ZIP could not be written to "
+                                                    << preview_path.string()
+                                                    << "; the .sl1 is unaffected and slicing continues." << std::endl;
                         }
                     }
 
