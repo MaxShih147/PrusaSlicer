@@ -6013,6 +6013,11 @@ CLIActionsConfigDef::CLIActionsConfigDef()
     def->cli = "export-support-stl";
     def->set_default_value(new ConfigOptionBool(false));
 
+    def = this->add("export_support_points", coString);
+    def->label = L("Export SLA Support Points");
+    def->tooltip = L("Compute the SLA support points and write them to the given JSON file. When this is the only requested output, the pipeline stops right after the support point step: no support tree, pad, archive or preview is produced.");
+    def->cli = "export-support-points";
+
     def = this->add("export_hollow_stl", coBool);
     def->label = L("Export Hollow Interior STL");
     def->tooltip = L("Generate hollow interior mesh and export as STL.");
@@ -6128,6 +6133,11 @@ CLIMiscConfigDef::CLIMiscConfigDef()
     def->label = L("Import Support STL");
     def->tooltip = L("Load an externally generated support mesh (STL) and use it as the SLA support track instead of generating supports. The mesh must share the model's world coordinate origin.");
     def->cli = "import-support-stl";
+
+    def = this->add("import_support_points", coString);
+    def->label = L("Import SLA Support Points");
+    def->tooltip = L("Load a support point list (JSON, as written by --export-support-points) and use it instead of running automatic support point detection. The file carries a fingerprint of the model it was generated from; slicing is refused if it does not match the model being sliced.");
+    def->cli = "import-support-points";
 
     def = this->add("datadir", coString);
     def->label = L("Data directory");

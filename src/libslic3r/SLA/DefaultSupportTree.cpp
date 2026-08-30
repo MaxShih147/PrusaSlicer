@@ -312,7 +312,11 @@ bool DefaultSupportTree::connect_to_nearpillar(const Head &head,
     Vec3d bridgestart = headjp;
     Vec3d bridgeend = nearjp_u;
     double max_len = r * m_sm.cfg.max_bridge_length_mm / m_sm.cfg.head_back_radius_mm;
-    double max_slope = m_sm.cfg.bridge_slope;
+    // This head's own bracing angle. Most heads in a cluster reach the ground
+    // through this bridge rather than through their own pillar, so leaving the
+    // global value here would make a custom angle do nothing for every head
+    // except the cluster centroid.
+    double max_slope = resolved_bridge_slope(m_sm, head.id);
     double zdiff = 0.0;
 
        // check the default situation if feasible for a bridge
@@ -425,7 +429,7 @@ void DefaultSupportTree::add_pinheads()
             NaNd,
             sp.head_front_radius,
             0.,
-            m_sm.cfg.head_penetration_mm,
+            point_head_penetration_mm(sp, m_sm.cfg.head_penetration_mm),
             Vec3d::Zero(),         // dir
             sp.pos.cast<double>()  // displacement
             );
@@ -461,6 +465,17 @@ void DefaultSupportTree::add_pinheads()
         // (Quaternion::FromTwoVectors) and apply the rotation to the
         // arrow head.
 
+        // Everything below reads this point's own sizes, falling back to the
+        // global configuration wherever the point leaves a field unset. Note
+        // back_r is a parameter rather than a lookup: filterfn() re-enters
+        // itself with the global fallback radius when the resolved one leaves
+        // no room for a head.
+        const SupportPoint &sp    = m_sm.pts[fidx];
+        const double pt_back_r    = point_head_back_radius_mm(sp, m_sm.cfg.head_back_radius_mm);
+        const double pt_width     = point_head_width_mm(sp, m_sm.cfg.head_width_mm);
+        const double pt_penetr    = point_head_penetration_mm(sp, m_sm.cfg.head_penetration_mm);
+        const double pt_slope     = point_bracing_angle_rad(sp, m_sm.cfg.bridge_slope);
+
         auto [polar, azimuth] = dir_to_spheric(n);
 
         // skip if the tilt is not sane
@@ -476,20 +491,22 @@ void DefaultSupportTree::add_pinheads()
         if (polar < M_PI / 2.0 + m_sm.cfg.overhang_angle_threshold) return;
 
         // We saturate the polar angle to 3pi/4
-        polar = std::max(polar, PI - m_sm.cfg.bridge_slope);
+        polar = std::max(polar, PI - pt_slope);
 
         // save the head (pinpoint) position
         Vec3d hp = m_points.row(fidx);
 
-        double lmin = m_sm.cfg.head_width_mm, lmax = lmin;
+        double lmin = pt_width, lmax = lmin;
 
-        if (back_r < m_sm.cfg.head_back_radius_mm) {
-            lmin = 0., lmax = m_sm.cfg.head_penetration_mm;
+        // back_r below this point's own radius means filterfn() re-entered with
+        // the global fallback radius, i.e. this is a mini pillar.
+        if (back_r < pt_back_r) {
+            lmin = 0., lmax = pt_penetr;
         }
 
         // The distance needed for a pinhead to not collide with model.
         double w = lmin + 2 * back_r + 2 * m_sm.cfg.head_front_radius_mm -
-                   m_sm.cfg.head_penetration_mm;
+                   pt_penetr;
 
         double pin_r = double(m_sm.pts[fidx].head_front_radius);
 
@@ -523,7 +540,7 @@ void DefaultSupportTree::add_pinheads()
                 },
                 initvals({polar, azimuth, (lmin + lmax) / 2.}), // start with what we have
                 bounds({
-                    {PI - m_sm.cfg.bridge_slope, PI},    // Must not exceed the slope limit
+                    {PI - pt_slope, PI},    // Must not exceed the slope limit
                     {-PI, PI}, // azimuth can be a full search
                     {lmin, lmax}
                 }));
@@ -558,9 +575,12 @@ void DefaultSupportTree::add_pinheads()
             // leave the pillar starting at the old junction while the head mesh
             // ends at the new one - a gap of up to the configured penetration.
             h.penetration_mm = clamped_head_penetration(m_sm.emesh, hp, nn,
-                                                        m_sm.cfg.head_penetration_mm,
+                                                        pt_penetr,
                                                         &m_penetration_stats);
         } else if (back_r > m_sm.cfg.head_fallback_radius_mm) {
+            // The fallback radius stays global: it is the "no room for a real
+            // head, try a mini pillar" escape hatch, not one of the point's
+            // own sizes.
             filterfn(fidx, i, m_sm.cfg.head_fallback_radius_mm);
         }
     };
@@ -568,7 +588,10 @@ void DefaultSupportTree::add_pinheads()
     execution::for_each(
         suptree_ex_policy, size_t(0), filtered_indices.size(),
         [this, &filterfn, &filtered_indices](size_t i) {
-            filterfn(filtered_indices[i], i, m_sm.cfg.head_back_radius_mm);
+            const unsigned fidx = filtered_indices[i];
+            filterfn(fidx, i,
+                     point_head_back_radius_mm(m_sm.pts[fidx],
+                                               m_sm.cfg.head_back_radius_mm));
         },
         execution::max_concurrency(suptree_ex_policy));
 
@@ -622,8 +645,13 @@ void DefaultSupportTree::classify()
                             const PointIndexEl &e2) {
         double d2d = distance(to_2d(e1.first), to_2d(e2.first));
         double d3d = distance(e1.first, e2.first);
-        return d2d < 2 * m_sm.cfg.base_radius_mm
-               && d3d < m_sm.cfg.max_bridge_length_mm;
+        // The 2D test asks "would these two pillar bases overlap", so it has to
+        // add up the two bases actually being built, not twice the global one.
+        // .second is the head id, which is the support point index. With every
+        // point on the default this is exactly 2 * base_radius_mm as before.
+        double bases = resolved_base_radius_mm(m_sm, long(e1.second)) +
+                       resolved_base_radius_mm(m_sm, long(e2.second));
+        return d2d < bases && d3d < m_sm.cfg.max_bridge_length_mm;
     };
 
     m_pillar_clusters = cluster(ground_head_indices, pointfn, predicate,
@@ -710,7 +738,8 @@ bool DefaultSupportTree::connect_to_ground(Head &head)
                                                      {head.junction_point(),
                                                       head.r_back_mm},
                                                      head.r_back_mm,
-                                                     head.dir);
+                                                     head.dir,
+                                                     head.id);
 
     if (pillar_id >= 0) {
         // Save the pillar endpoint in the spatial index
@@ -746,7 +775,9 @@ bool DefaultSupportTree::connect_to_model_body(Head &head)
     h = std::min(hit.distance() - head.r_back_mm, h);
 
     // If this is a mini pillar dont bother with the tail width, can be 0.
-    if (head.r_back_mm < m_sm.cfg.head_back_radius_mm) h = std::max(h, 0.);
+    // "Mini" is relative to the radius this point asked for, not the global one.
+    if (head.r_back_mm < resolved_head_back_radius_mm(m_sm, head.id))
+        h = std::max(h, 0.);
     else if (h <= 0.) return false;
 
     Vec3d endp{hjp.x(), hjp.y(), hjp.z() - hit.distance() + h};
@@ -796,7 +827,7 @@ bool DefaultSupportTree::connect_to_model_body(Head &head)
     // bite by exactly the amount that was trimmed.
     const double anchor_penetration =
         clamped_head_penetration(m_sm.emesh, hitp, taildir,
-                                 m_sm.cfg.head_penetration_mm,
+                                 resolved_head_penetration_mm(m_sm, head.id),
                                  &m_penetration_stats);
 
     double dist = (hitp - endp).norm() + anchor_penetration;

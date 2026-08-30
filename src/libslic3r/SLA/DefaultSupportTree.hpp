@@ -201,6 +201,11 @@ class DefaultSupportTree {
                               const Vec3d &sourcedir,
                               long         head_id = SupportTreeNode::ID_UNSET);
 
+    // Stays on the global base radius on purpose: pid here is a *pillar* id,
+    // not a head id, and the only caller is interconnect_pillars(), which adds
+    // auxiliary props that grew from no support point. Per-point base radii
+    // are applied in create_ground_pillar(), where the originating point is
+    // known.
     void add_pillar_base(long pid)
     {
         m_builder.add_pillar_base(pid, m_sm.cfg.base_height_mm, m_sm.cfg.base_radius_mm);

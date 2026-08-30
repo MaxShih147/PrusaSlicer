@@ -413,6 +413,7 @@ public:
     inline const std::vector<Head>   &heads() const { return m_heads; }
     inline const std::vector<Bridge> &bridges() const { return m_bridges; }
     inline const std::vector<Bridge> &crossbridges() const { return m_crossbridges; }
+    inline const std::vector<Pedestal> &pedestals() const { return m_pedestals; }
     
     template<class T> inline IntegerOnly<T, const Pillar&> pillar(T id) const
     {

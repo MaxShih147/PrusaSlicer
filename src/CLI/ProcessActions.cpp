@@ -40,6 +40,8 @@
 #include "libslic3r/MultipleBeds.hpp"
 #include "libslic3r/BuildVolume.hpp"
 #include "libslic3r/SLA/Hollowing.hpp"
+#include "libslic3r/SLA/ModelFingerprint.hpp"
+#include "libslic3r/SLA/SupportPointIO.hpp"
 #include "libslic3r/TriangleMesh.hpp"
 
 #include "CLI/CLI.hpp"
@@ -333,6 +335,47 @@ bool process_actions(Data& cli, const DynamicPrintConfig& print_config, std::vec
     DynamicPrintConfig& actions     = cli.actions_config;
     DynamicPrintConfig& transform   = cli.transform_config;
 
+    // Reads one CLI string option, treating an empty value as absent.
+    auto opt_path = [](const DynamicPrintConfig &cfg, const char *key) -> std::string {
+        return cfg.has(key) ? cfg.opt_string(key) : std::string();
+    };
+
+    const std::string import_support_points_path = opt_path(cli.misc_config, "import_support_points");
+    const std::string export_support_points_path = opt_path(actions, "export_support_points");
+
+    // An empty path is a typo, never a way of saying "not this time". Treating
+    // it as absent would leave the caller waiting for a file that was never
+    // going to be written, with a successful exit code to go with it.
+    if (cli.misc_config.has("import_support_points") && import_support_points_path.empty()) {
+        boost::nowide::cerr << "error: --import-support-points needs a file path" << std::endl;
+        return false;
+    }
+    if (actions.has("export_support_points") && export_support_points_path.empty()) {
+        boost::nowide::cerr << "error: --export-support-points needs a file path" << std::endl;
+        return false;
+    }
+
+    // The support point interface and --import-support-stl are mutually
+    // exclusive. One hands the engine a finished support mesh; the other
+    // describes the points the engine should build one FROM. Accepting both
+    // would mean silently ignoring one of them, so this is checked here, at the
+    // top of the function, before any output file exists.
+    {
+        const std::string stl_path = opt_path(cli.misc_config, "import_support_stl");
+        const char *conflicting = nullptr;
+        if (!import_support_points_path.empty())
+            conflicting = "--import-support-points";
+        else if (!export_support_points_path.empty())
+            conflicting = "--export-support-points";
+
+        if (!stl_path.empty() && conflicting != nullptr) {
+            boost::nowide::cerr << "error: " << conflicting
+                                << " cannot be combined with --import-support-stl"
+                                << std::endl;
+            return false;
+        }
+    }
+
     // doesn't need any aditional input 
 
     if (actions.has("help")) {
@@ -456,7 +499,7 @@ bool process_actions(Data& cli, const DynamicPrintConfig& print_config, std::vec
         }
     }
 
-    if (actions.has("slice") || actions.has("export_gcode") || actions.has("export_sla") || actions.has("export_support_stl") || actions.has("export_preview_pngs")) {
+    if (actions.has("slice") || actions.has("export_gcode") || actions.has("export_sla") || actions.has("export_support_stl") || actions.has("export_preview_pngs") || !export_support_points_path.empty()) {
         PrinterTechnology       printer_technology = Preset::printer_technology(print_config);
         if (actions.has("export_gcode") && printer_technology == ptSLA) {
             boost::nowide::cerr << "error: cannot export G-code for an FFF configuration" << std::endl;
@@ -465,6 +508,38 @@ bool process_actions(Data& cli, const DynamicPrintConfig& print_config, std::vec
         else if (actions.has("export_sla") && printer_technology == ptFFF) {
             boost::nowide::cerr << "error: cannot export SLA slices for a SLA configuration" << std::endl;
             return 1;
+        }
+        // Support points only exist in the SLA pipeline. Without this the FFF
+        // branch below would run a full slice and hand back a G-code file -
+        // a completely different artifact from the one that was asked for -
+        // while never writing the JSON and still exiting successfully.
+        else if (!export_support_points_path.empty() && printer_technology == ptFFF) {
+            boost::nowide::cerr << "error: --export-support-points requires an SLA configuration"
+                                << std::endl;
+            return false;
+        }
+        // Same reasoning in the other direction: an import that the SLA branch
+        // never reaches would be silently ignored.
+        else if (!import_support_points_path.empty() && printer_technology == ptFFF) {
+            boost::nowide::cerr << "error: --import-support-points requires an SLA configuration"
+                                << std::endl;
+            return false;
+        }
+
+        // The interchange file describes ONE object, and both paths below run
+        // once per input model. Left unchecked, two inputs would take turns
+        // writing the same export path and only the last one would survive -
+        // silently, with a successful exit code. Refused up front, before any
+        // slicing happens.
+        if (models.size() != 1) {
+            const char *which = !export_support_points_path.empty() ? "--export-support-points"
+                              : !import_support_points_path.empty() ? "--import-support-points"
+                                                                    : nullptr;
+            if (which != nullptr) {
+                boost::nowide::cerr << "error: " << which << " handles a single input model; "
+                                    << models.size() << " were given" << std::endl;
+                return false;
+            }
         }
 
         const Vec2crd           gap{ s_multiple_beds.get_bed_gap() };
@@ -499,6 +574,84 @@ bool process_actions(Data& cli, const DynamicPrintConfig& print_config, std::vec
             if (printer_technology == ptFFF) {
                 for (auto* mo : model.objects)
                     fff_print.auto_assign_extruders(mo);
+            }
+
+            // Load a caller supplied support point list (--import-support-points).
+            //
+            // This runs BEFORE print->apply() on purpose. apply() decides which
+            // pipeline steps are invalidated from the model's contents and
+            // copies that state into the print object, so points written after
+            // it would sit in the model with nothing looking at them.
+            // --import-support-stl below is the opposite case: it operates on an
+            // SLAPrintObject, which does not exist until apply() has run.
+            if (printer_technology == ptSLA && !import_support_points_path.empty()) {
+                boost::nowide::ifstream ifs(import_support_points_path);
+                if (!ifs.good()) {
+                    boost::nowide::cerr << "error: failed to open --import-support-points: "
+                                        << import_support_points_path << std::endl;
+                    return false;
+                }
+                std::ostringstream text;
+                text << ifs.rdbuf();
+
+                // The globals the file falls back to for any size it does not
+                // name. Built from the print config because no SLAPrintObject
+                // exists yet at this point.
+                SLAPrintObjectConfig obj_cfg;
+                obj_cfg.apply(print_config, true);
+                const sla::SupportTreeConfig scfg = make_support_cfg(obj_cfg);
+
+                sla::SupportPointFile file;
+                std::string parse_err;
+                if (!sla::support_points_from_string(text.str(), scfg, file, parse_err)) {
+                    boost::nowide::cerr << "error: --import-support-points: " << parse_err
+                                        << std::endl;
+                    return false;
+                }
+
+                // The interchange format carries a flat point list with no
+                // object_id dimension yet (openspec task 9.8 is still open), so
+                // there is no way to say which object a point belongs to.
+                // Refusing beats guessing.
+                if (model.objects.size() != 1) {
+                    boost::nowide::cerr << "error: --import-support-points handles a single object "
+                                           "per file; this model has " << model.objects.size()
+                                        << std::endl;
+                    return false;
+                }
+
+                ModelObject *mo = model.objects.front();
+
+                if (file.has_fingerprint) {
+                    const sla::ModelFingerprint current = sla::model_fingerprint(*mo);
+                    if (!sla::fingerprint_matches(file.fingerprint, current)) {
+                        // A fixed, untranslatable marker: the backend classifier
+                        // matches on this line to tell "the model changed" apart
+                        // from "support generation failed". Nothing is sliced and
+                        // no output file is written; in particular this must NOT
+                        // fall back to generating points automatically, which
+                        // would silently discard the caller's edits.
+                        boost::nowide::cerr << sla::support_points_model_mismatch_marker << std::endl;
+                        boost::nowide::cerr << "  expected: "
+                                            << sla::fingerprint_to_string(file.fingerprint) << std::endl;
+                        boost::nowide::cerr << "  actual:   "
+                                            << sla::fingerprint_to_string(current) << std::endl;
+                        return false;
+                    }
+                } else {
+                    // A hand written list that only adds a few points has no
+                    // fingerprint to carry. Loading it is allowed, but the caller
+                    // is told that nothing was verified.
+                    boost::nowide::cerr << "warning: --import-support-points file carries no model "
+                                           "fingerprint; loaded without checking it against the model."
+                                        << std::endl;
+                }
+
+                mo->sla_support_points = file.points;
+                mo->sla_points_status  = sla::PointsStatus::UserModified;
+                boost::nowide::cout << "Loaded " << file.points.size()
+                                    << " support points from " << import_support_points_path
+                                    << std::endl;
             }
 
             update_instances_outside_state(model, print_config);
@@ -570,7 +723,27 @@ bool process_actions(Data& cli, const DynamicPrintConfig& print_config, std::vec
                     && !actions.has("slice")
                     && !actions.has("export_gcode")
                     && !actions.has("export_preview_pngs");
-                if (support_stl_only) {
+                // Points-only fast path: stop one step earlier still, right
+                // after the support points are computed. Nothing downstream -
+                // support tree, pad, slicing, rasterization - is needed to write
+                // the point list, and skipping the tree is where the speed comes
+                // from. Note this deliberately excludes export_support_stl:
+                // asking for both is legal, and the pad stop below already runs
+                // past the support point step.
+                const bool support_points_only = printer_technology == ptSLA
+                    && !export_support_points_path.empty()
+                    && !actions.has("export_support_stl")
+                    && !actions.has("export_sla")
+                    && !actions.has("slice")
+                    && !actions.has("export_gcode")
+                    && !actions.has("export_preview_pngs");
+
+                if (support_points_only) {
+                    PrintBase::TaskParams task_params;
+                    task_params.to_object_step = slaposSupportPoints;
+                    sla_print.set_task(task_params);
+                }
+                else if (support_stl_only) {
                     PrintBase::TaskParams task_params;
                     task_params.to_object_step = slaposPad;
                     sla_print.set_task(task_params);
@@ -584,9 +757,9 @@ bool process_actions(Data& cli, const DynamicPrintConfig& print_config, std::vec
                 }
                 else {
                     outfile = sla_print.output_filepath(outfile);
-                    if (support_stl_only) {
-                        // No sl1 archive in this mode; keep a filename stem for
-                        // the *_support.stl output below.
+                    if (support_stl_only || support_points_only) {
+                        // No sl1 archive in either of these modes; keep a
+                        // filename stem for the *_support.stl output below.
                         outfile_final = outfile;
                     }
                     else {
@@ -613,6 +786,83 @@ bool process_actions(Data& cli, const DynamicPrintConfig& print_config, std::vec
                                                     << preview_path.string()
                                                     << "; the .sl1 is unaffected and slicing continues." << std::endl;
                         }
+                    }
+
+                    // Write the support point list (--export-support-points).
+                    if (!export_support_points_path.empty()) {
+                        if (sla_print.objects().size() != 1) {
+                            boost::nowide::cerr << "error: --export-support-points handles a single "
+                                                   "object per file; this print has "
+                                                << sla_print.objects().size() << std::endl;
+                            return false;
+                        }
+
+                        const SLAPrintObject *po = sla_print.objects().front();
+                        if (!po->is_step_done(slaposSupportPoints)) {
+                            boost::nowide::cerr << "error: --export-support-points: the support point "
+                                                   "step did not run" << std::endl;
+                            return false;
+                        }
+
+                        // Back into the coordinate system of the file the caller
+                        // handed in. trafo() is used through its accessor and
+                        // inverted whole: it folds in the shrinkage compensation
+                        // and a left handed mirroring, and rebuilding it by hand
+                        // would quietly lose both.
+                        const Transform3d to_object_space = po->trafo().inverse();
+
+                        sla::SupportPoints out_points;
+                        const std::vector<sla::SupportPoint> &pts = po->get_support_points();
+                        out_points.reserve(pts.size());
+                        for (const sla::SupportPoint &sp : pts) {
+                            const Vec3d mapped = to_object_space * sp.pos.cast<double>();
+
+                            // trafo() is only invertible while its linear part
+                            // is non-singular, and it is built as
+                            // Diagonal(correction) * instance.linear() - either
+                            // factor can collapse to zero through a zero
+                            // shrinkage compensation or a zero instance scale.
+                            // Eigen answers a singular inverse with infinities
+                            // rather than an exception, so the check has to be
+                            // on the result. in_float_range() also covers the
+                            // narrowing to float below, which is undefined
+                            // behaviour for anything past FLT_MAX.
+                            if (!sla::detail::in_float_range(mapped.x()) ||
+                                !sla::detail::in_float_range(mapped.y()) ||
+                                !sla::detail::in_float_range(mapped.z())) {
+                                boost::nowide::cerr
+                                    << "error: --export-support-points: the object transform is "
+                                       "not invertible (a zero scale or a zero shrinkage "
+                                       "compensation), so support point coordinates cannot be "
+                                       "mapped back to the input model" << std::endl;
+                                return false;
+                            }
+
+                            sla::SupportPoint moved = sp;
+                            moved.pos = mapped.cast<float>();
+                            out_points.push_back(moved);
+                        }
+
+                        const sla::SupportTreeConfig scfg = make_support_cfg(po->config());
+                        const sla::ModelFingerprint fp = sla::model_fingerprint(*po->model_object());
+
+                        boost::nowide::ofstream ofs(export_support_points_path);
+                        if (!ofs.good()) {
+                            boost::nowide::cerr << "error: failed to open --export-support-points for "
+                                                   "writing: " << export_support_points_path << std::endl;
+                            return false;
+                        }
+                        ofs << sla::support_points_to_string(out_points, fp, scfg) << std::endl;
+                        ofs.close();
+                        if (!ofs) {
+                            boost::nowide::cerr << "error: failed to write --export-support-points: "
+                                                << export_support_points_path << std::endl;
+                            return false;
+                        }
+
+                        boost::nowide::cout << "Support points exported to "
+                                            << export_support_points_path << " ("
+                                            << out_points.size() << " points)" << std::endl;
                     }
 
                     // Export support mesh (including pad) as STL if requested
@@ -662,7 +912,7 @@ bool process_actions(Data& cli, const DynamicPrintConfig& print_config, std::vec
                         }
                     }
                 }
-                if (!support_stl_only) {
+                if (!support_stl_only && !support_points_only) {
                     if (outfile != outfile_final) {
                         if (Slic3r::rename_file(outfile, outfile_final)) {
                             boost::nowide::cerr << "Renaming file " << outfile << " to " << outfile_final << " failed" << std::endl;

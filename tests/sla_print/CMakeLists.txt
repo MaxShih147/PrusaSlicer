@@ -11,6 +11,10 @@ add_executable(${_TEST_NAME}_tests ${_TEST_NAME}_tests_main.cpp
     sla_supptreeutils_tests.cpp
     sla_archive_readwrite_tests.cpp
     sla_import_support_tests.cpp
+    sla_support_point_fields_tests.cpp
+    sla_per_point_geometry_tests.cpp
+    sla_model_fingerprint_tests.cpp
+    sla_support_point_io_tests.cpp
     sla_pad_degradation_tests.cpp
     sla_zcorrection_tests.cpp)
 
