@@ -61,6 +61,12 @@ function(add_cmake_project projectname)
         INSTALL_DIR         ${${PROJECT_NAME}_DEP_INSTALL_PREFIX}
         DOWNLOAD_DIR        ${${PROJECT_NAME}_DEP_DOWNLOAD_DIR}/${projectname}
         BINARY_DIR          ${CMAKE_CURRENT_BINARY_DIR}/builds/${projectname}
+        # Without these, file(DOWNLOAD) has no timeout at all: a stalled
+        # connection (e.g. remote closes but our end doesn't notice, socket
+        # sits in CLOSE_WAIT) hangs the download step forever instead of
+        # tripping the retry-with-backoff logic ExternalProject already has.
+        TIMEOUT             600
+        INACTIVITY_TIMEOUT  60
         CMAKE_ARGS
             -DCMAKE_INSTALL_PREFIX:STRING=${${PROJECT_NAME}_DEP_INSTALL_PREFIX}
             -DCMAKE_MODULE_PATH:STRING=${CMAKE_MODULE_PATH}

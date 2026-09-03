@@ -21,6 +21,11 @@ ExternalProject_Add(dep_OpenSSL
     EXCLUDE_FROM_ALL ON
     URL "https://github.com/openssl/openssl/archive/OpenSSL_1_1_0l.tar.gz"
     URL_HASH SHA256=e2acf0cf58d9bff2b42f2dc0aee79340c8ffe2c5e45d3ca4533dd5d4f5775b1d
+    # file(DOWNLOAD) has no timeout by default: a stalled connection
+    # (remote closes, our end sits in CLOSE_WAIT) hangs forever instead
+    # of tripping ExternalProject's built-in retry-with-backoff.
+    TIMEOUT             600
+    INACTIVITY_TIMEOUT  60
     DOWNLOAD_DIR ${${PROJECT_NAME}_DEP_DOWNLOAD_DIR}/OpenSSL
     BUILD_IN_SOURCE ON
     CONFIGURE_COMMAND ${_conf_cmd} ${_cross_arch}

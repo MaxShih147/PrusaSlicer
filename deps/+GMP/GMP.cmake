@@ -56,6 +56,11 @@ else ()
         EXCLUDE_FROM_ALL ON
         URL https://gmplib.org/download/gmp/gmp-6.2.1.tar.bz2
         URL_HASH SHA256=eae9326beb4158c386e39a356818031bd28f3124cf915f8c5b1dc4c7a36b4d7c
+        # file(DOWNLOAD) has no timeout by default: a stalled connection
+        # (remote closes, our end sits in CLOSE_WAIT) hangs forever instead
+        # of tripping ExternalProject's built-in retry-with-backoff.
+        TIMEOUT             600
+        INACTIVITY_TIMEOUT  60
         DOWNLOAD_DIR ${${PROJECT_NAME}_DEP_DOWNLOAD_DIR}/GMP
         BUILD_IN_SOURCE ON 
         CONFIGURE_COMMAND  env "CFLAGS=${_gmp_ccflags}" "CXXFLAGS=${_gmp_ccflags}" ./configure ${_cross_compile_arg} --enable-shared=no --enable-cxx=yes --enable-static=yes "--prefix=${${PROJECT_NAME}_DEP_INSTALL_PREFIX}" ${_gmp_build_tgt}
