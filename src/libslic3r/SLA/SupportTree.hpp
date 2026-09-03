@@ -150,6 +150,23 @@ struct PriorPillar
 
 using PriorPillars = std::vector<PriorPillar>;
 
+// What a generation attached itself to, and what that did to the pillars it
+// attached to.
+//
+// A support that braces to a neighbour changes that neighbour's link count even
+// though its geometry is untouched, and the caller has to carry the new count
+// into the NEXT generation or the engine will keep bracing to a pillar that is
+// already full. Reporting it is the difference between an additive flow that
+// stays correct and one that drifts after a few supports.
+struct PriorAttachment
+{
+    long     prior_id = -1; // the caller's handle for the pillar attached to
+    unsigned links    = 0;  // its link count after this generation
+    unsigned bridges  = 0;  // its bridge count after this generation
+};
+
+using PriorAttachments = std::vector<PriorAttachment>;
+
 struct SupportableMesh
 {
     AABBMesh          emesh;
@@ -270,7 +287,8 @@ inline double ground_level(const SupportableMesh &sm)
 ///        the caller already has those.
 indexed_triangle_set create_support_tree(const SupportableMesh &mesh,
                                          const JobController   &ctl,
-                                         PriorPillars          *out_pillars = nullptr);
+                                         PriorPillars          *out_pillars = nullptr,
+                                         PriorAttachments      *out_attached = nullptr);
 
 indexed_triangle_set create_pad(const SupportableMesh      &model_mesh,
                                 const indexed_triangle_set &support_mesh,

@@ -925,7 +925,8 @@ bool process_actions(Data& cli, const DynamicPrintConfig& print_config, std::vec
                             // the caller has to be able to record.
                             if (!export_support_pillars_path.empty()) {
                                 const std::string doc = sla::prior_pillars_to_string(
-                                    po->generated_pillars(), po->get_elevation());
+                                    po->generated_pillars(), po->get_elevation(),
+                                    po->prior_attachments());
                                 boost::nowide::ofstream pofs(export_support_pillars_path);
                                 if (pofs.good()) {
                                     pofs << doc;

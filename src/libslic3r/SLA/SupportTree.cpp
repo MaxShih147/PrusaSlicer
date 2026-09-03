@@ -30,7 +30,8 @@ namespace Slic3r { namespace sla {
 
 indexed_triangle_set create_support_tree(const SupportableMesh &sm,
                                          const JobController   &ctl,
-                                         PriorPillars          *out_pillars)
+                                         PriorPillars          *out_pillars,
+                                         PriorAttachments      *out_attached)
 {
     auto builder = make_unique<SupportTreeBuilder>(ctl);
 
@@ -40,7 +41,7 @@ indexed_triangle_set create_support_tree(const SupportableMesh &sm,
 
         switch (sm.cfg.tree_type) {
         case SupportTreeType::Default: {
-            create_default_tree(*builder, sm);
+            DefaultSupportTree::execute(*builder, sm, out_attached);
             break;
         }
         case SupportTreeType::Branching: {

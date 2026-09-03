@@ -10,6 +10,7 @@
 #include <Eigen/Geometry>
 #include <algorithm>
 #include <map>
+#include <set>
 #include <mutex>
 #include <optional>
 #include <utility>
@@ -96,8 +97,14 @@ class DefaultSupportTree {
     // support points in Eigen/IGL format
     Eigen::MatrixXd m_points;
 
-    // Builder ids of the pillars adopted from SupportableMesh::prior.
+    // Builder ids of the pillars adopted from SupportableMesh::prior, and the
+    // caller handle each one came in with.
     std::vector<long> m_prior_pillar_ids;
+    std::map<long, long> m_prior_caller_ids; // builder id -> caller id
+
+    // Which prior pillars this run attached to. Recorded rather than derived:
+    // only the code that succeeds in bracing knows it happened.
+    std::set<long> m_attached_prior_ids;
 
     // throw if canceled: It will be called many times so a shorthand will
     // come in handy.
@@ -263,11 +270,21 @@ public:
     // without any of it being recomputed or re-emitted.
     void adopt_prior_pillars();
 
+    /// Note that this run braced to a prior pillar, if that is what `pillar_id`
+    /// is. Safe to call for any pillar; only frozen ones are recorded.
+    void note_prior_attachment(long pillar_id);
+
+    /// What this run attached to, with the link counts those pillars now carry.
+    PriorAttachments prior_attachments() const;
+
     void interconnect_pillars();
 
     inline void merge_result() { m_builder.merged_mesh(); }
 
-    static bool execute(SupportTreeBuilder & builder, const SupportableMesh &sm);
+    /// @param out_attached when given, receives the prior pillars this run
+    ///        braced to, with the link counts they now carry.
+    static bool execute(SupportTreeBuilder & builder, const SupportableMesh &sm,
+                        PriorAttachments *out_attached = nullptr);
 };
 
 inline void create_default_tree(SupportTreeBuilder &builder, const SupportableMesh &sm)

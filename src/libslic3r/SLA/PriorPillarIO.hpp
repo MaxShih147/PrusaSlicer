@@ -99,7 +99,8 @@ inline bool prior_pillars_from_string(const std::string &text,
  * @returns the JSON document
  */
 inline std::string prior_pillars_to_string(const PriorPillars &pillars,
-                                           double elevation = 0.)
+                                           double elevation = 0.,
+                                           const PriorAttachments &attached = {})
 {
     nlohmann::json arr = nlohmann::json::array();
     for (const PriorPillar &p : pillars) {
@@ -118,8 +119,19 @@ inline std::string prior_pillars_to_string(const PriorPillars &pillars,
     // it BEFORE any support exists, to place the model. Comes straight from
     // SLAPrintObject::get_elevation() so nobody has to reproduce the rule that
     // an enabled pad adds its wall thickness on top of the object elevation.
+    // What this run braced to. The link counts are the ones those pillars carry
+    // NOW, so the caller can update its own copies before the next generation -
+    // stale counts make the engine keep bracing to a pillar that is full.
+    nlohmann::json att = nlohmann::json::array();
+    for (const PriorAttachment &a : attached) {
+        att.push_back({{"prior_id", a.prior_id},
+                       {"links", a.links},
+                       {"bridges", a.bridges}});
+    }
+
     nlohmann::json doc = {{"version", prior_pillar_format_version},
                           {"elevation", elevation},
+                          {"attached_to", att},
                           {"pillars", arr}};
     return doc.dump(1, ' ');
 }

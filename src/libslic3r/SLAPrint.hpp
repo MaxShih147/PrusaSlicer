@@ -141,6 +141,15 @@ public:
     /// what is already on the plate without any of it being recomputed.
     void                        set_prior_pillars(const sla::PriorPillars &p) { m_prior_pillars = p; }
     const sla::PriorPillars    &prior_pillars() const { return m_prior_pillars; }
+    /// What the last generation braced to, and the link counts those pillars
+    /// now carry. The caller must carry these forward, or the next generation
+    /// will keep bracing to a pillar that is already full.
+    const sla::PriorAttachments &prior_attachments() const
+    {
+        static const sla::PriorAttachments empty;
+        return m_supportdata ? m_supportdata->prior_attachments : empty;
+    }
+
     /// The pillars the last support generation produced. Empty until it has run.
     const sla::PriorPillars    &generated_pillars() const
     {
@@ -404,10 +413,13 @@ private:
         
         // Pillars this generation created, for handing to the next one.
         sla::PriorPillars generated_pillars;
+        // The prior pillars it braced to, with their updated link counts.
+        sla::PriorAttachments prior_attachments;
 
         void create_support_tree(const sla::JobController &ctl)
         {
-            tree_mesh = TriangleMesh{sla::create_support_tree(input, ctl, &generated_pillars)};
+            tree_mesh = TriangleMesh{sla::create_support_tree(
+                input, ctl, &generated_pillars, &prior_attachments)};
         }
 
         void create_pad(const sla::JobController &ctl)

@@ -58,7 +58,8 @@ DefaultSupportTree::DefaultSupportTree(SupportTreeBuilder &   builder,
 }
 
 bool DefaultSupportTree::execute(SupportTreeBuilder    &builder,
-                                const SupportableMesh &sm)
+                                const SupportableMesh &sm,
+                                PriorAttachments      *out_attached)
 {
     if(sm.pts.empty()) return false;
 
@@ -181,6 +182,9 @@ bool DefaultSupportTree::execute(SupportTreeBuilder    &builder,
     if (pc != ABORT)
         report_penetration_failsafes(alg.m_penetration_stats,
                                      "Default support tree");
+
+    if (out_attached)
+        *out_attached = alg.prior_attachments();
 
     return pc == ABORT;
 }
@@ -377,6 +381,7 @@ bool DefaultSupportTree::connect_to_nearpillar(const Head &head,
         }
 
         m_builder.increment_bridges(nearpillar());
+        note_prior_attachment(nearpillar_id);
     } else return false;
 
     return true;
@@ -933,7 +938,30 @@ void DefaultSupportTree::adopt_prior_pillars()
                                                pp.links, pp.bridges);
         m_pillar_index.insert(m_builder.pillar(pid).endpoint(), unsigned(pid));
         m_prior_pillar_ids.push_back(pid);
+        m_prior_caller_ids[pid] = pp.id;
     }
+}
+
+void DefaultSupportTree::note_prior_attachment(long pillar_id)
+{
+    if (pillar_id < 0 || size_t(pillar_id) >= m_builder.pillarcount())
+        return;
+    if (m_builder.pillar(pillar_id).frozen)
+        m_attached_prior_ids.insert(pillar_id);
+}
+
+PriorAttachments DefaultSupportTree::prior_attachments() const
+{
+    PriorAttachments out;
+    out.reserve(m_attached_prior_ids.size());
+    for (long pid : m_attached_prior_ids) {
+        const auto it = m_prior_caller_ids.find(pid);
+        if (it == m_prior_caller_ids.end())
+            continue;
+        const Pillar &p = m_builder.pillar(pid);
+        out.push_back(PriorAttachment{it->second, p.links, p.bridges});
+    }
+    return out;
 }
 
 void DefaultSupportTree::interconnect_pillars()
@@ -1004,6 +1032,11 @@ void DefaultSupportTree::interconnect_pillars()
 
             if(interconnect(pillar, neighborpillar)) {
                 pairs.insert(hashval);
+                // Bracing to a pillar carried in from an earlier generation is
+                // the whole point of additive support: report it, and report
+                // what it did to that pillar's link count.
+                note_prior_attachment(a);
+                note_prior_attachment(b);
 
                 // If the interconnection length between the two pillars is
                 // less than 50% of the longer pillar's height, don't count
