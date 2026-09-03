@@ -695,6 +695,14 @@ bool SLAPrint::attach_imported_support(const indexed_triangle_set &its)
     return true;
 }
 
+bool SLAPrint::attach_prior_pillars(const sla::PriorPillars &pillars)
+{
+    if (m_objects.empty())
+        return false;
+    m_objects.front()->set_prior_pillars(pillars);
+    return true;
+}
+
 std::string SLAPrint::output_filename(const std::string &filename_base) const
 {
     DynamicConfig config = this->finished() ? this->print_statistics().config() : this->print_statistics().placeholders();

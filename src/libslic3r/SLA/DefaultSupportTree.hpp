@@ -96,6 +96,9 @@ class DefaultSupportTree {
     // support points in Eigen/IGL format
     Eigen::MatrixXd m_points;
 
+    // Builder ids of the pillars adopted from SupportableMesh::prior.
+    std::vector<long> m_prior_pillar_ids;
+
     // throw if canceled: It will be called many times so a shorthand will
     // come in handy.
     ThrowOnCancel m_thr;
@@ -254,6 +257,11 @@ public:
     // some smart algorithms to search for a safe path to the ground or to a
     // nearby pillar that can hold the supported weight.
     void routing_to_model();
+
+    // Register SupportableMesh::prior into the builder and the spatial index,
+    // so a newly placed support can brace to what is already on the plate
+    // without any of it being recomputed or re-emitted.
+    void adopt_prior_pillars();
 
     void interconnect_pillars();
 

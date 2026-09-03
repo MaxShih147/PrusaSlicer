@@ -137,6 +137,16 @@ public:
     // the support track. The mesh is transformed by trafo() to align with the
     // model's print frame (Contract A: shared world origin).
     void                        set_imported_support_mesh(const indexed_triangle_set &its);
+    /// Pillars from earlier generations, so a newly placed support can brace to
+    /// what is already on the plate without any of it being recomputed.
+    void                        set_prior_pillars(const sla::PriorPillars &p) { m_prior_pillars = p; }
+    const sla::PriorPillars    &prior_pillars() const { return m_prior_pillars; }
+    /// The pillars the last support generation produced. Empty until it has run.
+    const sla::PriorPillars    &generated_pillars() const
+    {
+        static const sla::PriorPillars empty;
+        return m_supportdata ? m_supportdata->generated_pillars : empty;
+    }
     bool                        has_imported_support() const { return m_imported_support; }
 
     struct Instance {
@@ -392,9 +402,12 @@ private:
             : input{t, {}, {}}
         {}
         
+        // Pillars this generation created, for handing to the next one.
+        sla::PriorPillars generated_pillars;
+
         void create_support_tree(const sla::JobController &ctl)
         {
-            tree_mesh = TriangleMesh{sla::create_support_tree(input, ctl)};
+            tree_mesh = TriangleMesh{sla::create_support_tree(input, ctl, &generated_pillars)};
         }
 
         void create_pad(const sla::JobController &ctl)
@@ -413,6 +426,7 @@ private:
     // mesh is (re)mounted into m_supportdata->tree_mesh in support_tree(), which
     // runs after those resets.
     indexed_triangle_set          m_imported_support_its;
+    sla::PriorPillars             m_prior_pillars;
 
     // Holds CSG operations for the printed object, prioritized by print steps.
     CSGContainer                  m_mesh_to_slice;
@@ -525,6 +539,9 @@ public:
     // Attach an externally imported support mesh to the (single) print object.
     // Returns false if there is no object. Scope: single-object only.
     bool attach_imported_support(const indexed_triangle_set &its);
+    /// Hand the pillars of an existing support to the next generation, so it
+    /// can brace to them additively. Single-object scope, like the above.
+    bool attach_prior_pillars(const sla::PriorPillars &pillars);
     // PrintObject by its ObjectID, to be used to uniquely bind slicing warnings to their source PrintObjects
     // in the notification center.
     const SLAPrintObject* get_print_object_by_model_object_id(ObjectID object_id) const {

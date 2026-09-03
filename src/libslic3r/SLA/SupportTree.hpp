@@ -125,6 +125,31 @@ struct SupportTreeConfig
 
 enum class MeshType { Support, Pad };
 
+// One pillar carried in from a previous generation.
+//
+// This is what makes support generation additive: a newly placed support can
+// see the pillars already on the plate, brace to the ones within reach, and
+// count them towards its own link budget so it does not grow redundant
+// auxiliary props - while the existing geometry is never recomputed and comes
+// back byte-identical, because it is never emitted at all.
+//
+// Only what bracing needs is carried: where the pillar stands, how thick it is,
+// and how many connections it already has.
+struct PriorPillar
+{
+    // Caller's handle, echoed back so it can be told what the new support
+    // attached to. The engine never interprets it.
+    long   id       = -1;
+    Vec3d  endpoint = Vec3d::Zero(); // bottom, at ground level
+    double height   = 0.;
+    double r_start  = 0.;
+    double r_end    = 0.;
+    unsigned links   = 0;
+    unsigned bridges = 0;
+};
+
+using PriorPillars = std::vector<PriorPillar>;
+
 struct SupportableMesh
 {
     AABBMesh          emesh;
@@ -132,6 +157,9 @@ struct SupportableMesh
     SupportTreeConfig cfg;
     PadConfig         pad_cfg;
     double            zoffset = 0.;
+
+    // Pillars from earlier generations. Empty means a normal, from-scratch run.
+    PriorPillars      prior;
 
     explicit SupportableMesh(const indexed_triangle_set &trmsh,
                              const SupportPoints        &sp,
@@ -235,8 +263,14 @@ inline double ground_level(const SupportableMesh &sm)
     return lvl;
 }
 
+/// Grow the support tree.
+/// @param out_pillars when given, receives the pillars this run created, so a
+///        later run can be handed them as SupportableMesh::prior and brace to
+///        them additively. Frozen pillars carried in are NOT repeated here:
+///        the caller already has those.
 indexed_triangle_set create_support_tree(const SupportableMesh &mesh,
-                                         const JobController   &ctl);
+                                         const JobController   &ctl,
+                                         PriorPillars          *out_pillars = nullptr);
 
 indexed_triangle_set create_pad(const SupportableMesh      &model_mesh,
                                 const indexed_triangle_set &support_mesh,

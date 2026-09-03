@@ -1032,6 +1032,9 @@ void SLAPrint::Steps::support_tree(SLAPrintObject &po)
 
     po.m_supportdata->input.cfg = make_support_cfg(po.m_config);
     po.m_supportdata->input.pad_cfg = make_pad_cfg(po.m_config);
+    // Additive generation: the pillars already on the plate take part in
+    // neighbour queries and bracing, but are never re-emitted.
+    po.m_supportdata->input.prior = po.prior_pillars();
 
     // scaling for the sub operations
     double d = objectstep_scale * OBJ_STEP_LEVELS[slaposSupportTree] / 100.0;

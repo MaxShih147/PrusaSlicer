@@ -100,6 +100,10 @@ const indexed_triangle_set &SupportTreeBuilder::merged_mesh(size_t steps) const
     
     for (auto &pill : m_pillars) {
         if (ctl().stopcondition()) break;
+        // Frozen pillars belong to an earlier generation: the caller already
+        // holds that geometry and expects it back unchanged, so emitting it
+        // here would duplicate it.
+        if (pill.frozen) continue;
         its_merge(merged, get_mesh(pill, steps));
     }
 

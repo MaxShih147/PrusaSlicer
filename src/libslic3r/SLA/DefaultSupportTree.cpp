@@ -64,6 +64,13 @@ bool DefaultSupportTree::execute(SupportTreeBuilder    &builder,
 
     DefaultSupportTree alg(builder, sm);
 
+    // Seed the pillars carried in from earlier generations. They go into the
+    // builder so interconnect() can take them by reference, and into the
+    // spatial index so neighbour queries find them - but they are flagged
+    // frozen, so merged_mesh() never emits their geometry and the caller's
+    // existing support mesh stays byte-identical.
+    alg.adopt_prior_pillars();
+
        // Let's define the individual steps of the processing. We can experiment
        // later with the ordering and the dependencies between them.
     enum Steps {
@@ -915,6 +922,20 @@ void DefaultSupportTree::routing_to_model()
         execution::max_concurrency(suptree_ex_policy));
 }
 
+void DefaultSupportTree::adopt_prior_pillars()
+{
+    m_prior_pillar_ids.clear();
+    m_prior_pillar_ids.reserve(m_sm.prior.size());
+
+    for (const PriorPillar &pp : m_sm.prior) {
+        long pid = m_builder.add_frozen_pillar(pp.endpoint, pp.height,
+                                               pp.r_start, pp.r_end,
+                                               pp.links, pp.bridges);
+        m_pillar_index.insert(m_builder.pillar(pid).endpoint(), unsigned(pid));
+        m_prior_pillar_ids.push_back(pid);
+    }
+}
+
 void DefaultSupportTree::interconnect_pillars()
 {
     // Now comes the algorithm that connects pillars with each other.
@@ -1001,8 +1022,15 @@ void DefaultSupportTree::interconnect_pillars()
         }
     };
 
-    // Run the cascade for the pillars in the index
-    m_pillar_index.foreach(cascadefn);
+    // Run the cascade for the pillars in the index. A frozen pillar is a
+    // neighbour, never a subject: cascading from it could add bracing that
+    // changes how the caller's existing support reads, which is exactly what
+    // an additive generation must not do. It can still be braced TO, because
+    // cascadefn queries the index and finds it.
+    m_pillar_index.foreach([this, &cascadefn](const PointIndexEl &el) {
+        if (!m_builder.pillar(el.second).frozen)
+            cascadefn(el);
+    });
 
     // We would be done here if we could allow some pillars to not be
     // connected with any neighbors. But this might leave the support tree
@@ -1018,6 +1046,10 @@ void DefaultSupportTree::interconnect_pillars()
     // not just the index.
     for(size_t pid = 0; pid < pillarcount; pid++) {
         auto pillar = [this, pid]() { return m_builder.pillar(pid); };
+
+        // Never prop up a frozen pillar: it was already resolved when it was
+        // generated, and adding to it now would change existing geometry.
+        if (pillar().frozen) continue;
 
         // Decide how many additional pillars will be needed:
 

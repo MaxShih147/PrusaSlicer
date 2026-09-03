@@ -6139,6 +6139,16 @@ CLIMiscConfigDef::CLIMiscConfigDef()
     def->tooltip = L("Load a support point list (JSON, as written by --export-support-points) and use it instead of running automatic support point detection. The file carries a fingerprint of the model it was generated from; slicing is refused if it does not match the model being sliced.");
     def->cli = "import-support-points";
 
+    def = this->add("export_support_pillars", coString);
+    def->label = L("Export SLA Support Pillars");
+    def->tooltip = L("Write the pillars this generation produced (JSON) so a later generation can be handed them with --prior-supports and brace to them additively.");
+    def->cli = "export-support-pillars";
+
+    def = this->add("prior_supports", coString);
+    def->label = L("Prior SLA Support Pillars");
+    def->tooltip = L("Load the pillars of an already generated support (JSON) so a newly placed support can brace to them. The prior pillars take part in neighbour queries and bracing but are never re-emitted, so the existing support mesh the caller already holds stays valid and unchanged.");
+    def->cli = "prior-supports";
+
     def = this->add("datadir", coString);
     def->label = L("Data directory");
     def->tooltip = L("Load and store settings at the given directory. This is useful for maintaining different profiles or including configurations from a network storage.");

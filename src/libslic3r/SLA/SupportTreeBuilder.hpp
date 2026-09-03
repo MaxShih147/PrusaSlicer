@@ -160,6 +160,12 @@ struct Pillar: public SupportTreeNode {
     // How many pillars are cascaded with this one
     unsigned links = 0;
 
+    // A pillar carried in from a previous generation. It takes part in
+    // neighbour queries and bracing so a newly added support can attach to it,
+    // but its own geometry is NOT emitted: the caller already has that mesh and
+    // it must come back byte-identical. See SupportableMesh::prior.
+    bool frozen = false;
+
     Pillar(const Vec3d &endp, double h, double start_radius, double end_radius)
         : height{h}
         , r_start(start_radius)
@@ -309,6 +315,23 @@ public:
     }
     
     void add_pillar_base(long pid, double baseheight = 3, double radius = 2);
+
+    /// Register a pillar from an earlier generation. It participates in the
+    /// spatial index and in bracing decisions, but merged_mesh() skips it.
+    long add_frozen_pillar(const Vec3d &endp, double h, double r_start, double r_end,
+                           unsigned links, unsigned bridges)
+    {
+        std::lock_guard<Mutex> lk(m_mutex);
+        m_pillars.emplace_back(endp, h, r_start, r_end);
+        Pillar &pillar = m_pillars.back();
+        pillar.id = long(m_pillars.size() - 1);
+        pillar.starts_from_head = false;
+        pillar.frozen = true;
+        pillar.links = links;
+        pillar.bridges = bridges;
+        m_meshcache_valid = false;
+        return pillar.id;
+    }
 
     template<class...Args> const Anchor& add_anchor(Args&&...args)
     {

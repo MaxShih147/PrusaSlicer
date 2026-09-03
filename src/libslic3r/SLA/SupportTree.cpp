@@ -29,7 +29,8 @@
 namespace Slic3r { namespace sla {
 
 indexed_triangle_set create_support_tree(const SupportableMesh &sm,
-                                         const JobController   &ctl)
+                                         const JobController   &ctl,
+                                         PriorPillars          *out_pillars)
 {
     auto builder = make_unique<SupportTreeBuilder>(ctl);
 
@@ -59,6 +60,26 @@ indexed_triangle_set create_support_tree(const SupportableMesh &sm,
         BOOST_LOG_TRIVIAL(info) << "Support tree creation took: "
                                 << duration<double>{stop - start}.count()
                                 << " seconds";
+
+        // Capture the pillars BEFORE cleanup, which frees the logical tree.
+        // Frozen pillars are skipped: they came from the caller and echoing
+        // them back would double-count them on the next generation.
+        if (out_pillars) {
+            out_pillars->clear();
+            long next_id = 0;
+            for (const Pillar &p : builder->pillars()) {
+                if (p.frozen) continue;
+                PriorPillar pp;
+                pp.id       = next_id++;
+                pp.endpoint = p.endpoint();
+                pp.height   = p.height;
+                pp.r_start  = p.r_start;
+                pp.r_end    = p.r_end;
+                pp.links    = p.links;
+                pp.bridges  = p.bridges;
+                out_pillars->push_back(pp);
+            }
+        }
 
         builder->merge_and_cleanup();   // clean metadata, leave only the meshes.
     }
