@@ -89,6 +89,7 @@ inline constexpr const char *type                      = "type";
 inline constexpr const char *head_front_radius         = "head_front_radius";
 inline constexpr const char *head_back_radius_mm       = "head_back_radius_mm";
 inline constexpr const char *head_width_mm             = "head_width_mm";
+inline constexpr const char *head_dir                  = "head_dir";
 inline constexpr const char *head_penetration_mm       = "head_penetration_mm";
 inline constexpr const char *contact_sphere_radius     = "contact_sphere_radius";
 inline constexpr const char *base_radius_mm            = "base_radius_mm";
@@ -297,6 +298,13 @@ inline nlohmann::json support_point_to_json(const SupportPoint &sp,
         std::max(0., point_head_back_radius_mm(sp, cfg.head_back_radius_mm));
     j[spkey::head_width_mm] =
         std::max(0., point_head_width_mm(sp, cfg.head_width_mm));
+    // Only when the caller set one: the zero vector means "work it out from the
+    // surface normal", and writing it back would be indistinguishable from a
+    // caller asking for a head that points nowhere.
+    if (point_has_head_dir(sp)) {
+        j[spkey::head_dir] = nlohmann::json::array(
+            {sp.head_dir.x(), sp.head_dir.y(), sp.head_dir.z()});
+    }
     j[spkey::head_penetration_mm] =
         std::max(0., point_head_penetration_mm(sp, cfg.head_penetration_mm));
 
@@ -420,6 +428,18 @@ inline bool support_point_from_json(const nlohmann::json &j,
 
     if (!read_extension(spkey::head_back_radius_mm,       sp.head_back_radius_mm))       return false;
     if (!read_extension(spkey::head_width_mm,             sp.head_width_mm))             return false;
+
+    // Absent means "use the surface normal"; present must be three numbers.
+    const auto dit = j.find(spkey::head_dir);
+    if (dit != j.end()) {
+        if (!dit->is_array() || dit->size() != 3) {
+            err = "head_dir must be a 3-element array";
+            return false;
+        }
+        sp.head_dir = Vec3f(float((*dit)[0].template get<double>()),
+                            float((*dit)[1].template get<double>()),
+                            float((*dit)[2].template get<double>()));
+    }
     if (!read_extension(spkey::head_penetration_mm,       sp.head_penetration_mm))       return false;
     if (!read_extension(spkey::contact_sphere_radius,     sp.contact_sphere_radius))     return false;
     if (!read_extension(spkey::base_radius_mm,            sp.base_radius_mm))            return false;

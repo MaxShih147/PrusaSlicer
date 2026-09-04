@@ -488,6 +488,24 @@ void DefaultSupportTree::add_pinheads()
         const double pt_penetr    = point_head_penetration_mm(sp, m_sm.cfg.head_penetration_mm);
         const double pt_slope     = point_bracing_angle_rad(sp, m_sm.cfg.bridge_slope);
 
+        // A caller that placed this support by hand may have said which way its
+        // head points. Dragging one moves the PILLAR while the tip stays in the
+        // model, so the head leans and stretches to bridge the gap - somewhere
+        // the search below, which only ever looks around the surface normal,
+        // would never go. Taken as given: the caller is choosing, and the checks
+        // that follow exist to second-guess a normal, not a decision.
+        if (point_has_head_dir(m_sm.pts[fidx])) {
+            const SupportPoint &sp0 = m_sm.pts[fidx];
+            // Filled in the same way the search below fills it, on the head
+            // already built from this point's position and penetration.
+            Head &h = heads[fidx];
+            h.id        = fidx;
+            h.dir       = sp0.head_dir.cast<double>().normalized();
+            h.width_mm  = point_head_width_mm(sp0, m_sm.cfg.head_width_mm);
+            h.r_back_mm = point_head_back_radius_mm(sp0, m_sm.cfg.head_back_radius_mm);
+            return;
+        }
+
         auto [polar, azimuth] = dir_to_spheric(n);
 
         // skip if the tilt is not sane
