@@ -83,6 +83,7 @@ sla::SupportTreeConfig make_support_cfg(const SLAPrintObjectConfig& c)
                 scfg.safety_distance_mm : c.support_base_safety_distance.getFloat();
 
         scfg.max_bridges_on_pillar = unsigned(c.support_max_bridges_on_pillar.getInt());
+        scfg.auxiliary_pillars = c.support_auxiliary_pillars.getBool();
         scfg.max_weight_on_model_support = c.support_max_weight_on_model.getFloat();
         break;
     }
@@ -112,6 +113,7 @@ sla::SupportTreeConfig make_support_cfg(const SLAPrintObjectConfig& c)
                 scfg.safety_distance_mm : c.branchingsupport_base_safety_distance.getFloat();
 
         scfg.max_bridges_on_pillar = unsigned(c.branchingsupport_max_bridges_on_pillar.getInt());
+        scfg.auxiliary_pillars = c.branchingsupport_auxiliary_pillars.getBool();
         scfg.max_weight_on_model_support = c.branchingsupport_max_weight_on_model.getFloat();
         break;
     }

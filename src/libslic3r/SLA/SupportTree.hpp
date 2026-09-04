@@ -91,6 +91,17 @@ struct SupportTreeConfig
     
     unsigned max_bridges_on_pillar = 3;
 
+    // Whether a lonely pillar may be propped up with auxiliary pillars of its
+    // own. On by default, because a tall pillar standing alone is the classic
+    // way for a support to fail.
+    //
+    // Manual placement turns it off: there, one click means one support, and an
+    // engine adding pillars the user did not ask for makes the result something
+    // they cannot reason about - they placed a support and got three. The
+    // trade-off is real and theirs to make: a tall lone pillar is more likely to
+    // fail on the printer.
+    bool auxiliary_pillars = true;
+
     double max_weight_on_model_support = 10.f;
 
     double head_fullwidth() const {

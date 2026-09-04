@@ -4147,6 +4147,18 @@ void PrintConfigDef::init_sla_support_params(const std::string &prefix)
     def->mode = comExpert;
     def->set_default_value(new ConfigOptionInt(prefix == "branching" ? 2 : 3));
 
+    def = this->add(prefix + "support_auxiliary_pillars", coBool);
+    def->label = L("Auxiliary support pillars");
+    def->tooltip = L(
+        "Let the engine prop up a pillar that stands too tall with nothing "
+        "braced to it, by adding one or two pillars of its own beside it. Turn "
+        "off where the user places supports by hand: one placement should "
+        "produce one support, not three. A tall lone pillar is then likelier to "
+        "fail on the printer, which becomes the placer's call rather than the "
+        "engine's.");
+    def->mode = comExpert;
+    def->set_default_value(new ConfigOptionBool(true));
+
     def = this->add(prefix + "support_max_weight_on_model", coFloat);
     def->label = L("Max weight on model");
     def->category = L("Supports");

@@ -1088,6 +1088,7 @@ PRINT_CONFIG_CLASS_DEFINE(
 
     // How much bridge (supporting another pinhead) can be placed on a pillar.
     ((ConfigOptionInt,   support_max_bridges_on_pillar))
+    ((ConfigOptionBool,  support_auxiliary_pillars))
 
     // How the pillars are bridged together
     ((ConfigOptionEnum<SLAPillarConnectionMode>, support_pillar_connection_mode))
@@ -1152,6 +1153,7 @@ PRINT_CONFIG_CLASS_DEFINE(
 
     // How much bridge (supporting another pinhead) can be placed on a pillar.
     ((ConfigOptionInt,   branchingsupport_max_bridges_on_pillar))
+    ((ConfigOptionBool,  branchingsupport_auxiliary_pillars))
 
     // How the pillars are bridged together
     ((ConfigOptionEnum<SLAPillarConnectionMode>, branchingsupport_pillar_connection_mode))

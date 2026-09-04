@@ -1073,6 +1073,10 @@ void DefaultSupportTree::interconnect_pillars()
     // lonely pillars. One or even two additional pillar might get inserted
     // depending on the length of the lonely pillar.
 
+    // Propping a lonely pillar is the engine deciding the user needs more
+    // supports than they asked for. Where placement is the user's, it is not.
+    if (!m_sm.cfg.auxiliary_pillars) return;
+
     size_t pillarcount = m_builder.pillarcount();
 
     // Again, go through all pillars, this time in the whole support tree
