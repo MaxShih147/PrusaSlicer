@@ -6149,6 +6149,11 @@ CLIMiscConfigDef::CLIMiscConfigDef()
     def->tooltip = L("Write the support tree as data (JSON): heads, pillars, junctions, pedestals and one record per bar of bracing. This is everything the support mesh is built from, before it is built - a caller that has it can draw the support itself, point at one bar and remove that bar, none of which a single STL allows.");
     def->cli = "export-support-tree";
 
+    def = this->add("export_pad_stl", coString);
+    def->label = L("Export SLA Pad");
+    def->tooltip = L("Write the pad on its own (STL). The support mesh export merges the pad into it, which is right for printing but wrong for a caller that draws the support tree from --export-support-tree: the tree describes pillars and bracing and has no way to describe a pad, so without this the pad simply goes missing from what the caller draws.");
+    def->cli = "export-pad-stl";
+
     def = this->add("export_brace_stls", coString);
     def->label = L("Export SLA Support Braces");
     def->tooltip = L("Directory to write the braces this generation grew to pillars given by --prior-supports, one STL per pillar reached (brace_<id>.stl). They are kept out of the main support mesh so that removing one of those pillars can take its brace with it, without regenerating the support the brace was grown with.");

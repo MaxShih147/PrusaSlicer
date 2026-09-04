@@ -345,6 +345,7 @@ bool process_actions(Data& cli, const DynamicPrintConfig& print_config, std::vec
     const std::string import_support_points_path = opt_path(cli.misc_config, "import_support_points");
     const std::string export_support_pillars_path = opt_path(cli.misc_config, "export_support_pillars");
     const std::string export_support_tree_path = opt_path(cli.misc_config, "export_support_tree");
+    const std::string export_pad_stl_path = opt_path(cli.misc_config, "export_pad_stl");
     const std::string export_brace_stls_dir = opt_path(cli.misc_config, "export_brace_stls");
     const std::string export_support_points_path = opt_path(actions, "export_support_points");
 
@@ -940,6 +941,23 @@ bool process_actions(Data& cli, const DynamicPrintConfig& print_config, std::vec
                                 } else {
                                     boost::nowide::cerr << "Failed to export support pillars to "
                                                         << export_support_pillars_path << std::endl;
+                                }
+                            }
+
+                            // The pad on its own. The support mesh export merges
+                            // it in, which is right for printing and wrong for a
+                            // caller drawing from the element list: a pad is an
+                            // extruded footprint, not pillars and bracing, so the
+                            // tree has no way to carry it.
+                            if (!export_pad_stl_path.empty()) {
+                                TriangleMesh pad_only = po->pad_mesh();
+                                if (!pad_only.empty()) {
+                                    if (pad_only.write_binary(export_pad_stl_path.c_str()))
+                                        boost::nowide::cout << "Pad mesh exported to " << export_pad_stl_path << std::endl;
+                                    else
+                                        boost::nowide::cerr << "Failed to export pad mesh to " << export_pad_stl_path << std::endl;
+                                } else {
+                                    boost::nowide::cout << "No pad mesh generated" << std::endl;
                                 }
                             }
 
