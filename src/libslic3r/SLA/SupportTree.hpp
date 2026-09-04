@@ -72,6 +72,15 @@ struct SupportTreeConfig
     // (PI/2 - overhang_angle_threshold), so a SMALLER value supports MORE
     // surfaces: 0 supports every overhang, PI/2 (the default) supports only
     // perfectly horizontal down-facing surfaces.
+    //
+    // CONSUMED IN EXACTLY ONE PLACE: the Phase 3 filter in
+    // SLAPrintSteps.cpp's support_points() (step slaposSupportPoints). The
+    // support tree steps deliberately do NOT read it - filtering happens once,
+    // upstream, so an exported point list no longer carries points the tree
+    // would have dropped for angle, and an imported list is never re-filtered
+    // (capability sla-overhang-threshold-semantics). Do not delete this field
+    // as unused: it is the only route the value travels from the config to
+    // that filter.
     double overhang_angle_threshold = M_PI / 2;
 
     // The max length of a bridge in mm
@@ -225,6 +234,47 @@ inline double resolved_bridge_slope(const SupportableMesh &sm, long head_id)
 // geometry and no global contact sphere setting, so the field is carried
 // through the data structures and the interchange format but has no consumer
 // here (openspec change per-point-support-sizing, task 3.1).
+
+// Is this surface tilted far enough downwards to carry a support head?
+//
+// polar     - the spherical polar angle of the SURFACE NORMAL, in radians, as
+//             produced by Slic3r::Geometry::dir_to_spheric(): 0 means the
+//             normal points straight up, PI means it points straight down.
+// threshold - SupportTreeConfig::overhang_angle_threshold, in radians.
+//
+// Writing `s` for the surface's slope from the horizontal plane (0 for a flat
+// down-facing face, PI/2 for a vertical wall), the two are related by
+// polar = PI - s, so the test below rearranges to
+//
+//     s <= PI/2 - threshold          i.e.   slope <= 90deg - critical angle
+//
+// A SMALLER threshold therefore supports MORE surfaces: 0 supports every
+// overhang, PI/2 supports only perfectly horizontal down-facing ones. This
+// direction is frozen and matches both the support_critical_angle tooltip in
+// PrintConfig.cpp and the four localisations of the DS-Online support angle
+// hint; change one and all of them have to move together.
+//
+// DELIBERATE DIVERGENCE FROM PhrozenOrca. That codebase's
+// sla_support_passes_overhang_filter() tests `slope <= critical angle`, i.e.
+// the opposite scale, where a LARGER value supports more. The two agree only
+// at 45 degrees. A merge between the projects must resolve this by hand and
+// must NOT take either side's predicate verbatim
+// (capability sla-overhang-threshold-semantics).
+//
+// The algebraically equivalent form `n.z() <= -sin(threshold)` is useful as an
+// independent check in tests but is NOT the implementation: acos and sin need
+// not agree on the last ulp right at the boundary.
+//
+// A NaN polar - reachable from a degenerate triangle, whose normal normalises
+// to NaN and makes acos() return NaN - is REJECTED, because every comparison
+// against NaN is false. That is the wanted answer: a point whose normal cannot
+// be determined has no business carrying a head. Note it is also the opposite
+// of what the old inline `if (polar < PI/2 + threshold) return;` did, which let
+// a NaN fall through into head placement.
+inline bool passes_overhang_filter(double polar, double threshold)
+{
+    return polar >= M_PI / 2.0 + threshold;
+}
 
 inline double ground_level(const SupportableMesh &sm)
 {

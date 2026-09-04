@@ -1103,6 +1103,21 @@ bool SLAPrintObject::invalidate_state_by_config_options(const std::vector<t_conf
         } else if (
                opt_key == "support_points_density_relative"
             || opt_key == "support_enforcers_only"
+            // The two critical angles belong here, not with the rest of the
+            // support settings below, because the overhang filter now runs in
+            // slaposSupportPoints (Phase 3 of SLAPrintSteps.cpp's
+            // support_points()) rather than in the support tree. Changing one
+            // of them changes which points EXIST, so the point list itself has
+            // to be recomputed - invalidating only slaposSupportTree would
+            // rebuild the tree from a stale, differently-filtered list.
+            //
+            // The one-shot CLI process the backend drives recomputes
+            // everything anyway and cannot observe this; the registration is
+            // for the GUI and any other caller that keeps an SLAPrintObject
+            // alive across a config edit
+            // (capability sla-overhang-threshold-semantics).
+            || opt_key == "support_critical_angle"
+            || opt_key == "branchingsupport_critical_angle"
             ) {
             steps.emplace_back(slaposSupportPoints);
         } else if (
@@ -1118,6 +1133,15 @@ bool SLAPrintObject::invalidate_state_by_config_options(const std::vector<t_conf
             || opt_key == "support_buildplate_only"
             || opt_key == "support_base_diameter"
             || opt_key == "support_base_height"
+            // KEPT, BUT NEVER REACHED: this is an else-if chain and both
+            // critical angles now match the slaposSupportPoints branch above.
+            // They stay listed here to document that the support tree is still
+            // a dependent of these settings, and because invalidating
+            // slaposSupportPoints propagates to slaposSupportTree anyway
+            // (invalidate_step(), a few functions down). If the branch above is
+            // ever removed, these two become live again with the old behaviour
+            // - which would be wrong once the filter lives in step 5
+            // (openspec change align-support-point-overhang-filter, D5).
             || opt_key == "support_critical_angle"
             || opt_key == "support_bracing_angle"
             || opt_key == "support_max_bridge_length"
@@ -1135,7 +1159,7 @@ bool SLAPrintObject::invalidate_state_by_config_options(const std::vector<t_conf
             || opt_key == "branchingsupport_buildplate_only"
             || opt_key == "branchingsupport_base_diameter"
             || opt_key == "branchingsupport_base_height"
-            || opt_key == "branchingsupport_critical_angle"
+            || opt_key == "branchingsupport_critical_angle" // kept, never reached - see the note above
             || opt_key == "branchingsupport_bracing_angle"
             || opt_key == "branchingsupport_max_bridge_length"
             || opt_key == "branchingsupport_max_pillar_link_distance"

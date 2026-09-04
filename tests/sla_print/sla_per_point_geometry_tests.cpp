@@ -49,13 +49,13 @@ indexed_triangle_set apex_down_cone(double r, double h)
 
 sla::SupportTreeConfig test_cfg()
 {
-    sla::SupportTreeConfig cfg;
-    // 0 accepts every overhang (a SMALLER threshold supports MORE surfaces -
-    // see the comment on SupportTreeConfig::overhang_angle_threshold). The
-    // default PI/2 would only accept perfectly horizontal down-faces and make
-    // the cone cases produce no heads at all.
-    cfg.overhang_angle_threshold = 0.;
-    return cfg;
+    // Plain defaults. This used to force overhang_angle_threshold to 0 so the
+    // cone cases would not lose their heads to the tree's own angle gate; that
+    // gate is gone - filtering happens once, upstream, in Phase 3 of
+    // support_points() - so the field is no longer read here and setting it
+    // did nothing (openspec change align-support-point-overhang-filter,
+    // capability sla-overhang-threshold-semantics).
+    return sla::SupportTreeConfig{};
 }
 
 // The head grown from support point `pt_index`, or nullptr if the point was
