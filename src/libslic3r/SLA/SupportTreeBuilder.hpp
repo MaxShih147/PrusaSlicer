@@ -476,6 +476,9 @@ public:
     inline const std::vector<Bridge> &bridges() const { return m_bridges; }
     inline const std::vector<Bridge> &crossbridges() const { return m_crossbridges; }
     inline const std::vector<Pedestal> &pedestals() const { return m_pedestals; }
+    inline const std::vector<Junction> &junctions() const { return m_junctions; }
+    inline const std::vector<DiffBridge> &diffbridges() const { return m_diffbridges; }
+    inline const std::vector<Anchor> &anchors() const { return m_anchors; }
     
     template<class T> inline IntegerOnly<T, const Pillar&> pillar(T id) const
     {

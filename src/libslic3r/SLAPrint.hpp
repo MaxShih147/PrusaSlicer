@@ -164,6 +164,15 @@ public:
         static const sla::PriorPillars empty;
         return m_supportdata ? m_supportdata->generated_pillars : empty;
     }
+
+    /// The last generation's support tree as data: heads, pillars, junctions,
+    /// pedestals and one record per bar of bracing. Everything merged_mesh()
+    /// turns into triangles, before it does.
+    const sla::SupportTreeElements &support_tree_elements() const
+    {
+        static const sla::SupportTreeElements empty;
+        return m_supportdata ? m_supportdata->tree_elements : empty;
+    }
     bool                        has_imported_support() const { return m_imported_support; }
 
     struct Instance {
@@ -426,11 +435,15 @@ private:
         // The braces reaching those pillars, kept out of tree_mesh so each can
         // be removed on its own when the pillar it reaches goes away.
         sla::FrozenBraceMeshes frozen_braces;
+        // The same support as data rather than triangles, for a caller that
+        // draws and edits it instead of only printing it.
+        sla::SupportTreeElements tree_elements;
 
         void create_support_tree(const sla::JobController &ctl)
         {
             tree_mesh = TriangleMesh{sla::create_support_tree(
-                input, ctl, &generated_pillars, &prior_attachments, &frozen_braces)};
+                input, ctl, &generated_pillars, &prior_attachments,
+                &frozen_braces, &tree_elements)};
         }
 
         void create_pad(const sla::JobController &ctl)

@@ -177,6 +177,72 @@ using PriorAttachments = std::vector<PriorAttachment>;
 // support it came with, which would move geometry the user already accepted.
 using FrozenBraceMeshes = std::map<long, indexed_triangle_set>;
 
+// ---------------------------------------------------------------------------
+// The support tree as data rather than as triangles.
+//
+// merged_mesh() is nothing but get_mesh() over the builder's element lists, so
+// handing the lists over is handing over the whole support. A caller that has
+// them can draw it, point at ONE element of it, and take that element away -
+// none of which triangle soup allows. A single STL per support answers "how
+// does it look"; this answers "what is it made of", which is what an editor
+// needs.
+//
+// Every element is world-space and in the engine's own frame (the mesh it was
+// given, grounded), the same frame the exported STL is in.
+struct TreeHead
+{
+    Vec3d  pos = Vec3d::Zero(); // the point on the model it holds up
+    Vec3d  dir = Vec3d::Zero(); // away from the surface; the pin points along it
+    double r_pin = 0., r_back = 0., width = 0., penetration = 0.;
+};
+
+struct TreePillar
+{
+    Vec3d    endpt   = Vec3d::Zero(); // bottom
+    double   height  = 0.;
+    double   r_start = 0., r_end = 0.;
+    unsigned links   = 0, bridges = 0;
+};
+
+struct TreeJunction
+{
+    Vec3d  pos = Vec3d::Zero();
+    double r   = 0.;
+};
+
+struct TreePedestal
+{
+    Vec3d  pos      = Vec3d::Zero();
+    double height   = 0.;
+    double r_bottom = 0., r_top = 0.;
+};
+
+// One BAR of bracing. The builder has always held them one per record; only the
+// merged mesh loses the boundary between them.
+struct TreeBridge
+{
+    Vec3d  startp = Vec3d::Zero(), endp = Vec3d::Zero();
+    double r      = 0.;
+    double end_r  = 0.; // equal to r unless it tapers (DiffBridge / Anchor)
+    // The caller's handle for the pillar this bar reaches, when that pillar came
+    // in from an earlier generation; -1 when both ends belong to this one. It is
+    // what lets the caller drop this bar, and only this bar, when that support
+    // goes away.
+    long   reaches = -1;
+};
+
+struct SupportTreeElements
+{
+    std::vector<TreeHead>     heads;
+    // Only the pillars this generation grew, in the same order as the
+    // PriorPillars reported alongside - so the caller's handle for pillars[i]
+    // is that list's [i].id, and there is no second numbering to keep in sync.
+    std::vector<TreePillar>   pillars;
+    std::vector<TreeJunction> junctions;
+    std::vector<TreePedestal> pedestals;
+    std::vector<TreeBridge>   bridges;
+};
+
 struct SupportableMesh
 {
     AABBMesh          emesh;
@@ -299,7 +365,8 @@ indexed_triangle_set create_support_tree(const SupportableMesh &mesh,
                                          const JobController   &ctl,
                                          PriorPillars          *out_pillars = nullptr,
                                          PriorAttachments      *out_attached = nullptr,
-                                         FrozenBraceMeshes     *out_braces = nullptr);
+                                         FrozenBraceMeshes     *out_braces = nullptr,
+                                         SupportTreeElements   *out_elements = nullptr);
 
 indexed_triangle_set create_pad(const SupportableMesh      &model_mesh,
                                 const indexed_triangle_set &support_mesh,

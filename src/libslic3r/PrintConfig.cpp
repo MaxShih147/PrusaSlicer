@@ -6144,6 +6144,11 @@ CLIMiscConfigDef::CLIMiscConfigDef()
     def->tooltip = L("Write the pillars this generation produced (JSON) so a later generation can be handed them with --prior-supports and brace to them additively.");
     def->cli = "export-support-pillars";
 
+    def = this->add("export_support_tree", coString);
+    def->label = L("Export SLA Support Tree");
+    def->tooltip = L("Write the support tree as data (JSON): heads, pillars, junctions, pedestals and one record per bar of bracing. This is everything the support mesh is built from, before it is built - a caller that has it can draw the support itself, point at one bar and remove that bar, none of which a single STL allows.");
+    def->cli = "export-support-tree";
+
     def = this->add("export_brace_stls", coString);
     def->label = L("Export SLA Support Braces");
     def->tooltip = L("Directory to write the braces this generation grew to pillars given by --prior-supports, one STL per pillar reached (brace_<id>.stl). They are kept out of the main support mesh so that removing one of those pillars can take its brace with it, without regenerating the support the brace was grown with.");

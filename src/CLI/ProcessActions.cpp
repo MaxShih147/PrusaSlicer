@@ -43,6 +43,7 @@
 #include "libslic3r/SLA/ModelFingerprint.hpp"
 #include "libslic3r/SLA/SupportPointIO.hpp"
 #include "libslic3r/SLA/PriorPillarIO.hpp"
+#include "libslic3r/SLA/SupportTreeIO.hpp"
 #include "libslic3r/TriangleMesh.hpp"
 
 #include "CLI/CLI.hpp"
@@ -343,6 +344,7 @@ bool process_actions(Data& cli, const DynamicPrintConfig& print_config, std::vec
 
     const std::string import_support_points_path = opt_path(cli.misc_config, "import_support_points");
     const std::string export_support_pillars_path = opt_path(cli.misc_config, "export_support_pillars");
+    const std::string export_support_tree_path = opt_path(cli.misc_config, "export_support_tree");
     const std::string export_brace_stls_dir = opt_path(cli.misc_config, "export_brace_stls");
     const std::string export_support_points_path = opt_path(actions, "export_support_points");
 
@@ -938,6 +940,27 @@ bool process_actions(Data& cli, const DynamicPrintConfig& print_config, std::vec
                                 } else {
                                     boost::nowide::cerr << "Failed to export support pillars to "
                                                         << export_support_pillars_path << std::endl;
+                                }
+                            }
+
+                            // The same support as data rather than triangles.
+                            // Written even when nothing grew, for the same
+                            // reason the pillar list is.
+                            if (!export_support_tree_path.empty()) {
+                                const auto &els = po->support_tree_elements();
+                                const std::string doc = sla::support_tree_to_string(
+                                    els, po->get_elevation());
+                                boost::nowide::ofstream tofs(export_support_tree_path);
+                                if (tofs.good()) {
+                                    tofs << doc;
+                                    boost::nowide::cout << "Support tree exported to "
+                                                        << export_support_tree_path << " ("
+                                                        << els.pillars.size() << " pillars, "
+                                                        << els.bridges.size() << " bars)"
+                                                        << std::endl;
+                                } else {
+                                    boost::nowide::cerr << "Failed to export support tree to "
+                                                        << export_support_tree_path << std::endl;
                                 }
                             }
 

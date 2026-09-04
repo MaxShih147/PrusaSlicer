@@ -50,7 +50,8 @@ indexed_triangle_set create_support_tree(const SupportableMesh &sm,
                                          const JobController   &ctl,
                                          PriorPillars          *out_pillars,
                                          PriorAttachments      *out_attached,
-                                         FrozenBraceMeshes     *out_braces)
+                                         FrozenBraceMeshes     *out_braces,
+                                         SupportTreeElements   *out_elements)
 {
     auto builder = make_unique<SupportTreeBuilder>(ctl);
 
@@ -112,6 +113,55 @@ indexed_triangle_set create_support_tree(const SupportableMesh &sm,
                 if (caller >= 0)
                     (*out_braces)[caller] = mesh;
             }
+        }
+
+        // The tree as data, captured before cleanup like everything else here.
+        // This is the same content merged_mesh() is about to turn into
+        // triangles - handing it over lets the caller draw the support itself,
+        // point at one bar of bracing, and remove it without another run.
+        if (out_elements) {
+            *out_elements = SupportTreeElements{};
+
+            for (const Head &h : builder->heads()) {
+                if (!h.is_valid()) continue;
+                out_elements->heads.push_back(
+                    TreeHead{h.pos, h.dir, h.r_pin_mm, h.r_back_mm, h.width_mm,
+                             h.penetration_mm});
+            }
+
+            // Frozen pillars are the caller's own from earlier generations;
+            // echoing them would have it draw each one twice. Skipping them here
+            // keeps this list index-aligned with out_pillars, which skips them
+            // for the same reason.
+            for (const Pillar &p : builder->pillars()) {
+                if (p.frozen) continue;
+                out_elements->pillars.push_back(
+                    TreePillar{p.endpoint(), p.height, p.r_start, p.r_end,
+                               p.links, p.bridges});
+            }
+
+            for (const Junction &j : builder->junctions())
+                out_elements->junctions.push_back(TreeJunction{j.pos, j.r});
+
+            for (const Pedestal &p : builder->pedestals())
+                out_elements->pedestals.push_back(
+                    TreePedestal{p.pos, p.height, p.r_bottom, p.r_top});
+
+            // Bracing, one record per BAR. A bar reaching a pillar the caller
+            // carried in is tagged with that pillar's handle: it belongs to both
+            // ends, and the caller has to be able to drop it when that end goes.
+            auto add_bridge = [&](const Bridge &b, double end_r) {
+                long reaches = -1;
+                if (builder->bridge_reaches_frozen(b))
+                    reaches = prior_caller_id(sm, *builder,
+                                              builder->bridge_frozen_target(b));
+                out_elements->bridges.push_back(
+                    TreeBridge{b.startp, b.endp, b.r, end_r, reaches});
+            };
+
+            for (const Bridge &b : builder->bridges())      add_bridge(b, b.r);
+            for (const Bridge &b : builder->crossbridges()) add_bridge(b, b.r);
+            for (const DiffBridge &b : builder->diffbridges()) add_bridge(b, b.end_r);
         }
 
         builder->merge_and_cleanup();   // clean metadata, leave only the meshes.
