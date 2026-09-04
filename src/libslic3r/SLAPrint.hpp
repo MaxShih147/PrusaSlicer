@@ -438,17 +438,27 @@ private:
         // The same support as data rather than triangles, for a caller that
         // draws and edits it instead of only printing it.
         sla::SupportTreeElements tree_elements;
+        // The same tree WITH the pillars carried in from earlier generations.
+        // tree_mesh leaves them out so the caller is not handed its own geometry
+        // back; the pad is grown from a footprint and belongs to the whole
+        // plate, so it needs them or each added support gets a pad its own size.
+        indexed_triangle_set pad_source_mesh;
 
         void create_support_tree(const sla::JobController &ctl)
         {
             tree_mesh = TriangleMesh{sla::create_support_tree(
                 input, ctl, &generated_pillars, &prior_attachments,
-                &frozen_braces, &tree_elements)};
+                &frozen_braces, &tree_elements, &pad_source_mesh)};
         }
 
         void create_pad(const sla::JobController &ctl)
         {
-            pad_mesh = TriangleMesh{sla::create_pad(input, tree_mesh.its, ctl)};
+            // Grown from the tree INCLUDING frozen pillars: a pad belongs to the
+            // whole plate, and tree_mesh deliberately omits what earlier
+            // generations produced.
+            const indexed_triangle_set &src =
+                pad_source_mesh.empty() ? tree_mesh.its : pad_source_mesh;
+            pad_mesh = TriangleMesh{sla::create_pad(input, src, ctl)};
         }
     };
 

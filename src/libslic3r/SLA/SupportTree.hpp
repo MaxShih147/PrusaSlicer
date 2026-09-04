@@ -366,7 +366,8 @@ indexed_triangle_set create_support_tree(const SupportableMesh &mesh,
                                          PriorPillars          *out_pillars = nullptr,
                                          PriorAttachments      *out_attached = nullptr,
                                          FrozenBraceMeshes     *out_braces = nullptr,
-                                         SupportTreeElements   *out_elements = nullptr);
+                                         SupportTreeElements   *out_elements = nullptr,
+                                         indexed_triangle_set  *out_full_mesh = nullptr);
 
 indexed_triangle_set create_pad(const SupportableMesh      &model_mesh,
                                 const indexed_triangle_set &support_mesh,

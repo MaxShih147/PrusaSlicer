@@ -103,6 +103,49 @@ SupportTreeBuilder::frozen_brace_meshes(size_t steps) const
     return out;
 }
 
+indexed_triangle_set SupportTreeBuilder::full_mesh(size_t steps) const
+{
+    // Everything, frozen included. merged_mesh() leaves the frozen pillars out
+    // for the caller's sake; the pad is grown from the tree's FOOTPRINT and
+    // belongs to the whole plate, so it has to see them or each added support
+    // gets a pad the size of itself.
+    indexed_triangle_set merged;
+
+    for (auto &head : m_heads)
+        if (head.is_valid()) its_merge(merged, get_mesh(head, steps));
+
+    for (auto &pill : m_pillars) {
+        its_merge(merged, get_mesh(pill, steps));
+        // A frozen pillar carries no Pedestal of its own here - it was made in
+        // an earlier run - so give it a footprint to grow the pad from.
+        if (pill.frozen && pill.height > EPSILON) {
+            Pedestal ped{pill.endpoint(), std::min(pill.height, 1.0),
+                         pill.r_start, pill.r_start};
+            its_merge(merged, get_mesh(ped, steps));
+        }
+    }
+
+    for (auto &pedest : m_pedestals)
+        its_merge(merged, get_mesh(pedest, steps));
+
+    for (auto &j : m_junctions)
+        its_merge(merged, get_mesh(j, steps));
+
+    for (auto &bs : m_bridges)
+        its_merge(merged, get_mesh(bs, steps));
+
+    for (auto &bs : m_crossbridges)
+        its_merge(merged, get_mesh(bs, steps));
+
+    for (auto &bs : m_diffbridges)
+        its_merge(merged, get_mesh(bs, steps));
+
+    for (auto &anch : m_anchors)
+        its_merge(merged, get_mesh(anch, steps));
+
+    return merged;
+}
+
 const indexed_triangle_set &SupportTreeBuilder::merged_mesh(size_t steps) const
 {
     if (m_meshcache_valid) return m_meshcache;

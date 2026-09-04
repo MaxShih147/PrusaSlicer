@@ -51,7 +51,8 @@ indexed_triangle_set create_support_tree(const SupportableMesh &sm,
                                          PriorPillars          *out_pillars,
                                          PriorAttachments      *out_attached,
                                          FrozenBraceMeshes     *out_braces,
-                                         SupportTreeElements   *out_elements)
+                                         SupportTreeElements   *out_elements,
+                                         indexed_triangle_set  *out_full_mesh)
 {
     auto builder = make_unique<SupportTreeBuilder>(ctl);
 
@@ -163,6 +164,11 @@ indexed_triangle_set create_support_tree(const SupportableMesh &sm,
             for (const Bridge &b : builder->crossbridges()) add_bridge(b, b.r);
             for (const DiffBridge &b : builder->diffbridges()) add_bridge(b, b.end_r);
         }
+
+        // The whole tree, frozen pillars included, for the pad to be grown from.
+        // Also before cleanup, for the same reason as everything else here.
+        if (out_full_mesh)
+            *out_full_mesh = builder->full_mesh();
 
         builder->merge_and_cleanup();   // clean metadata, leave only the meshes.
     }

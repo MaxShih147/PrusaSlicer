@@ -476,6 +476,15 @@ public:
     inline const std::vector<Bridge> &bridges() const { return m_bridges; }
     inline const std::vector<Bridge> &crossbridges() const { return m_crossbridges; }
     inline const std::vector<Pedestal> &pedestals() const { return m_pedestals; }
+    // Every element, frozen pillars included.
+    //
+    // merged_mesh() leaves out the pillars carried in from earlier generations,
+    // because the caller already holds their geometry and handing it back would
+    // draw them twice. The PAD is grown from the support tree's footprint, and
+    // it belongs to the whole plate rather than to one generation - so it has to
+    // see them, or each added support gets a pad the size of itself.
+    indexed_triangle_set full_mesh(size_t steps = 45) const;
+
     inline const std::vector<Junction> &junctions() const { return m_junctions; }
     inline const std::vector<DiffBridge> &diffbridges() const { return m_diffbridges; }
     inline const std::vector<Anchor> &anchors() const { return m_anchors; }
