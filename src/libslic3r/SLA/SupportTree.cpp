@@ -28,10 +28,29 @@
 
 namespace Slic3r { namespace sla {
 
+/// Which caller handle did a frozen builder pillar come in under?
+///
+/// adopt_prior_pillars() registers SupportableMesh::prior in order, so the nth
+/// frozen pillar in the builder is the nth entry of prior.
+static long prior_caller_id(const SupportableMesh &sm,
+                            const SupportTreeBuilder &builder, long pillar_id)
+{
+    size_t seen = 0;
+    const auto &pillars = builder.pillars();
+    for (size_t i = 0; i < pillars.size(); ++i) {
+        if (!pillars[i].frozen) continue;
+        if (long(i) == pillar_id)
+            return seen < sm.prior.size() ? sm.prior[seen].id : -1;
+        ++seen;
+    }
+    return -1;
+}
+
 indexed_triangle_set create_support_tree(const SupportableMesh &sm,
                                          const JobController   &ctl,
                                          PriorPillars          *out_pillars,
-                                         PriorAttachments      *out_attached)
+                                         PriorAttachments      *out_attached,
+                                         FrozenBraceMeshes     *out_braces)
 {
     auto builder = make_unique<SupportTreeBuilder>(ctl);
 
@@ -79,6 +98,19 @@ indexed_triangle_set create_support_tree(const SupportableMesh &sm,
                 pp.links    = p.links;
                 pp.bridges  = p.bridges;
                 out_pillars->push_back(pp);
+            }
+        }
+
+        // Also before cleanup: the braces reaching frozen pillars, keyed by the
+        // caller's handle for each. Mapped here because only the algorithm knows
+        // which builder pillar came in under which handle.
+        if (out_braces) {
+            out_braces->clear();
+            const auto by_pillar = builder->frozen_brace_meshes();
+            for (const auto &[pid, mesh] : by_pillar) {
+                const long caller = prior_caller_id(sm, *builder, pid);
+                if (caller >= 0)
+                    (*out_braces)[caller] = mesh;
             }
         }
 

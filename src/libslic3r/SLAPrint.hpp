@@ -150,6 +150,14 @@ public:
         return m_supportdata ? m_supportdata->prior_attachments : empty;
     }
 
+    /// Braces from the last generation to pillars carried in, keyed by the
+    /// caller's handle for each pillar reached.
+    const sla::FrozenBraceMeshes &frozen_braces() const
+    {
+        static const sla::FrozenBraceMeshes empty;
+        return m_supportdata ? m_supportdata->frozen_braces : empty;
+    }
+
     /// The pillars the last support generation produced. Empty until it has run.
     const sla::PriorPillars    &generated_pillars() const
     {
@@ -415,11 +423,14 @@ private:
         sla::PriorPillars generated_pillars;
         // The prior pillars it braced to, with their updated link counts.
         sla::PriorAttachments prior_attachments;
+        // The braces reaching those pillars, kept out of tree_mesh so each can
+        // be removed on its own when the pillar it reaches goes away.
+        sla::FrozenBraceMeshes frozen_braces;
 
         void create_support_tree(const sla::JobController &ctl)
         {
             tree_mesh = TriangleMesh{sla::create_support_tree(
-                input, ctl, &generated_pillars, &prior_attachments)};
+                input, ctl, &generated_pillars, &prior_attachments, &frozen_braces)};
         }
 
         void create_pad(const sla::JobController &ctl)

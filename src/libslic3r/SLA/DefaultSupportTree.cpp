@@ -275,7 +275,7 @@ bool DefaultSupportTree::interconnect(const Pillar &pillar,
     while(ej.z() >= eupper.z() /*endz*/) {
         if(bridge_mesh_distance(sj, dirv(sj, ej), pillar.r_start) >= bridge_distance)
         {
-            m_builder.add_crossbridge(sj, ej, pillar.r_start);
+            m_builder.add_crossbridge_between(pillar.id, nextpillar.id, sj, ej, pillar.r_start);
             was_connected = true;
         }
 
@@ -287,7 +287,7 @@ bool DefaultSupportTree::interconnect(const Pillar &pillar,
                 bridge_mesh_distance(sjback, dirv(sjback, ejback),
                                      pillar.r_start) >= bridge_distance) {
                 // need to check collision for the cross stick
-                m_builder.add_crossbridge(sjback, ejback, pillar.r_start);
+                m_builder.add_crossbridge_between(pillar.id, nextpillar.id, sjback, ejback, pillar.r_start);
                 was_connected = true;
             }
         }
@@ -375,9 +375,9 @@ bool DefaultSupportTree::connect_to_nearpillar(const Head &head,
         if(zdiff > 0) {
             m_builder.add_pillar(head.id, headjp.z() - bridgestart.z());
             m_builder.add_junction(bridgestart, r);
-            m_builder.add_bridge(bridgestart, bridgeend, r);
+            m_builder.add_bridge_between(nearpillar_id, bridgestart, bridgeend, r);
         } else {
-            m_builder.add_bridge(head.id, bridgeend);
+            m_builder.add_bridge_to_pillar(head.id, bridgeend, nearpillar_id);
         }
 
         m_builder.increment_bridges(nearpillar());

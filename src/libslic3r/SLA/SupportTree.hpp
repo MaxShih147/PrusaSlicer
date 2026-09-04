@@ -14,6 +14,7 @@
 #include <libslic3r/SLA/SupportTreeStrategies.hpp>
 #include <math.h>
 #include <vector>
+#include <map>
 #include <memory>
 #include <algorithm>
 #include <cmath>
@@ -167,6 +168,15 @@ struct PriorAttachment
 
 using PriorAttachments = std::vector<PriorAttachment>;
 
+// The braces a generation grew to pillars carried in from earlier ones, keyed by
+// the caller's handle for the pillar each reaches.
+//
+// Handed over separately from the support's own mesh because it belongs to both
+// ends: grown now, but only meaningful while that pillar exists. Kept apart, it
+// can be taken away on its own when the pillar goes - without regrowing the
+// support it came with, which would move geometry the user already accepted.
+using FrozenBraceMeshes = std::map<long, indexed_triangle_set>;
+
 struct SupportableMesh
 {
     AABBMesh          emesh;
@@ -288,7 +298,8 @@ inline double ground_level(const SupportableMesh &sm)
 indexed_triangle_set create_support_tree(const SupportableMesh &mesh,
                                          const JobController   &ctl,
                                          PriorPillars          *out_pillars = nullptr,
-                                         PriorAttachments      *out_attached = nullptr);
+                                         PriorAttachments      *out_attached = nullptr,
+                                         FrozenBraceMeshes     *out_braces = nullptr);
 
 indexed_triangle_set create_pad(const SupportableMesh      &model_mesh,
                                 const indexed_triangle_set &support_mesh,

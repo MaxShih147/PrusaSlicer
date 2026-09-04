@@ -87,6 +87,22 @@ void SupportTreeBuilder::add_pillar_base(long pid, double baseheight, double rad
     m_meshcache_valid = false;
 }
 
+std::map<long, indexed_triangle_set>
+SupportTreeBuilder::frozen_brace_meshes(size_t steps) const
+{
+    std::map<long, indexed_triangle_set> out;
+    auto collect = [&](const std::vector<Bridge> &src) {
+        for (const Bridge &b : src) {
+            const long target = bridge_frozen_target(b);
+            if (target == SupportTreeNode::ID_UNSET) continue;
+            its_merge(out[target], get_mesh(b, steps));
+        }
+    };
+    collect(m_bridges);
+    collect(m_crossbridges);
+    return out;
+}
+
 const indexed_triangle_set &SupportTreeBuilder::merged_mesh(size_t steps) const
 {
     if (m_meshcache_valid) return m_meshcache;
@@ -119,11 +135,16 @@ const indexed_triangle_set &SupportTreeBuilder::merged_mesh(size_t steps) const
 
     for (auto &bs : m_bridges) {
         if (ctl().stopcondition()) break;
+        // A brace reaching a frozen pillar is handed over separately: it has to
+        // be removable on its own when that pillar goes, and merging it in here
+        // would mean regrowing this whole support to take one brace away.
+        if (bridge_reaches_frozen(bs)) continue;
         its_merge(merged, get_mesh(bs, steps));
     }
     
     for (auto &bs : m_crossbridges) {
         if (ctl().stopcondition()) break;
+        if (bridge_reaches_frozen(bs)) continue;
         its_merge(merged, get_mesh(bs, steps));
     }
 

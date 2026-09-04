@@ -343,6 +343,7 @@ bool process_actions(Data& cli, const DynamicPrintConfig& print_config, std::vec
 
     const std::string import_support_points_path = opt_path(cli.misc_config, "import_support_points");
     const std::string export_support_pillars_path = opt_path(cli.misc_config, "export_support_pillars");
+    const std::string export_brace_stls_dir = opt_path(cli.misc_config, "export_brace_stls");
     const std::string export_support_points_path = opt_path(actions, "export_support_points");
 
     // An empty path is a typo, never a way of saying "not this time". Treating
@@ -937,6 +938,25 @@ bool process_actions(Data& cli, const DynamicPrintConfig& print_config, std::vec
                                 } else {
                                     boost::nowide::cerr << "Failed to export support pillars to "
                                                         << export_support_pillars_path << std::endl;
+                                }
+                            }
+
+                            // Braces reaching pillars from earlier generations,
+                            // one file each. Separate from the support mesh so
+                            // that removing such a pillar can take its brace
+                            // with it, leaving the support itself untouched.
+                            if (!export_brace_stls_dir.empty()) {
+                                boost::system::error_code ec;
+                                boost::filesystem::create_directories(export_brace_stls_dir, ec);
+                                for (const auto &[prior_id, its] : po->frozen_braces()) {
+                                    if (its.empty()) continue;
+                                    TriangleMesh bm{its};
+                                    boost::filesystem::path bp(export_brace_stls_dir);
+                                    bp /= ("brace_" + std::to_string(prior_id) + ".stl");
+                                    if (bm.write_binary(bp.string().c_str()))
+                                        boost::nowide::cout << "Brace mesh exported to " << bp.string() << std::endl;
+                                    else
+                                        boost::nowide::cerr << "Failed to export brace mesh to " << bp.string() << std::endl;
                                 }
                             }
 
