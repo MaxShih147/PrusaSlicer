@@ -25,7 +25,7 @@ namespace Slic3r { namespace sla {
 //    "heads":[{"pos":[x,y,z],"dir":[x,y,z],"r_pin":0.2,"r_back":0.5,
 //              "width":1.0,"penetration":0.2,"pillar":3}],
 //    "pillars":[{"endpt":[x,y,z],"height":40.2,"r_start":0.5,"r_end":0.5,
-//                "links":0,"bridges":0,"props":1}],
+//                "links":0,"bridges":0,"props":1,"head":4}],
 //    "junctions":[{"pos":[x,y,z],"r":0.5,"pillar":3}],
 //    "pedestals":[{"pos":[x,y,z],"height":1.0,"r_bottom":2.0,"r_top":0.5,
 //                  "pillar":3}],
@@ -103,6 +103,7 @@ inline std::string support_tree_to_string(const SupportTreeElements &els,
                             {"links", p.links},
                             {"bridges", p.bridges}};
         detail::put_owner(j, "props", p.props);
+        detail::put_owner(j, "head", p.head);
         pillars.push_back(std::move(j));
     }
 

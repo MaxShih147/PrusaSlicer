@@ -229,6 +229,12 @@ struct TreePillar
     // The pillar this one props up, for an auxiliary one. It holds no head, so
     // this is the only thing tying it to a support. -1 for an ordinary pillar.
     int      props   = -1;
+    // The pin whose junction is this pillar's TOP, when one grew it. Not the
+    // same question as TreeHead::pillar, which every pin answers: a pin bridged
+    // onto a pillar stands on it without owning it, and its head does not reach
+    // the top. Moving a pillar re-aims the pin that owns it and leaves the
+    // others to their bars, so the difference has to be recorded.
+    int      head    = -1;
 };
 
 struct TreeJunction

@@ -129,6 +129,16 @@ indexed_triangle_set create_support_tree(const SupportableMesh &sm,
             // so the two numberings differ. This map is what keeps every
             // reference below pointing at the right record.
             std::unordered_map<long, int> pillar_slot;
+            std::unordered_map<long, int> head_slot;
+            {
+                int i = 0;
+                for (const Head &h : builder->heads())
+                    if (h.is_valid()) head_slot[h.id] = i++;
+            }
+            auto head_at = [&head_slot](long id) {
+                auto it = head_slot.find(id);
+                return it == head_slot.end() ? -1 : it->second;
+            };
 
             // Frozen pillars are the caller's own from earlier generations;
             // echoing them would have it draw each one twice. Skipping them here
@@ -139,7 +149,8 @@ indexed_triangle_set create_support_tree(const SupportableMesh &sm,
                 pillar_slot[p.id] = int(out_elements->pillars.size());
                 out_elements->pillars.push_back(
                     TreePillar{p.endpoint(), p.height, p.r_start, p.r_end,
-                               p.links, p.bridges});
+                               p.links, p.bridges, -1,
+                               p.starts_from_head ? head_at(p.start_junction_id) : -1});
             }
 
             auto slot = [&pillar_slot](long id) {
