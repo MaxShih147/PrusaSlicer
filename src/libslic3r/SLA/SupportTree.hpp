@@ -200,11 +200,24 @@ using FrozenBraceMeshes = std::map<long, indexed_triangle_set>;
 //
 // Every element is world-space and in the engine's own frame (the mesh it was
 // given, grounded), the same frame the exported STL is in.
+// Ownership below is by POSITION in these lists, not by any separate id: a
+// head's `pillar` is an index into `pillars`. One numbering, nothing to keep in
+// sync, and nothing spent on ids that the array subscript already gives.
 struct TreeHead
 {
     Vec3d  pos = Vec3d::Zero(); // the point on the model it holds up
     Vec3d  dir = Vec3d::Zero(); // away from the surface; the pin points along it
     double r_pin = 0., r_back = 0., width = 0., penetration = 0.;
+    // The pillar this pin's load ends up on: its own where it grew one, else the
+    // one it bridges across to. -1 when it stands on a pillar from an earlier
+    // generation, or on nothing.
+    //
+    // This is what makes automatic supports editable. A run places hundreds of
+    // pins and routes them onto far fewer pillars (routing_to_ground clusters
+    // them; only the centroid grows a pillar of its own), so "which pin does
+    // this belong to" cannot be read off the geometry afterwards - but the
+    // builder knew it all along.
+    int    pillar = -1;
 };
 
 struct TreePillar
@@ -213,12 +226,16 @@ struct TreePillar
     double   height  = 0.;
     double   r_start = 0., r_end = 0.;
     unsigned links   = 0, bridges = 0;
+    // The pillar this one props up, for an auxiliary one. It holds no head, so
+    // this is the only thing tying it to a support. -1 for an ordinary pillar.
+    int      props   = -1;
 };
 
 struct TreeJunction
 {
     Vec3d  pos = Vec3d::Zero();
     double r   = 0.;
+    int    pillar = -1; // the pillar it sits on, where that was known
 };
 
 struct TreePedestal
@@ -226,6 +243,7 @@ struct TreePedestal
     Vec3d  pos      = Vec3d::Zero();
     double height   = 0.;
     double r_bottom = 0., r_top = 0.;
+    int    pillar   = -1; // the pillar it was put under
 };
 
 // One BAR of bracing. The builder has always held them one per record; only the
@@ -240,6 +258,10 @@ struct TreeBridge
     // what lets the caller drop this bar, and only this bar, when that support
     // goes away.
     long   reaches = -1;
+    // The pillars this bar joins, by position in `pillars`. -1 at an end that
+    // is not a pillar of this run: a head's own junction, or a frozen pillar
+    // (which `reaches` names instead).
+    int    a = -1, b = -1;
 };
 
 struct SupportTreeElements

@@ -615,6 +615,11 @@ inline long build_ground_connection(SupportTreeBuilder &builder,
     auto it = conn.path.begin();
     auto itnx = std::next(it);
 
+    // The route is laid down before the pillar it ends in exists, so remember
+    // where these start and hand them over once it does.
+    const size_t first_junction = builder.junctioncount();
+    const size_t first_bridge   = builder.diffbridgecount();
+
     while (itnx != conn.path.end()) {
         builder.add_diffbridge(*it, *itnx);
         builder.add_junction(*itnx);
@@ -641,6 +646,9 @@ inline long build_ground_connection(SupportTreeBuilder &builder,
 
     if (conn.pillar_base->r_top >= sm.cfg.head_back_radius_mm)
         builder.add_pillar_base(ret, conn.pillar_base->height, conn.pillar_base->r_bottom);
+
+    builder.own_junctions_from(first_junction, ret);
+    builder.own_diffbridges_from(first_bridge, ret);
 
     return ret;
 }

@@ -7,6 +7,7 @@
  *
  */
 
+#include <unordered_map>
 #include <libslic3r/SLA/SupportTree.hpp>
 #include <libslic3r/SLA/SupportTreeBuilder.hpp>
 #include <libslic3r/SLA/DefaultSupportTree.hpp>
@@ -123,12 +124,11 @@ indexed_triangle_set create_support_tree(const SupportableMesh &sm,
         if (out_elements) {
             *out_elements = SupportTreeElements{};
 
-            for (const Head &h : builder->heads()) {
-                if (!h.is_valid()) continue;
-                out_elements->heads.push_back(
-                    TreeHead{h.pos, h.dir, h.r_pin_mm, h.r_back_mm, h.width_mm,
-                             h.penetration_mm});
-            }
+            // Ownership travels as a POSITION in the exported list, not as the
+            // builder's own id: invalid heads and frozen pillars are left out,
+            // so the two numberings differ. This map is what keeps every
+            // reference below pointing at the right record.
+            std::unordered_map<long, int> pillar_slot;
 
             // Frozen pillars are the caller's own from earlier generations;
             // echoing them would have it draw each one twice. Skipping them here
@@ -136,17 +136,48 @@ indexed_triangle_set create_support_tree(const SupportableMesh &sm,
             // for the same reason.
             for (const Pillar &p : builder->pillars()) {
                 if (p.frozen) continue;
+                pillar_slot[p.id] = int(out_elements->pillars.size());
                 out_elements->pillars.push_back(
                     TreePillar{p.endpoint(), p.height, p.r_start, p.r_end,
                                p.links, p.bridges});
             }
 
+            auto slot = [&pillar_slot](long id) {
+                auto it = pillar_slot.find(id);
+                return it == pillar_slot.end() ? -1 : it->second;
+            };
+
+            // Second pass, now that every pillar has a slot: an auxiliary pillar
+            // says which one it props up.
+            {
+                int i = 0;
+                for (const Pillar &p : builder->pillars()) {
+                    if (p.frozen) continue;
+                    out_elements->pillars[size_t(i++)].props = slot(p.props_for);
+                }
+            }
+
+            for (const Head &h : builder->heads()) {
+                if (!h.is_valid()) continue;
+                // Where the load goes: its own pillar, or the one it bridges to.
+                long carrier = h.pillar_id;
+                if (carrier < 0 && h.bridge_id >= 0
+                    && size_t(h.bridge_id) < builder->bridges().size()) {
+                    carrier = builder->bridges()[size_t(h.bridge_id)].owner_b;
+                }
+                out_elements->heads.push_back(
+                    TreeHead{h.pos, h.dir, h.r_pin_mm, h.r_back_mm, h.width_mm,
+                             h.penetration_mm, slot(carrier)});
+            }
+
             for (const Junction &j : builder->junctions())
-                out_elements->junctions.push_back(TreeJunction{j.pos, j.r});
+                out_elements->junctions.push_back(
+                    TreeJunction{j.pos, j.r, slot(j.pillar_id)});
 
             for (const Pedestal &p : builder->pedestals())
                 out_elements->pedestals.push_back(
-                    TreePedestal{p.pos, p.height, p.r_bottom, p.r_top});
+                    TreePedestal{p.pos, p.height, p.r_bottom, p.r_top,
+                                 slot(p.pillar_id)});
 
             // Bracing, one record per BAR. A bar reaching a pillar the caller
             // carried in is tagged with that pillar's handle: it belongs to both
@@ -157,7 +188,8 @@ indexed_triangle_set create_support_tree(const SupportableMesh &sm,
                     reaches = prior_caller_id(sm, *builder,
                                               builder->bridge_frozen_target(b));
                 out_elements->bridges.push_back(
-                    TreeBridge{b.startp, b.endp, b.r, end_r, reaches});
+                    TreeBridge{b.startp, b.endp, b.r, end_r, reaches,
+                               slot(b.owner_a), slot(b.owner_b)});
             };
 
             for (const Bridge &b : builder->bridges())      add_bridge(b, b.r);

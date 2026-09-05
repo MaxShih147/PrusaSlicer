@@ -373,9 +373,15 @@ bool DefaultSupportTree::connect_to_nearpillar(const Head &head,
     if (m_builder.bridgecount(nearpillar()) < m_sm.cfg.max_bridges_on_pillar) {
         // A partial pillar is needed under the starting head.
         if(zdiff > 0) {
-            m_builder.add_pillar(head.id, headjp.z() - bridgestart.z());
+            // A partial pillar is needed under the starting head. It is this
+            // head's own, and the bar then runs from ITS top across to the near
+            // pillar - so both ends of that bar have an owner, and the head has
+            // a pillar to be grouped with.
+            const long own = m_builder.add_pillar(head.id, headjp.z() - bridgestart.z());
+            const size_t first_junction = m_builder.junctioncount();
             m_builder.add_junction(bridgestart, r);
-            m_builder.add_bridge_between(nearpillar_id, bridgestart, bridgeend, r);
+            m_builder.own_junctions_from(first_junction, own);
+            m_builder.add_bridge_between(nearpillar_id, bridgestart, bridgeend, r, own);
         } else {
             m_builder.add_bridge_to_pillar(head.id, bridgeend, nearpillar_id);
         }
@@ -1180,18 +1186,28 @@ void DefaultSupportTree::interconnect_pillars()
                 if (interconnect(pillar(), p)) {
                     Pillar &pp = m_builder.pillar(m_builder.add_pillar(p));
 
+                    // An auxiliary pillar carries no head, so this is the only
+                    // thing that says which support it belongs to.
+                    pp.props_for = pillar().id;
+
                     add_pillar_base(pp.id);
 
                     m_pillar_index.insert(pp.endpoint(), unsigned(pp.id));
 
+                    size_t first_junction = m_builder.junctioncount();
                     m_builder.add_junction(s, pillar().r_start);
+                    m_builder.own_junctions_from(first_junction, pp.id);
                     double t = bridge_mesh_distance(pillarsp, dirv(pillarsp, s),
                                                     pillar().r_start);
                     if (distance(pillarsp, s) < t)
-                        m_builder.add_bridge(pillarsp, s, pillar().r_start);
+                        m_builder.add_bridge_between(pp.id, pillarsp, s,
+                                                     pillar().r_start, pillar().id);
 
-                    if (pillar().endpoint().z() > ground_level(m_sm) + pillar().r_start)
+                    if (pillar().endpoint().z() > ground_level(m_sm) + pillar().r_start) {
+                        first_junction = m_builder.junctioncount();
                         m_builder.add_junction(pillar().endpoint(), pillar().r_start);
+                        m_builder.own_junctions_from(first_junction, pillar().id);
+                    }
 
                     newpills.emplace_back(pp.id);
                     m_builder.increment_links(pillar());

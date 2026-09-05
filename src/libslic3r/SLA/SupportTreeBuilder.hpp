@@ -91,6 +91,11 @@ struct Junction: public SupportTreeNode {
     double r = 1;
     Vec3d pos;
 
+    // The pillar this junction sits on, where the code that made it knew. A
+    // caller drawing the tree groups elements by pillar; a junction with no
+    // owner is simply not part of any group.
+    long pillar_id = ID_UNSET;
+
     Junction(const Vec3d &tr, double r_mm) : r(r_mm), pos(tr) {}
 };
 
@@ -161,6 +166,11 @@ struct Pillar: public SupportTreeNode {
     // How many pillars are cascaded with this one
     unsigned links = 0;
 
+    // The pillar this one was grown to prop up, for an auxiliary pillar. Such a
+    // pillar carries no head of its own, so without this there is nothing to say
+    // which support it belongs to.
+    long props_for = ID_UNSET;
+
     // A pillar carried in from a previous generation. It takes part in
     // neighbour queries and bracing so a newly added support can attach to it,
     // but its own geometry is NOT emitted: the caller already has that mesh and
@@ -191,6 +201,9 @@ struct Pillar: public SupportTreeNode {
 struct Pedestal: public SupportTreeNode {
     Vec3d pos;
     double height, r_bottom, r_top;
+
+    // The pillar this base was put under.
+    long pillar_id = ID_UNSET;
 
     Pedestal(const Vec3d &p, double h, double rbottom, double rtop)
         : pos{p}, height{h}, r_bottom{rbottom}, r_top{rtop}
@@ -435,11 +448,17 @@ public:
         return m_crossbridges[size_t(b.id)];
     }
 
-    /// A free-standing bridge that knows which pillar it reached.
+    /// A free-standing bridge that knows which pillars it joins.
+    ///
+    /// `from_pillar` is optional because not every bar starts on one; when it
+    /// does, saying so is what lets a caller group the bar with both ends
+    /// rather than only the one it reached.
     const Bridge& add_bridge_between(long pillar_id, const Vec3d &s,
-                                     const Vec3d &e, double r)
+                                     const Vec3d &e, double r,
+                                     long from_pillar = SupportTreeNode::ID_UNSET)
     {
         const Bridge &b = add_bridge(s, e, r);
+        m_bridges[size_t(b.id)].owner_a = from_pillar;
         m_bridges[size_t(b.id)].owner_b = pillar_id;
         return m_bridges[size_t(b.id)];
     }
@@ -466,6 +485,38 @@ public:
         return m_heads[m_head_indices[id]];
     }
     
+    /// How many junctions exist, for a caller about to add some and then say
+    /// which pillar they belong to.
+    inline size_t junctioncount() const {
+        std::lock_guard<Mutex> lk(m_mutex);
+        return m_junctions.size();
+    }
+
+    /// Give every junction from `first` onwards to a pillar.
+    ///
+    /// A route to the ground lays its junctions down BEFORE the pillar they
+    /// belong to exists, so ownership is written afterwards rather than passed
+    /// in. Junctions made elsewhere keep whatever owner they already have.
+    void own_junctions_from(size_t first, long pillar_id)
+    {
+        std::lock_guard<Mutex> lk(m_mutex);
+        for (size_t i = first; i < m_junctions.size(); ++i)
+            m_junctions[i].pillar_id = pillar_id;
+    }
+
+    /// Give every bridge from `first` onwards a pillar at its far end.
+    void own_diffbridges_from(size_t first, long pillar_id)
+    {
+        std::lock_guard<Mutex> lk(m_mutex);
+        for (size_t i = first; i < m_diffbridges.size(); ++i)
+            m_diffbridges[i].owner_b = pillar_id;
+    }
+
+    inline size_t diffbridgecount() const {
+        std::lock_guard<Mutex> lk(m_mutex);
+        return m_diffbridges.size();
+    }
+
     inline size_t pillarcount() const {
         std::lock_guard<Mutex> lk(m_mutex);
         return m_pillars.size();

@@ -20,32 +20,53 @@ namespace Slic3r { namespace sla {
 // the mesh it was given, grounded, with the pillars landing one object elevation
 // below the model's underside.
 //
-// Shape:
-//   {"version":1,"elevation":5.0,
+// Shape (version 2):
+//   {"version":2,"elevation":5.0,
 //    "heads":[{"pos":[x,y,z],"dir":[x,y,z],"r_pin":0.2,"r_back":0.5,
-//              "width":1.0,"penetration":0.2}],
+//              "width":1.0,"penetration":0.2,"pillar":3}],
 //    "pillars":[{"endpt":[x,y,z],"height":40.2,"r_start":0.5,"r_end":0.5,
-//                "links":0,"bridges":0}],
-//    "junctions":[{"pos":[x,y,z],"r":0.5}],
-//    "pedestals":[{"pos":[x,y,z],"height":1.0,"r_bottom":2.0,"r_top":0.5}],
+//                "links":0,"bridges":0,"props":1}],
+//    "junctions":[{"pos":[x,y,z],"r":0.5,"pillar":3}],
+//    "pedestals":[{"pos":[x,y,z],"height":1.0,"r_bottom":2.0,"r_top":0.5,
+//                  "pillar":3}],
 //    "bridges":[{"startp":[x,y,z],"endp":[x,y,z],"r":0.5,"end_r":0.5,
-//                "reaches":7000}]}
+//                "reaches":7000,"a":1,"b":3}]}
+//
+// OWNERSHIP is by position in these lists: a head's "pillar" is an index into
+// "pillars". The array subscript is the id, so nothing is spent carrying one.
+// It is what makes an automatic run editable - hundreds of pins routed onto far
+// fewer pillars, with no way to tell afterwards which pin a pillar carries
+// unless the run says so.
+//
+// EVERY OWNERSHIP KEY IS OMITTED WHEN IT SAYS NOTHING (-1), and so is "end_r"
+// when it equals "r" and "reaches" when it is -1. A reader fills those in with
+// the documented defaults. On a plate of a few hundred supports this is most of
+// the document: the common bar is a plain {"startp","endp","r"}. The dump is
+// compact for the same reason - an automatic tree is downloaded whole, and
+// indentation was a third of its bytes.
 //
 // `pillars` is index-aligned with the prior-pillar list reported alongside, so
 // the caller's handle for pillars[i] is that list's [i].id. One numbering, not
 // two.
 //
 // `reaches` on a bridge is the caller's handle for a pillar carried in from an
-// earlier generation, or -1 when both ends belong to this run. It is what lets
-// the caller drop exactly the bars that die with a support it removes.
+// earlier generation, or absent when both ends belong to this run. It is what
+// lets the caller drop exactly the bars that die with a support it removes.
 
-inline constexpr int support_tree_format_version = 1;
+inline constexpr int support_tree_format_version = 2;
 
 namespace detail {
 
 inline nlohmann::json vec3(const Vec3d &v)
 {
     return nlohmann::json::array({v.x(), v.y(), v.z()});
+}
+
+/// Write an ownership index only when there is one.
+inline void put_owner(nlohmann::json &j, const char *key, int idx)
+{
+    if (idx >= 0)
+        j[key] = idx;
 }
 
 } // namespace detail
@@ -63,43 +84,59 @@ inline std::string support_tree_to_string(const SupportTreeElements &els,
 
     nlohmann::json heads = nlohmann::json::array();
     for (const TreeHead &h : els.heads) {
-        heads.push_back({{"pos", vec3(h.pos)},
-                         {"dir", vec3(h.dir)},
-                         {"r_pin", h.r_pin},
-                         {"r_back", h.r_back},
-                         {"width", h.width},
-                         {"penetration", h.penetration}});
+        nlohmann::json j = {{"pos", vec3(h.pos)},
+                            {"dir", vec3(h.dir)},
+                            {"r_pin", h.r_pin},
+                            {"r_back", h.r_back},
+                            {"width", h.width},
+                            {"penetration", h.penetration}};
+        detail::put_owner(j, "pillar", h.pillar);
+        heads.push_back(std::move(j));
     }
 
     nlohmann::json pillars = nlohmann::json::array();
     for (const TreePillar &p : els.pillars) {
-        pillars.push_back({{"endpt", vec3(p.endpt)},
-                           {"height", p.height},
-                           {"r_start", p.r_start},
-                           {"r_end", p.r_end},
-                           {"links", p.links},
-                           {"bridges", p.bridges}});
+        nlohmann::json j = {{"endpt", vec3(p.endpt)},
+                            {"height", p.height},
+                            {"r_start", p.r_start},
+                            {"r_end", p.r_end},
+                            {"links", p.links},
+                            {"bridges", p.bridges}};
+        detail::put_owner(j, "props", p.props);
+        pillars.push_back(std::move(j));
     }
 
     nlohmann::json junctions = nlohmann::json::array();
-    for (const TreeJunction &j : els.junctions)
-        junctions.push_back({{"pos", vec3(j.pos)}, {"r", j.r}});
+    for (const TreeJunction &j : els.junctions) {
+        nlohmann::json rec = {{"pos", vec3(j.pos)}, {"r", j.r}};
+        detail::put_owner(rec, "pillar", j.pillar);
+        junctions.push_back(std::move(rec));
+    }
 
     nlohmann::json pedestals = nlohmann::json::array();
     for (const TreePedestal &p : els.pedestals) {
-        pedestals.push_back({{"pos", vec3(p.pos)},
-                             {"height", p.height},
-                             {"r_bottom", p.r_bottom},
-                             {"r_top", p.r_top}});
+        nlohmann::json j = {{"pos", vec3(p.pos)},
+                            {"height", p.height},
+                            {"r_bottom", p.r_bottom},
+                            {"r_top", p.r_top}};
+        detail::put_owner(j, "pillar", p.pillar);
+        pedestals.push_back(std::move(j));
     }
 
     nlohmann::json bridges = nlohmann::json::array();
     for (const TreeBridge &b : els.bridges) {
-        bridges.push_back({{"startp", vec3(b.startp)},
-                           {"endp", vec3(b.endp)},
-                           {"r", b.r},
-                           {"end_r", b.end_r},
-                           {"reaches", b.reaches}});
+        nlohmann::json j = {{"startp", vec3(b.startp)},
+                            {"endp", vec3(b.endp)},
+                            {"r", b.r}};
+        // A bar tapers only when it joins two different radii; most do not, and
+        // a reader takes end_r as r when it is absent.
+        if (b.end_r != b.r)
+            j["end_r"] = b.end_r;
+        if (b.reaches >= 0)
+            j["reaches"] = b.reaches;
+        detail::put_owner(j, "a", b.a);
+        detail::put_owner(j, "b", b.b);
+        bridges.push_back(std::move(j));
     }
 
     nlohmann::json doc = {{"version", support_tree_format_version},
@@ -109,7 +146,9 @@ inline std::string support_tree_to_string(const SupportTreeElements &els,
                           {"junctions", junctions},
                           {"pedestals", pedestals},
                           {"bridges", bridges}};
-    return doc.dump(1, ' ');
+    // Compact: an automatic tree is hundreds of elements downloaded whole, and
+    // indentation was about a third of the bytes.
+    return doc.dump();
 }
 
 }} // namespace Slic3r::sla

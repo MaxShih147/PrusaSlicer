@@ -84,6 +84,7 @@ void SupportTreeBuilder::add_pillar_base(long pid, double baseheight, double rad
                              std::max(radius, pll.r_start), pll.r_start);
 
     m_pedestals.back().id = m_pedestals.size() - 1;
+    m_pedestals.back().pillar_id = pid;
     m_meshcache_valid = false;
 }
 
