@@ -1183,8 +1183,16 @@ void DefaultSupportTree::interconnect_pillars()
                 Vec3d s = spts[n];
                 Pillar p(Vec3d{s.x(), s.y(), gnd}, s.z() - gnd, pillar().r_start);
 
+                // The bracing is made against a pillar that does not exist yet:
+                // interconnect() is the test for whether this prop can be placed
+                // at all, and only a prop that passes is added. So the bars it
+                // makes have no id at that end until the pillar has one.
+                const size_t first_cross = m_builder.crossbridgecount();
+
                 if (interconnect(pillar(), p)) {
                     Pillar &pp = m_builder.pillar(m_builder.add_pillar(p));
+
+                    m_builder.own_crossbridges_from(first_cross, pp.id);
 
                     // An auxiliary pillar carries no head, so this is the only
                     // thing that says which support it belongs to.

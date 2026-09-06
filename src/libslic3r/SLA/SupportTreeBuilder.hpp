@@ -512,6 +512,30 @@ public:
             m_diffbridges[i].owner_b = pillar_id;
     }
 
+    /// How many crossbridges exist, for a caller about to make some against a
+    /// pillar that does not exist yet.
+    inline size_t crossbridgecount() const {
+        std::lock_guard<Mutex> lk(m_mutex);
+        return m_crossbridges.size();
+    }
+
+    /// Name the far end of every crossbridge from `first` onwards that has none.
+    ///
+    /// interconnect() is called with a candidate pillar BEFORE it is added to
+    /// the builder, so the bars it makes carry ID_UNSET at that end - the
+    /// candidate has no id yet. Filling it in afterwards is what lets a caller
+    /// tell this bracing apart from a bar that carries a pin: without it those
+    /// bars look owner-less, and anything that reasons about ownership - which
+    /// support a bar belongs to, what goes when a pillar is removed - gets them
+    /// wrong.
+    void own_crossbridges_from(size_t first, long pillar_id)
+    {
+        std::lock_guard<Mutex> lk(m_mutex);
+        for (size_t i = first; i < m_crossbridges.size(); ++i)
+            if (m_crossbridges[i].owner_b < 0)
+                m_crossbridges[i].owner_b = pillar_id;
+    }
+
     inline size_t diffbridgecount() const {
         std::lock_guard<Mutex> lk(m_mutex);
         return m_diffbridges.size();
