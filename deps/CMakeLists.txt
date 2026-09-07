@@ -101,10 +101,26 @@ if (APPLE)
         string(REGEX MATCH "^[0-9]+[.][0-9]+" DEP_OSX_TARGET "${DEP_OSX_TARGET}")
 
         if (NOT DEP_OSX_TARGET)
-            message(FATAL_ERROR "Could not determine OS X SDK version. Please use -DCMAKE_OSX_DEPLOYMENT_TARGET=<version>")
+            # CMAKE_OSX_SYSROOT can resolve to the unversioned "MacOSX.sdk"
+            # symlink instead of a versioned "MacOSXNN.N.sdk" path (seen on
+            # newer Xcode releases), so the regex above has nothing to match.
+            # Fall back to asking the active Xcode toolchain directly.
+            execute_process(
+                COMMAND xcrun --show-sdk-version
+                OUTPUT_VARIABLE DEP_OSX_TARGET
+                OUTPUT_STRIP_TRAILING_WHITESPACE
+                ERROR_QUIET
+            )
+            if (DEP_OSX_TARGET)
+                dep_message(STATUS "OS X Deployment Target (inferred via xcrun): ${DEP_OSX_TARGET}")
+            endif ()
+        else ()
+            dep_message(STATUS "OS X Deployment Target (inferred from SDK path): ${DEP_OSX_TARGET}")
         endif ()
 
-        dep_message(STATUS "OS X Deployment Target (inferred from SDK): ${DEP_OSX_TARGET}")
+        if (NOT DEP_OSX_TARGET)
+            message(FATAL_ERROR "Could not determine OS X SDK version. Please use -DCMAKE_OSX_DEPLOYMENT_TARGET=<version>")
+        endif ()
     endif ()
 
     # This ensures dependencies don't use SDK features which are not available in the version specified by Deployment target
