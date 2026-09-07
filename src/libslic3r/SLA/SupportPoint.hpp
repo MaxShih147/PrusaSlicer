@@ -110,13 +110,27 @@ struct SupportPoint
     // point_bracing_angle_rad().
     float support_bracing_angle_deg = support_point_unset; // [in degrees]
 
+    // Which way the pinhead points, away from the surface.
+    //
+    // Normally the engine works this out from the surface normal and then
+    // searches around it for an angle that clears the model. A caller that is
+    // placing supports by hand may want the head somewhere that search would
+    // never choose: dragging a support moves the PILLAR while the tip stays in
+    // the model, so the head has to stretch and lean to bridge the gap.
+    //
+    // The zero vector is the sentinel for "not set" - a direction has to point
+    // somewhere, so no real value can collide with it. Set together with
+    // head_width_mm, which sets how far along this direction the junction sits.
+    Vec3f head_dir = Vec3f::Zero();
+
     bool is_island() const { return type == SupportPointType::island; }
     template<class Archive> void serialize(Archive &ar){
         // Every size field must be listed here: a field left out is silently
         // dropped on every cereal round trip (undo/redo, backend snapshots).
         ar(pos, head_front_radius, type,
            head_back_radius_mm, head_width_mm, head_penetration_mm,
-           contact_sphere_radius, base_radius_mm, support_bracing_angle_deg);
+           contact_sphere_radius, base_radius_mm, support_bracing_angle_deg,
+           head_dir);
     }
 
     // unsaved changes + cache invalidation
@@ -131,7 +145,8 @@ struct SupportPoint
                same(head_penetration_mm, sp.head_penetration_mm) &&
                same(contact_sphere_radius, sp.contact_sphere_radius) &&
                same(base_radius_mm, sp.base_radius_mm) &&
-               same(support_bracing_angle_deg, sp.support_bracing_angle_deg);
+               same(support_bracing_angle_deg, sp.support_bracing_angle_deg) &&
+               head_dir == sp.head_dir;
     }
 
     bool operator!=(const SupportPoint &sp) const { return !(sp == (*this)); }
@@ -172,6 +187,16 @@ inline double point_head_back_radius_mm(const SupportPoint &sp, double global_mm
 inline double point_head_width_mm(const SupportPoint &sp, double global_mm)
 {
     return point_resolve(sp.head_width_mm, global_mm);
+}
+
+/**
+ * Whether this point dictates which way its head points.
+ * @param sp the support point
+ * @returns true when the caller set a direction
+ */
+inline bool point_has_head_dir(const SupportPoint &sp)
+{
+    return sp.head_dir.squaredNorm() > EPSILON;
 }
 
 inline double point_head_penetration_mm(const SupportPoint &sp, double global_mm)

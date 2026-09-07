@@ -14,6 +14,7 @@
 #include <libslic3r/SLA/SupportTreeStrategies.hpp>
 #include <math.h>
 #include <vector>
+#include <map>
 #include <memory>
 #include <algorithm>
 #include <cmath>
@@ -99,6 +100,17 @@ struct SupportTreeConfig
     
     unsigned max_bridges_on_pillar = 3;
 
+    // Whether a lonely pillar may be propped up with auxiliary pillars of its
+    // own. On by default, because a tall pillar standing alone is the classic
+    // way for a support to fail.
+    //
+    // Manual placement turns it off: there, one click means one support, and an
+    // engine adding pillars the user did not ask for makes the result something
+    // they cannot reason about - they placed a support and got three. The
+    // trade-off is real and theirs to make: a tall lone pillar is more likely to
+    // fail on the printer.
+    bool auxiliary_pillars = true;
+
     double max_weight_on_model_support = 10.f;
 
     double head_fullwidth() const {
@@ -134,6 +146,151 @@ struct SupportTreeConfig
 
 enum class MeshType { Support, Pad };
 
+// One pillar carried in from a previous generation.
+//
+// This is what makes support generation additive: a newly placed support can
+// see the pillars already on the plate, brace to the ones within reach, and
+// count them towards its own link budget so it does not grow redundant
+// auxiliary props - while the existing geometry is never recomputed and comes
+// back byte-identical, because it is never emitted at all.
+//
+// Only what bracing needs is carried: where the pillar stands, how thick it is,
+// and how many connections it already has.
+struct PriorPillar
+{
+    // Caller's handle, echoed back so it can be told what the new support
+    // attached to. The engine never interprets it.
+    long   id       = -1;
+    Vec3d  endpoint = Vec3d::Zero(); // bottom, at ground level
+    double height   = 0.;
+    double r_start  = 0.;
+    double r_end    = 0.;
+    unsigned links   = 0;
+    unsigned bridges = 0;
+};
+
+using PriorPillars = std::vector<PriorPillar>;
+
+// What a generation attached itself to, and what that did to the pillars it
+// attached to.
+//
+// A support that braces to a neighbour changes that neighbour's link count even
+// though its geometry is untouched, and the caller has to carry the new count
+// into the NEXT generation or the engine will keep bracing to a pillar that is
+// already full. Reporting it is the difference between an additive flow that
+// stays correct and one that drifts after a few supports.
+struct PriorAttachment
+{
+    long     prior_id = -1; // the caller's handle for the pillar attached to
+    unsigned links    = 0;  // its link count after this generation
+    unsigned bridges  = 0;  // its bridge count after this generation
+};
+
+using PriorAttachments = std::vector<PriorAttachment>;
+
+// The braces a generation grew to pillars carried in from earlier ones, keyed by
+// the caller's handle for the pillar each reaches.
+//
+// Handed over separately from the support's own mesh because it belongs to both
+// ends: grown now, but only meaningful while that pillar exists. Kept apart, it
+// can be taken away on its own when the pillar goes - without regrowing the
+// support it came with, which would move geometry the user already accepted.
+using FrozenBraceMeshes = std::map<long, indexed_triangle_set>;
+
+// ---------------------------------------------------------------------------
+// The support tree as data rather than as triangles.
+//
+// merged_mesh() is nothing but get_mesh() over the builder's element lists, so
+// handing the lists over is handing over the whole support. A caller that has
+// them can draw it, point at ONE element of it, and take that element away -
+// none of which triangle soup allows. A single STL per support answers "how
+// does it look"; this answers "what is it made of", which is what an editor
+// needs.
+//
+// Every element is world-space and in the engine's own frame (the mesh it was
+// given, grounded), the same frame the exported STL is in.
+// Ownership below is by POSITION in these lists, not by any separate id: a
+// head's `pillar` is an index into `pillars`. One numbering, nothing to keep in
+// sync, and nothing spent on ids that the array subscript already gives.
+struct TreeHead
+{
+    Vec3d  pos = Vec3d::Zero(); // the point on the model it holds up
+    Vec3d  dir = Vec3d::Zero(); // away from the surface; the pin points along it
+    double r_pin = 0., r_back = 0., width = 0., penetration = 0.;
+    // The pillar this pin's load ends up on: its own where it grew one, else the
+    // one it bridges across to. -1 when it stands on a pillar from an earlier
+    // generation, or on nothing.
+    //
+    // This is what makes automatic supports editable. A run places hundreds of
+    // pins and routes them onto far fewer pillars (routing_to_ground clusters
+    // them; only the centroid grows a pillar of its own), so "which pin does
+    // this belong to" cannot be read off the geometry afterwards - but the
+    // builder knew it all along.
+    int    pillar = -1;
+};
+
+struct TreePillar
+{
+    Vec3d    endpt   = Vec3d::Zero(); // bottom
+    double   height  = 0.;
+    double   r_start = 0., r_end = 0.;
+    unsigned links   = 0, bridges = 0;
+    // The pillar this one props up, for an auxiliary one. It holds no head, so
+    // this is the only thing tying it to a support. -1 for an ordinary pillar.
+    int      props   = -1;
+    // The pin whose junction is this pillar's TOP, when one grew it. Not the
+    // same question as TreeHead::pillar, which every pin answers: a pin bridged
+    // onto a pillar stands on it without owning it, and its head does not reach
+    // the top. Moving a pillar re-aims the pin that owns it and leaves the
+    // others to their bars, so the difference has to be recorded.
+    int      head    = -1;
+};
+
+struct TreeJunction
+{
+    Vec3d  pos = Vec3d::Zero();
+    double r   = 0.;
+    int    pillar = -1; // the pillar it sits on, where that was known
+};
+
+struct TreePedestal
+{
+    Vec3d  pos      = Vec3d::Zero();
+    double height   = 0.;
+    double r_bottom = 0., r_top = 0.;
+    int    pillar   = -1; // the pillar it was put under
+};
+
+// One BAR of bracing. The builder has always held them one per record; only the
+// merged mesh loses the boundary between them.
+struct TreeBridge
+{
+    Vec3d  startp = Vec3d::Zero(), endp = Vec3d::Zero();
+    double r      = 0.;
+    double end_r  = 0.; // equal to r unless it tapers (DiffBridge / Anchor)
+    // The caller's handle for the pillar this bar reaches, when that pillar came
+    // in from an earlier generation; -1 when both ends belong to this one. It is
+    // what lets the caller drop this bar, and only this bar, when that support
+    // goes away.
+    long   reaches = -1;
+    // The pillars this bar joins, by position in `pillars`. -1 at an end that
+    // is not a pillar of this run: a head's own junction, or a frozen pillar
+    // (which `reaches` names instead).
+    int    a = -1, b = -1;
+};
+
+struct SupportTreeElements
+{
+    std::vector<TreeHead>     heads;
+    // Only the pillars this generation grew, in the same order as the
+    // PriorPillars reported alongside - so the caller's handle for pillars[i]
+    // is that list's [i].id, and there is no second numbering to keep in sync.
+    std::vector<TreePillar>   pillars;
+    std::vector<TreeJunction> junctions;
+    std::vector<TreePedestal> pedestals;
+    std::vector<TreeBridge>   bridges;
+};
+
 struct SupportableMesh
 {
     AABBMesh          emesh;
@@ -141,6 +298,9 @@ struct SupportableMesh
     SupportTreeConfig cfg;
     PadConfig         pad_cfg;
     double            zoffset = 0.;
+
+    // Pillars from earlier generations. Empty means a normal, from-scratch run.
+    PriorPillars      prior;
 
     explicit SupportableMesh(const indexed_triangle_set &trmsh,
                              const SupportPoints        &sp,
@@ -285,8 +445,18 @@ inline double ground_level(const SupportableMesh &sm)
     return lvl;
 }
 
+/// Grow the support tree.
+/// @param out_pillars when given, receives the pillars this run created, so a
+///        later run can be handed them as SupportableMesh::prior and brace to
+///        them additively. Frozen pillars carried in are NOT repeated here:
+///        the caller already has those.
 indexed_triangle_set create_support_tree(const SupportableMesh &mesh,
-                                         const JobController   &ctl);
+                                         const JobController   &ctl,
+                                         PriorPillars          *out_pillars = nullptr,
+                                         PriorAttachments      *out_attached = nullptr,
+                                         FrozenBraceMeshes     *out_braces = nullptr,
+                                         SupportTreeElements   *out_elements = nullptr,
+                                         indexed_triangle_set  *out_full_mesh = nullptr);
 
 indexed_triangle_set create_pad(const SupportableMesh      &model_mesh,
                                 const indexed_triangle_set &support_mesh,

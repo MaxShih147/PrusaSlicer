@@ -42,6 +42,8 @@
 #include "libslic3r/SLA/Hollowing.hpp"
 #include "libslic3r/SLA/ModelFingerprint.hpp"
 #include "libslic3r/SLA/SupportPointIO.hpp"
+#include "libslic3r/SLA/PriorPillarIO.hpp"
+#include "libslic3r/SLA/SupportTreeIO.hpp"
 #include "libslic3r/TriangleMesh.hpp"
 
 #include "CLI/CLI.hpp"
@@ -341,6 +343,10 @@ bool process_actions(Data& cli, const DynamicPrintConfig& print_config, std::vec
     };
 
     const std::string import_support_points_path = opt_path(cli.misc_config, "import_support_points");
+    const std::string export_support_pillars_path = opt_path(cli.misc_config, "export_support_pillars");
+    const std::string export_support_tree_path = opt_path(cli.misc_config, "export_support_tree");
+    const std::string export_pad_stl_path = opt_path(cli.misc_config, "export_pad_stl");
+    const std::string export_brace_stls_dir = opt_path(cli.misc_config, "export_brace_stls");
     const std::string export_support_points_path = opt_path(actions, "export_support_points");
 
     // An empty path is a typo, never a way of saying "not this time". Treating
@@ -692,6 +698,33 @@ bool process_actions(Data& cli, const DynamicPrintConfig& print_config, std::vec
                 }
             }
 
+            // Additive generation: hand the engine the pillars of the support
+            // that is already on the plate. They are braced to and counted
+            // towards the new pillar's link budget, but never re-emitted.
+            const std::string prior_supports_path = opt_path(cli.misc_config, "prior_supports");
+            if (printer_technology == ptSLA && !prior_supports_path.empty()) {
+                boost::nowide::ifstream pifs(prior_supports_path);
+                if (!pifs.good()) {
+                    boost::nowide::cerr << "error: failed to open --prior-supports: "
+                                        << prior_supports_path << std::endl;
+                    return false;
+                }
+                std::ostringstream ptext;
+                ptext << pifs.rdbuf();
+
+                sla::PriorPillars priors;
+                std::string prior_err;
+                if (!sla::prior_pillars_from_string(ptext.str(), priors, prior_err)) {
+                    boost::nowide::cerr << "error: --prior-supports: " << prior_err << std::endl;
+                    return false;
+                }
+                if (!sla_print.attach_prior_pillars(priors))
+                    boost::nowide::cerr << "warning: --prior-supports provided but no SLA object to attach to." << std::endl;
+                else
+                    boost::nowide::cout << "Loaded " << priors.size()
+                                        << " prior support pillars from " << prior_supports_path << std::endl;
+            }
+
             if (actions.has("export_preview_pngs") && printer_technology == ptSLA) {
                 double scale = actions.opt_float("export_preview_pngs");
                 if (scale > 0.)
@@ -887,6 +920,84 @@ bool process_actions(Data& cli, const DynamicPrintConfig& print_config, std::vec
                                 if (!pad_mesh.empty()) {
                                     combined_mesh.merge(pad_mesh);
                                     has_pad = true;
+                                }
+                            }
+
+                            // The pillars this generation grew, for handing to
+                            // the next one as --prior-supports. Written even when
+                            // the mesh is empty: "nothing grew" is a real answer
+                            // the caller has to be able to record.
+                            if (!export_support_pillars_path.empty()) {
+                                const std::string doc = sla::prior_pillars_to_string(
+                                    po->generated_pillars(), po->get_elevation(),
+                                    po->prior_attachments());
+                                boost::nowide::ofstream pofs(export_support_pillars_path);
+                                if (pofs.good()) {
+                                    pofs << doc;
+                                    boost::nowide::cout << "Support pillars exported to "
+                                                        << export_support_pillars_path << " ("
+                                                        << po->generated_pillars().size()
+                                                        << " pillars)" << std::endl;
+                                } else {
+                                    boost::nowide::cerr << "Failed to export support pillars to "
+                                                        << export_support_pillars_path << std::endl;
+                                }
+                            }
+
+                            // The pad on its own. The support mesh export merges
+                            // it in, which is right for printing and wrong for a
+                            // caller drawing from the element list: a pad is an
+                            // extruded footprint, not pillars and bracing, so the
+                            // tree has no way to carry it.
+                            if (!export_pad_stl_path.empty()) {
+                                TriangleMesh pad_only = po->pad_mesh();
+                                if (!pad_only.empty()) {
+                                    if (pad_only.write_binary(export_pad_stl_path.c_str()))
+                                        boost::nowide::cout << "Pad mesh exported to " << export_pad_stl_path << std::endl;
+                                    else
+                                        boost::nowide::cerr << "Failed to export pad mesh to " << export_pad_stl_path << std::endl;
+                                } else {
+                                    boost::nowide::cout << "No pad mesh generated" << std::endl;
+                                }
+                            }
+
+                            // The same support as data rather than triangles.
+                            // Written even when nothing grew, for the same
+                            // reason the pillar list is.
+                            if (!export_support_tree_path.empty()) {
+                                const auto &els = po->support_tree_elements();
+                                const std::string doc = sla::support_tree_to_string(
+                                    els, po->get_elevation());
+                                boost::nowide::ofstream tofs(export_support_tree_path);
+                                if (tofs.good()) {
+                                    tofs << doc;
+                                    boost::nowide::cout << "Support tree exported to "
+                                                        << export_support_tree_path << " ("
+                                                        << els.pillars.size() << " pillars, "
+                                                        << els.bridges.size() << " bars)"
+                                                        << std::endl;
+                                } else {
+                                    boost::nowide::cerr << "Failed to export support tree to "
+                                                        << export_support_tree_path << std::endl;
+                                }
+                            }
+
+                            // Braces reaching pillars from earlier generations,
+                            // one file each. Separate from the support mesh so
+                            // that removing such a pillar can take its brace
+                            // with it, leaving the support itself untouched.
+                            if (!export_brace_stls_dir.empty()) {
+                                boost::system::error_code ec;
+                                boost::filesystem::create_directories(export_brace_stls_dir, ec);
+                                for (const auto &[prior_id, its] : po->frozen_braces()) {
+                                    if (its.empty()) continue;
+                                    TriangleMesh bm{its};
+                                    boost::filesystem::path bp(export_brace_stls_dir);
+                                    bp /= ("brace_" + std::to_string(prior_id) + ".stl");
+                                    if (bm.write_binary(bp.string().c_str()))
+                                        boost::nowide::cout << "Brace mesh exported to " << bp.string() << std::endl;
+                                    else
+                                        boost::nowide::cerr << "Failed to export brace mesh to " << bp.string() << std::endl;
                                 }
                             }
 

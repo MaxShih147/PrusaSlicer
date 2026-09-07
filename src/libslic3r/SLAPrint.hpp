@@ -137,6 +137,42 @@ public:
     // the support track. The mesh is transformed by trafo() to align with the
     // model's print frame (Contract A: shared world origin).
     void                        set_imported_support_mesh(const indexed_triangle_set &its);
+    /// Pillars from earlier generations, so a newly placed support can brace to
+    /// what is already on the plate without any of it being recomputed.
+    void                        set_prior_pillars(const sla::PriorPillars &p) { m_prior_pillars = p; }
+    const sla::PriorPillars    &prior_pillars() const { return m_prior_pillars; }
+    /// What the last generation braced to, and the link counts those pillars
+    /// now carry. The caller must carry these forward, or the next generation
+    /// will keep bracing to a pillar that is already full.
+    const sla::PriorAttachments &prior_attachments() const
+    {
+        static const sla::PriorAttachments empty;
+        return m_supportdata ? m_supportdata->prior_attachments : empty;
+    }
+
+    /// Braces from the last generation to pillars carried in, keyed by the
+    /// caller's handle for each pillar reached.
+    const sla::FrozenBraceMeshes &frozen_braces() const
+    {
+        static const sla::FrozenBraceMeshes empty;
+        return m_supportdata ? m_supportdata->frozen_braces : empty;
+    }
+
+    /// The pillars the last support generation produced. Empty until it has run.
+    const sla::PriorPillars    &generated_pillars() const
+    {
+        static const sla::PriorPillars empty;
+        return m_supportdata ? m_supportdata->generated_pillars : empty;
+    }
+
+    /// The last generation's support tree as data: heads, pillars, junctions,
+    /// pedestals and one record per bar of bracing. Everything merged_mesh()
+    /// turns into triangles, before it does.
+    const sla::SupportTreeElements &support_tree_elements() const
+    {
+        static const sla::SupportTreeElements empty;
+        return m_supportdata ? m_supportdata->tree_elements : empty;
+    }
     bool                        has_imported_support() const { return m_imported_support; }
 
     struct Instance {
@@ -392,14 +428,37 @@ private:
             : input{t, {}, {}}
         {}
         
+        // Pillars this generation created, for handing to the next one.
+        sla::PriorPillars generated_pillars;
+        // The prior pillars it braced to, with their updated link counts.
+        sla::PriorAttachments prior_attachments;
+        // The braces reaching those pillars, kept out of tree_mesh so each can
+        // be removed on its own when the pillar it reaches goes away.
+        sla::FrozenBraceMeshes frozen_braces;
+        // The same support as data rather than triangles, for a caller that
+        // draws and edits it instead of only printing it.
+        sla::SupportTreeElements tree_elements;
+        // The same tree WITH the pillars carried in from earlier generations.
+        // tree_mesh leaves them out so the caller is not handed its own geometry
+        // back; the pad is grown from a footprint and belongs to the whole
+        // plate, so it needs them or each added support gets a pad its own size.
+        indexed_triangle_set pad_source_mesh;
+
         void create_support_tree(const sla::JobController &ctl)
         {
-            tree_mesh = TriangleMesh{sla::create_support_tree(input, ctl)};
+            tree_mesh = TriangleMesh{sla::create_support_tree(
+                input, ctl, &generated_pillars, &prior_attachments,
+                &frozen_braces, &tree_elements, &pad_source_mesh)};
         }
 
         void create_pad(const sla::JobController &ctl)
         {
-            pad_mesh = TriangleMesh{sla::create_pad(input, tree_mesh.its, ctl)};
+            // Grown from the tree INCLUDING frozen pillars: a pad belongs to the
+            // whole plate, and tree_mesh deliberately omits what earlier
+            // generations produced.
+            const indexed_triangle_set &src =
+                pad_source_mesh.empty() ? tree_mesh.its : pad_source_mesh;
+            pad_mesh = TriangleMesh{sla::create_pad(input, src, ctl)};
         }
     };
 
@@ -413,6 +472,7 @@ private:
     // mesh is (re)mounted into m_supportdata->tree_mesh in support_tree(), which
     // runs after those resets.
     indexed_triangle_set          m_imported_support_its;
+    sla::PriorPillars             m_prior_pillars;
 
     // Holds CSG operations for the printed object, prioritized by print steps.
     CSGContainer                  m_mesh_to_slice;
@@ -525,6 +585,9 @@ public:
     // Attach an externally imported support mesh to the (single) print object.
     // Returns false if there is no object. Scope: single-object only.
     bool attach_imported_support(const indexed_triangle_set &its);
+    /// Hand the pillars of an existing support to the next generation, so it
+    /// can brace to them additively. Single-object scope, like the above.
+    bool attach_prior_pillars(const sla::PriorPillars &pillars);
     // PrintObject by its ObjectID, to be used to uniquely bind slicing warnings to their source PrintObjects
     // in the notification center.
     const SLAPrintObject* get_print_object_by_model_object_id(ObjectID object_id) const {

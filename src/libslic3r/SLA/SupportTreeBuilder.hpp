@@ -17,6 +17,7 @@
 #include <mutex>
 #include <utility>
 #include <vector>
+#include <map>
 #include <cassert>
 #include <cstddef>
 
@@ -90,6 +91,11 @@ struct Junction: public SupportTreeNode {
     double r = 1;
     Vec3d pos;
 
+    // The pillar this junction sits on, where the code that made it knew. A
+    // caller drawing the tree groups elements by pillar; a junction with no
+    // owner is simply not part of any group.
+    long pillar_id = ID_UNSET;
+
     Junction(const Vec3d &tr, double r_mm) : r(r_mm), pos(tr) {}
 };
 
@@ -160,6 +166,17 @@ struct Pillar: public SupportTreeNode {
     // How many pillars are cascaded with this one
     unsigned links = 0;
 
+    // The pillar this one was grown to prop up, for an auxiliary pillar. Such a
+    // pillar carries no head of its own, so without this there is nothing to say
+    // which support it belongs to.
+    long props_for = ID_UNSET;
+
+    // A pillar carried in from a previous generation. It takes part in
+    // neighbour queries and bracing so a newly added support can attach to it,
+    // but its own geometry is NOT emitted: the caller already has that mesh and
+    // it must come back byte-identical. See SupportableMesh::prior.
+    bool frozen = false;
+
     Pillar(const Vec3d &endp, double h, double start_radius, double end_radius)
         : height{h}
         , r_start(start_radius)
@@ -185,6 +202,9 @@ struct Pedestal: public SupportTreeNode {
     Vec3d pos;
     double height, r_bottom, r_top;
 
+    // The pillar this base was put under.
+    long pillar_id = ID_UNSET;
+
     Pedestal(const Vec3d &p, double h, double rbottom, double rtop)
         : pos{p}, height{h}, r_bottom{rbottom}, r_top{rtop}
     {}
@@ -198,6 +218,14 @@ struct Anchor: public Head { using Head::Head; };
 struct Bridge: public SupportTreeNode {
     double r = 0.8;
     Vec3d startp = Vec3d::Zero(), endp = Vec3d::Zero();
+
+    // The pillars this bridge joins, when it joins two. Recorded so a bridge
+    // that reaches a pillar carried in from an earlier generation can be told
+    // apart from the support's own geometry: the caller holds that pillar's
+    // mesh already, and if that pillar is later removed the bridge has to go
+    // with it - on its own, without regenerating the support it belongs to.
+    long owner_a = ID_UNSET;
+    long owner_b = ID_UNSET;
     
     Bridge(const Vec3d &j1,
            const Vec3d &j2,
@@ -310,6 +338,23 @@ public:
     
     void add_pillar_base(long pid, double baseheight = 3, double radius = 2);
 
+    /// Register a pillar from an earlier generation. It participates in the
+    /// spatial index and in bracing decisions, but merged_mesh() skips it.
+    long add_frozen_pillar(const Vec3d &endp, double h, double r_start, double r_end,
+                           unsigned links, unsigned bridges)
+    {
+        std::lock_guard<Mutex> lk(m_mutex);
+        m_pillars.emplace_back(endp, h, r_start, r_end);
+        Pillar &pillar = m_pillars.back();
+        pillar.id = long(m_pillars.size() - 1);
+        pillar.starts_from_head = false;
+        pillar.frozen = true;
+        pillar.links = links;
+        pillar.bridges = bridges;
+        m_meshcache_valid = false;
+        return pillar.id;
+    }
+
     template<class...Args> const Anchor& add_anchor(Args&&...args)
     {
         std::lock_guard<Mutex> lk(m_mutex);
@@ -390,6 +435,42 @@ public:
         return _add_bridge(m_crossbridges, std::forward<Args>(args)...);
     }
 
+    /// A crossbridge that knows which two pillars it joins.
+    const Bridge& add_crossbridge_between(long pillar_a, long pillar_b,
+                                          const Vec3d &s, const Vec3d &e, double r)
+    {
+        const Bridge &b = _add_bridge(m_crossbridges, s, e, r);
+        // _add_bridge hands back a const reference into the vector it just grew;
+        // the ids are bookkeeping rather than geometry, so writing them through
+        // the vector keeps that accessor honest about the geometry.
+        m_crossbridges[size_t(b.id)].owner_a = pillar_a;
+        m_crossbridges[size_t(b.id)].owner_b = pillar_b;
+        return m_crossbridges[size_t(b.id)];
+    }
+
+    /// A free-standing bridge that knows which pillars it joins.
+    ///
+    /// `from_pillar` is optional because not every bar starts on one; when it
+    /// does, saying so is what lets a caller group the bar with both ends
+    /// rather than only the one it reached.
+    const Bridge& add_bridge_between(long pillar_id, const Vec3d &s,
+                                     const Vec3d &e, double r,
+                                     long from_pillar = SupportTreeNode::ID_UNSET)
+    {
+        const Bridge &b = add_bridge(s, e, r);
+        m_bridges[size_t(b.id)].owner_a = from_pillar;
+        m_bridges[size_t(b.id)].owner_b = pillar_id;
+        return m_bridges[size_t(b.id)];
+    }
+
+    /// A head-to-pillar bridge that knows which pillar it reached.
+    const Bridge& add_bridge_to_pillar(long headid, const Vec3d &endp, long pillar_id)
+    {
+        const Bridge &b = add_bridge(headid, endp);
+        m_bridges[size_t(b.id)].owner_b = pillar_id;
+        return m_bridges[size_t(b.id)];
+    }
+
     template<class...Args> const DiffBridge& add_diffbridge(Args&&... args)
     {
         return _add_bridge(m_diffbridges, std::forward<Args>(args)...);
@@ -404,6 +485,38 @@ public:
         return m_heads[m_head_indices[id]];
     }
     
+    /// How many junctions exist, for a caller about to add some and then say
+    /// which pillar they belong to.
+    inline size_t junctioncount() const {
+        std::lock_guard<Mutex> lk(m_mutex);
+        return m_junctions.size();
+    }
+
+    /// Give every junction from `first` onwards to a pillar.
+    ///
+    /// A route to the ground lays its junctions down BEFORE the pillar they
+    /// belong to exists, so ownership is written afterwards rather than passed
+    /// in. Junctions made elsewhere keep whatever owner they already have.
+    void own_junctions_from(size_t first, long pillar_id)
+    {
+        std::lock_guard<Mutex> lk(m_mutex);
+        for (size_t i = first; i < m_junctions.size(); ++i)
+            m_junctions[i].pillar_id = pillar_id;
+    }
+
+    /// Give every bridge from `first` onwards a pillar at its far end.
+    void own_diffbridges_from(size_t first, long pillar_id)
+    {
+        std::lock_guard<Mutex> lk(m_mutex);
+        for (size_t i = first; i < m_diffbridges.size(); ++i)
+            m_diffbridges[i].owner_b = pillar_id;
+    }
+
+    inline size_t diffbridgecount() const {
+        std::lock_guard<Mutex> lk(m_mutex);
+        return m_diffbridges.size();
+    }
+
     inline size_t pillarcount() const {
         std::lock_guard<Mutex> lk(m_mutex);
         return m_pillars.size();
@@ -414,6 +527,18 @@ public:
     inline const std::vector<Bridge> &bridges() const { return m_bridges; }
     inline const std::vector<Bridge> &crossbridges() const { return m_crossbridges; }
     inline const std::vector<Pedestal> &pedestals() const { return m_pedestals; }
+    // Every element, frozen pillars included.
+    //
+    // merged_mesh() leaves out the pillars carried in from earlier generations,
+    // because the caller already holds their geometry and handing it back would
+    // draw them twice. The PAD is grown from the support tree's footprint, and
+    // it belongs to the whole plate rather than to one generation - so it has to
+    // see them, or each added support gets a pad the size of itself.
+    indexed_triangle_set full_mesh(size_t steps = 45) const;
+
+    inline const std::vector<Junction> &junctions() const { return m_junctions; }
+    inline const std::vector<DiffBridge> &diffbridges() const { return m_diffbridges; }
+    inline const std::vector<Anchor> &anchors() const { return m_anchors; }
     
     template<class T> inline IntegerOnly<T, const Pillar&> pillar(T id) const
     {
@@ -432,6 +557,36 @@ public:
         
         return m_pillars[size_t(id)];
     }
+
+    /// Does this bridge reach a pillar carried in from an earlier generation?
+    bool bridge_reaches_frozen(const Bridge &b) const
+    {
+        auto frozen = [this](long pid) {
+            return pid >= 0 && size_t(pid) < m_pillars.size() && m_pillars[size_t(pid)].frozen;
+        };
+        return frozen(b.owner_a) || frozen(b.owner_b);
+    }
+
+    /// The frozen pillar a bridge reaches, or ID_UNSET.
+    long bridge_frozen_target(const Bridge &b) const
+    {
+        auto frozen = [this](long pid) {
+            return pid >= 0 && size_t(pid) < m_pillars.size() && m_pillars[size_t(pid)].frozen;
+        };
+        if (frozen(b.owner_a)) return b.owner_a;
+        if (frozen(b.owner_b)) return b.owner_b;
+        return SupportTreeNode::ID_UNSET;
+    }
+
+    /// Bridges reaching each frozen pillar, meshed on their own.
+    ///
+    /// A brace to a pillar from an earlier generation is geometry that belongs
+    /// to BOTH: it is grown now, but it only makes sense while that pillar
+    /// exists. Kept out of the support's own mesh and handed over separately, it
+    /// can be taken away on its own when that pillar goes - without regrowing
+    /// the support it was grown with, which would move geometry the user has
+    /// already accepted.
+    std::map<long, indexed_triangle_set> frozen_brace_meshes(size_t steps = 16) const;
 
     // WITHOUT THE PAD!!!
     // steps = facet count of support cylinders/cones/spheres. Lowered from 45

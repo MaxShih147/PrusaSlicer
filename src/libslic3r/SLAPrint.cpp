@@ -83,6 +83,7 @@ sla::SupportTreeConfig make_support_cfg(const SLAPrintObjectConfig& c)
                 scfg.safety_distance_mm : c.support_base_safety_distance.getFloat();
 
         scfg.max_bridges_on_pillar = unsigned(c.support_max_bridges_on_pillar.getInt());
+        scfg.auxiliary_pillars = c.support_auxiliary_pillars.getBool();
         scfg.max_weight_on_model_support = c.support_max_weight_on_model.getFloat();
         break;
     }
@@ -112,6 +113,7 @@ sla::SupportTreeConfig make_support_cfg(const SLAPrintObjectConfig& c)
                 scfg.safety_distance_mm : c.branchingsupport_base_safety_distance.getFloat();
 
         scfg.max_bridges_on_pillar = unsigned(c.branchingsupport_max_bridges_on_pillar.getInt());
+        scfg.auxiliary_pillars = c.branchingsupport_auxiliary_pillars.getBool();
         scfg.max_weight_on_model_support = c.branchingsupport_max_weight_on_model.getFloat();
         break;
     }
@@ -692,6 +694,14 @@ bool SLAPrint::attach_imported_support(const indexed_triangle_set &its)
         return false;
     // Single-object scope (per design): attach to the first object.
     m_objects.front()->set_imported_support_mesh(its);
+    return true;
+}
+
+bool SLAPrint::attach_prior_pillars(const sla::PriorPillars &pillars)
+{
+    if (m_objects.empty())
+        return false;
+    m_objects.front()->set_prior_pillars(pillars);
     return true;
 }
 
