@@ -10,6 +10,11 @@
 #include <libslic3r/SLA/Pad.hpp>
 #include <libslic3r/SLA/SupportPointGenerator.hpp>
 #include <libslic3r/SLA/ZCorrection.hpp>
+// Phase 3 of support_points() needs dir_to_spheric() and per-point mesh
+// normals; the overhang predicate itself arrives with SLA/SupportTree.hpp,
+// which SLAPrintSteps.hpp already pulls in.
+#include <libslic3r/Geometry.hpp>
+#include <libslic3r/MeshNormals.hpp>
 #include <libslic3r/ElephantFootCompensation.hpp>
 #include <libslic3r/CSGMesh/ModelToCSGMesh.hpp>
 #include <libslic3r/CSGMesh/SliceCSGMesh.hpp>
@@ -895,6 +900,37 @@ void SLAPrint::Steps::support_points(SLAPrintObject &po)
         config.head_diameter = float(cfg.branchingsupport_head_front_diameter);
         break;
     }
+
+    // Inputs for the Phase 3 overhang filter further down. They get their OWN
+    // switch rather than riding along with head_diameter above, because the two
+    // group the tree types DIFFERENTLY and the split is not a mistake:
+    //
+    //   head_diameter (above)   Default + Organic | Branching
+    //   these two (below)       Default | Branching + Organic
+    //
+    // The grouping here is not a free choice - it has to be whatever
+    // make_support_cfg() (SLAPrint.cpp) does, because Phase 3 must reach the
+    // same verdict as the support tree, which reads the config that function
+    // builds. There, Branching falls through into Organic and both take the
+    // branchingsupport_ keys, for BOTH the critical angle (-> the config's
+    // overhang_angle_threshold) and half the head diameter (-> its
+    // head_front_radius_mm, the eps the tree hands to normals()). Folding
+    // Organic in with Default here - as head_diameter does - would leave step 5
+    // and step 6 judging an Organic build against different settings.
+    double overhang_threshold_rad = 0.;
+    double normal_eps_mm          = 0.;
+
+    switch (cfg.support_tree_type) {
+    case SupportTreeType::Default:
+        overhang_threshold_rad = cfg.support_critical_angle.getFloat() * PI / 180.0;
+        normal_eps_mm          = 0.5 * cfg.support_head_front_diameter.getFloat();
+        break;
+    case SupportTreeType::Branching:
+    case SupportTreeType::Organic:
+        overhang_threshold_rad = cfg.branchingsupport_critical_angle.getFloat() * PI / 180.0;
+        normal_eps_mm          = 0.5 * cfg.branchingsupport_head_front_diameter.getFloat();
+        break;
+    }
     
     // copy current configuration for sampling islands
 #ifdef USE_ISLAND_GUI_FOR_SETTINGS
@@ -960,6 +996,56 @@ void SLAPrint::Steps::support_points(SLAPrintObject &po)
     double allowed_move = grid_pitch + std::numeric_limits<float>::epsilon();
     SupportPoints support_points =
         move_on_mesh_surface(layer_support_points, emesh, allowed_move, cancel);
+
+    // Phase 3: drop the points whose surface is not tilted far enough downwards
+    // to count as an overhang. This is the ONLY place the overhang angle is
+    // applied - the support tree steps do not repeat it - so the list exported
+    // by --export-support-points describes exactly the points that will grow a
+    // head (capability sla-overhang-threshold-semantics).
+    //
+    // The position in this function is not free; all three bounds are load
+    // bearing:
+    //   * NOT before move_on_mesh_surface(). Normals have to be taken at the
+    //     coordinates that were snapped onto the mesh. A point still sitting at
+    //     its sampling layer height can be a whole layer off the surface, and
+    //     the closest-face projection would then report a neighbouring face.
+    //   * NOT after the permanent_supports append below. Those are the caller's
+    //     own points; filtering them here would undo the exemption that lets a
+    //     user place a support anywhere they like.
+    //   * NOT after filter_support_points_by_modifiers(). An enforcer means
+    //     "put supports here", and running it later would let an enforcer
+    //     resurrect a point this filter just rejected.
+    //
+    // There is deliberately NO short-circuit for a zero threshold: the test
+    // still rejects upward-facing normals, and skipping it would leave step 5
+    // and step 6 looking at different point sets.
+    const size_t pts_before_overhang_filter = support_points.size();
+    if (!support_points.empty()) {
+        PointSet point_matrix(support_points.size(), 3);
+        for (size_t i = 0; i < support_points.size(); ++i)
+            point_matrix.row(Eigen::Index(i)) = support_points[i].pos.cast<double>();
+
+        // Same mesh, same eps and same routine the support tree uses, so a
+        // point that survives here cannot be re-judged differently there.
+        PointSet nmls = Slic3r::normals(ex_tbb, point_matrix, emesh,
+                                        normal_eps_mm, cancel);
+
+        SupportPoints kept;
+        kept.reserve(support_points.size());
+        for (size_t i = 0; i < support_points.size(); ++i) {
+            Vec3d n = nmls.row(Eigen::Index(i));
+            const double polar = Geometry::dir_to_spheric(n).first;
+            if (sla::passes_overhang_filter(polar, overhang_threshold_rad))
+                kept.push_back(support_points[i]);
+        }
+
+        support_points = std::move(kept);
+    }
+
+    BOOST_LOG_TRIVIAL(debug)
+        << "Overhang filter kept " << support_points.size() << " of "
+        << pts_before_overhang_filter << " support point(s) at a threshold of "
+        << overhang_threshold_rad * 180.0 / PI << " deg";
 
     // The Generator count with permanent support positions but do not convert to LayerSupportPoints.
     // To preserve permanent 3d position it is necessary to append points after move_on_mesh_surface
