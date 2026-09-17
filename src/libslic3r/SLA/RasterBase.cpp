@@ -21,6 +21,16 @@
 #include <intrin.h>
 #endif
 
+// The fixed-block preview kernel (design D13) sums bytes with SSE2's
+// _mm_sad_epu8, which every x86-64 CPU has. ARM64EC also defines _M_X64 but
+// only emulates these intrinsics, so it takes the scalar kernel like arm64.
+#if (defined(_M_X64) && !defined(_M_ARM64EC)) || defined(__x86_64__)
+#include <emmintrin.h>
+#define SLA_PREVIEW_SAD_SSE2 1
+#else
+#define SLA_PREVIEW_SAD_SSE2 0
+#endif
+
 #include "agg/agg_gamma_functions.h"
 
 namespace Slic3r { namespace sla {
@@ -181,56 +191,18 @@ void preview_box_downscale_integer_reference(const uint8_t *src, size_t w,
     }
 }
 
-// Row-major fast path (design D3) for single-channel buffers. Same pixels, same
-// unsigned sums, same truncating division as the reference, so the same bytes;
-// only the visiting order changes. For every destination row, each of its n
-// source rows is walked left to right over columns [0, new_w * n) while the
-// per-block totals accumulate in `sums`, and all-zero 8-byte words -- the black
-// background -- are skipped whole. A word may straddle two blocks; a zero word
-// adds nothing to either, and a non-zero one is attributed byte by byte.
-static void preview_box_downscale_integer(const uint8_t *src, size_t w,
-                                          uint8_t *dst, size_t new_w, size_t new_h,
-                                          size_t num_components, size_t n)
-{
-    if (num_components != 1 || !raster_fastpath_enabled()) {
-        preview_box_downscale_integer_reference(src, w, dst, new_w, new_h, num_components, n);
-        return;
-    }
-
-    const unsigned area = static_cast<unsigned>(n * n);
-    const size_t   span = new_w * n;             // columns read per source row
-    std::vector<unsigned> sums(new_w);
-
-    for (size_t dy = 0; dy < new_h; ++dy) {
-        std::fill(sums.begin(), sums.end(), 0u);
-        const uint8_t *block_row = src + (dy * n) * w;
-        for (size_t sy = 0; sy < n; ++sy) {
-            const uint8_t *row = block_row + sy * w;
-            size_t x = 0;
-            // x + 8 <= span keeps every load inside columns [0, new_w * n).
-            for (; x + 8 <= span; x += 8) {
-                if (load_u64(row + x) == 0) continue;
-                // One division per non-zero word; a counter tracks block edges.
-                size_t bx = x / n, offset = x - bx * n;
-                for (size_t i = x; i < x + 8; ++i) {
-                    sums[bx] += row[i];
-                    if (++offset == n) { offset = 0; ++bx; }
-                }
-            }
-            for (; x < span; ++x)                    // tail shorter than 8 bytes
-                sums[x / n] += row[x];
-        }
-        for (size_t dx = 0; dx < new_w; ++dx)
-            dst[dy * new_w + dx] = static_cast<uint8_t>(sums[dx] / area);
-    }
-}
-
-// Accumulate one row of target blocks, columns [dx0, dx1), exactly as
-// preview_box_downscale_integer() does for a whole row: the same source pixels,
-// the same additions, the same truncating division.
-static void preview_block_row(const uint8_t *src, size_t w, uint8_t *dst, size_t new_w,
-                              size_t dy, size_t dx0, size_t dx1, size_t n,
-                              std::vector<unsigned> &sums)
+// Row-major accumulation (design D3) of one row of target blocks, columns
+// [dx0, dx1), for any n. Same pixels, same unsigned sums, same truncating
+// division as the reference, so the same bytes; only the visiting order
+// changes. Each of the n source rows is walked left to right over the columns
+// of these blocks while the per-block totals accumulate in `sums`, and all-zero
+// 8-byte words -- the black background -- are skipped whole. A word may
+// straddle two blocks; a zero word adds nothing to either, and a non-zero one is
+// attributed byte by byte. preview_block_row() sends n = 4, 5, 8 and 10 to the
+// fixed-block kernel below instead; every other n still comes here.
+static void preview_block_row_generic(const uint8_t *src, size_t w, uint8_t *dst, size_t new_w,
+                                      size_t dy, size_t dx0, size_t dx1, size_t n,
+                                      std::vector<unsigned> &sums)
 {
     const unsigned area = static_cast<unsigned>(n * n);
     const size_t   xa = dx0 * n, xb = dx1 * n;   // source columns of these blocks
@@ -254,6 +226,151 @@ static void preview_block_row(const uint8_t *src, size_t w, uint8_t *dst, size_t
     }
     for (size_t dx = dx0; dx < dx1; ++dx)
         dst[dy * new_w + dx] = static_cast<uint8_t>(sums[dx] / area);
+}
+
+namespace {
+
+// Sum of the len bytes [p, p + len), 1 <= len <= 8. Nothing outside that range
+// is read: the bytes are copied into a zeroed 64-bit word, so the high bytes the
+// copy does not reach are 0 and add nothing. memcpy has no alignment
+// requirement, and with len constant at every call site it compiles to a plain
+// load. On x86-64, _mm_sad_epu8 against zero adds all eight bytes of the word
+// in one instruction; the scalar version adds the same bytes one by one.
+inline unsigned sum_bytes_upto8_scalar(const uint8_t *p, size_t len)
+{
+    assert(len >= 1 && len <= 8);
+    unsigned s = 0;
+    for (size_t i = 0; i < len; ++i)
+        s += p[i];
+    return s;
+}
+
+inline unsigned sum_bytes_upto8(const uint8_t *p, size_t len)
+{
+#if SLA_PREVIEW_SAD_SSE2
+    assert(len >= 1 && len <= 8);
+    uint64_t word = 0;
+    std::memcpy(&word, p, len);
+    const __m128i v = _mm_cvtsi64_si128(static_cast<int64_t>(word));
+    return static_cast<unsigned>(_mm_cvtsi128_si32(_mm_sad_epu8(v, _mm_setzero_si128())));
+#else
+    return sum_bytes_upto8_scalar(p, len);
+#endif
+}
+
+// Fixed-block kernel (design D13), row-major like D3: for each of the N source
+// rows of one target row, add block dx's N bytes [dx * N, dx * N + N) into
+// sums[dx]. The block total is built in a local and stored once per block per
+// row, so no store is read back by the very next byte. N = 10 is read as 8
+// bytes and then 2; every read stays inside its block. ScalarKernel selects the
+// byte-by-byte sum; only test_only_preview_box_downscale_integer() sets it.
+template<size_t N, bool ScalarKernel>
+inline void accumulate_rows_fixed(const uint8_t *block_row, size_t w, unsigned *sums,
+                                  size_t dx0, size_t dx1)
+{
+    for (size_t sy = 0; sy < N; ++sy) {
+        const uint8_t *row = block_row + sy * w;
+        for (size_t dx = dx0; dx < dx1; ++dx) {
+            const uint8_t *p = row + dx * N;
+            unsigned block = 0;
+            size_t   i     = 0;
+            // ScalarKernel is a compile-time constant: each call is a direct,
+            // inlinable call and the other branch is dropped.
+            for (; i + 8 <= N; i += 8)
+                block += ScalarKernel ? sum_bytes_upto8_scalar(p + i, 8) : sum_bytes_upto8(p + i, 8);
+            if (i < N)
+                block += ScalarKernel ? sum_bytes_upto8_scalar(p + i, N - i)
+                                      : sum_bytes_upto8(p + i, N - i);
+            sums[dx] += block;
+        }
+    }
+}
+
+// The truncating division of preview_block_row_generic(), with the divisor a
+// compile-time constant so the compiler can turn it into a shift (N = 4, 8) or a
+// multiply (N = 5, 10). The language fixes the result, so it is the same value.
+template<size_t N>
+inline void divide_fixed(const unsigned *sums, uint8_t *out, size_t dx0, size_t dx1)
+{
+    constexpr unsigned area = static_cast<unsigned>(N * N);
+    for (size_t dx = dx0; dx < dx1; ++dx)
+        out[dx] = static_cast<uint8_t>(sums[dx] / area);
+}
+
+template<size_t N, bool ScalarKernel>
+inline void preview_block_row_fixed(const uint8_t *block_row, size_t w, unsigned *sums,
+                                    uint8_t *out, size_t dx0, size_t dx1)
+{
+    std::fill(sums + dx0, sums + dx1, 0u);
+    accumulate_rows_fixed<N, ScalarKernel>(block_row, w, sums, dx0, dx1);
+    divide_fixed<N>(sums, out, dx0, dx1);
+}
+
+// Accumulate one row of target blocks, columns [dx0, dx1): the same source
+// pixels, the same unsigned sums and the same truncating division as the
+// reference, hence the same bytes. The factors in use (n = 10 on 16K, n = 5 on
+// 8K) and the other two that fit a tile (4, 8) take the fixed-block kernel; any
+// other n goes through the byte-by-byte walk unchanged.
+//
+// Callers keep every block inside the buffer: dx1 <= new_w with
+// new_w * n <= w, and dy < new_h with new_h * n <= h.
+template<bool ScalarKernel>
+void preview_block_row_select(const uint8_t *src, size_t w, uint8_t *dst, size_t new_w,
+                              size_t dy, size_t dx0, size_t dx1, size_t n,
+                              std::vector<unsigned> &sums)
+{
+    const uint8_t *const block_row = src + (dy * n) * w;
+    unsigned *const      s         = sums.data();
+    uint8_t *const       out       = dst + dy * new_w;
+
+    switch (n) {
+    case 4:  preview_block_row_fixed<4, ScalarKernel>(block_row, w, s, out, dx0, dx1);  return;
+    case 5:  preview_block_row_fixed<5, ScalarKernel>(block_row, w, s, out, dx0, dx1);  return;
+    case 8:  preview_block_row_fixed<8, ScalarKernel>(block_row, w, s, out, dx0, dx1);  return;
+    case 10: preview_block_row_fixed<10, ScalarKernel>(block_row, w, s, out, dx0, dx1); return;
+    default: preview_block_row_generic(src, w, dst, new_w, dy, dx0, dx1, n, sums); return;
+    }
+}
+
+} // namespace
+
+// The engine's row accumulation: the SSE2 kernel wherever it is compiled in.
+static void preview_block_row(const uint8_t *src, size_t w, uint8_t *dst, size_t new_w,
+                              size_t dy, size_t dx0, size_t dx1, size_t n,
+                              std::vector<unsigned> &sums)
+{
+    preview_block_row_select<false>(src, w, dst, new_w, dy, dx0, dx1, n, sums);
+}
+
+// For tests only (tasks 2.27); see the declaration in RasterBase.hpp.
+void test_only_preview_box_downscale_integer(const uint8_t *src, size_t w,
+                                             uint8_t *dst, size_t new_w, size_t new_h,
+                                             size_t n, bool scalar_kernel)
+{
+    std::vector<unsigned> sums(new_w);
+    for (size_t dy = 0; dy < new_h; ++dy) {
+        if (scalar_kernel)
+            preview_block_row_select<true>(src, w, dst, new_w, dy, 0, new_w, n, sums);
+        else
+            preview_block_row(src, w, dst, new_w, dy, 0, new_w, n, sums);
+    }
+}
+
+// Fast path for single-channel buffers: every target row through
+// preview_block_row(), over all of its columns. Anything else, or
+// SLA_RASTER_FASTPATH=0, takes the reference unchanged.
+static void preview_box_downscale_integer(const uint8_t *src, size_t w,
+                                          uint8_t *dst, size_t new_w, size_t new_h,
+                                          size_t num_components, size_t n)
+{
+    if (num_components != 1 || !raster_fastpath_enabled()) {
+        preview_box_downscale_integer_reference(src, w, dst, new_w, new_h, num_components, n);
+        return;
+    }
+
+    std::vector<unsigned> sums(new_w);
+    for (size_t dy = 0; dy < new_h; ++dy)
+        preview_block_row(src, w, dst, new_w, dy, 0, new_w, n, sums);
 }
 
 // Tile-aware downscale (design D6 (4)). Requires T % n == 0, so every n x n

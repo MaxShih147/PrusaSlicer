@@ -397,6 +397,18 @@ void preview_box_downscale_integer_reference(const uint8_t *src, size_t w,
                                              uint8_t *dst, size_t new_w, size_t new_h,
                                              size_t num_components, size_t n);
 
+// For tests only (tasks 2.27): the single-channel integer downscale fast path on
+// a raw buffer, i.e. the pixels PNGPreviewEncoder hands to the PNG writer, with
+// the same preconditions as the reference above. Unlike the encoder it ignores
+// SLA_RASTER_FASTPATH. With scalar_kernel the fixed-block kernel (design D13,
+// n = 4, 5, 8, 10) adds bytes one by one -- the kernel builds without SSE2 use --
+// instead of with _mm_sad_epu8, so both run on the machine running the tests.
+// Any other n takes the byte-by-byte row walk either way. The engine never
+// calls this.
+void test_only_preview_box_downscale_integer(const uint8_t *src, size_t w,
+                                             uint8_t *dst, size_t new_w, size_t new_h,
+                                             size_t n, bool scalar_kernel);
+
 // SLA_RASTER_FASTPATH switch (design D8). Returns false only when the variable is
 // set to exactly "0"; unset or any other value keeps the fast paths on. The
 // environment is read once per process, on first call; later changes to the

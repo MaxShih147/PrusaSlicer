@@ -27,6 +27,21 @@
 #include "libslic3r/SLA/AGGRaster.hpp"
 #include "libslic3r/SLA/RasterBase.hpp"
 
+// Page protection for the guard page tests of the fixed-block preview kernel.
+// Last, so the Windows macros cannot reach the headers above.
+#if defined(_WIN32)
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <windows.h>
+#elif defined(__unix__) || defined(__APPLE__)
+#  include <sys/mman.h>
+#  include <unistd.h>
+#endif
+
 using namespace Slic3r;
 
 namespace {
@@ -2360,4 +2375,395 @@ TEST_CASE("A random 8K layer matches the dense pipeline byte for byte",
     REQUIRE(marked_tiles(*tiles).empty());
     REQUIRE(raster.read_pixel(0, 0) == 0);
     REQUIRE(raster.read_pixel(W - 1, H - 1) == 0);
+}
+
+// ---------------------------------------------------------------------------
+// Fixed-block preview kernel (design D13, tasks 2.27).
+//
+// n = 4, 5, 8 and 10 downscale through a kernel that sums each block with
+// _mm_sad_epu8, or byte by byte on builds without SSE2. Every test compares
+// with preview_box_downscale_integer_reference() and runs the kernel both ways
+// through sla::test_only_preview_box_downscale_integer(), so the scalar kernel
+// is exercised on x86-64 as well.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+const size_t FixedBlockFactors[] = {4, 5, 8, 10};
+
+// The reference downscale of src, required equal byte for byte to the engine
+// kernel and to the scalar kernel (both through the test entry) and, unless
+// through_encoder is false, to the pixels PNGPreviewEncoder writes. Returns the
+// reference pixels.
+std::vector<uint8_t> require_fixed_block_kernels_match(const uint8_t *src, size_t w, size_t h,
+                                                       size_t n, bool through_encoder = true)
+{
+    INFO("w = " << w << ", h = " << h << ", n = " << n);
+
+    size_t new_w = 0, new_h = 0;
+    preview_size(w, h, n, new_w, new_h);
+    REQUIRE(new_w == w / n);          // whole blocks only, as the fixed-block guard needs
+    REQUIRE(new_h == h / n);
+    REQUIRE(new_w >= 1);
+    REQUIRE(new_h >= 1);
+
+    std::vector<uint8_t> expected(new_w * new_h);
+    sla::preview_box_downscale_integer_reference(src, w, expected.data(), new_w, new_h, 1, n);
+
+    for (bool scalar : {false, true}) {
+        INFO((scalar ? "scalar kernel" : "engine kernel"));
+        // Every pixel starts at the complement of its expected value, so one the
+        // kernel never writes cannot match by accident.
+        std::vector<uint8_t> out(expected.size());
+        for (size_t i = 0; i < out.size(); ++i) out[i] = uint8_t(~expected[i]);
+
+        sla::test_only_preview_box_downscale_integer(src, w, out.data(), new_w, new_h, n, scalar);
+        REQUIRE(first_difference(out, expected) == NoDifference);
+    }
+
+    if (through_encoder) {
+        INFO("PNGPreviewEncoder");
+        const std::vector<uint8_t> encoded =
+            decode_preview(sla::PNGPreviewEncoder{1.0 / double(n)}(src, w, h, 1), new_w, new_h);
+        REQUIRE(first_difference(encoded, expected) == NoDifference);
+    }
+    return expected;
+}
+
+// Sets the n x n block (bx, by) so that its bytes add up to `sum`: as many 255s
+// as fit, then the remainder, then zeros, in row-major order within the block.
+// `reversed` lays them out from the block's last byte backwards, so the
+// partial byte lands near both ends across the blocks of one test.
+void fill_block_with_sum(std::vector<uint8_t> &px, size_t w, size_t n, size_t bx, size_t by,
+                         unsigned sum, bool reversed)
+{
+    const size_t area = n * n;
+    for (size_t j = 0; j < area; ++j) {
+        const unsigned before = unsigned(255 * j);        // held by the bytes placed so far
+        uint8_t v = 0;
+        if (sum >= before + 255)
+            v = 255;
+        else if (sum > before)
+            v = uint8_t(sum - before);
+
+        const size_t k = reversed ? area - 1 - j : j;
+        px[(by * n + k / n) * w + bx * n + k % n] = v;
+    }
+}
+
+// `size` readable bytes placed so that the byte just past their end
+// (Side::End) or just before their start (Side::Start) lies on a page the
+// process may not touch. A read one byte too far faults and ends the test run
+// instead of passing silently.
+class GuardedBuffer
+{
+public:
+    enum class Side { Start, End };
+
+    GuardedBuffer(size_t size, Side side)
+    {
+        const size_t page = page_size();
+        if (page == 0 || size == 0) return;
+
+        const size_t readable = (size + page - 1) / page * page;
+        m_total = readable + page;
+        if (!reserve()) return;
+
+        uint8_t *const guard = side == Side::End ? m_base + readable : m_base;
+        if (!protect(guard, page)) return;
+
+        m_data = side == Side::End ? m_base + readable - size : m_base + page;
+    }
+
+    ~GuardedBuffer() { release(); }
+
+    GuardedBuffer(const GuardedBuffer &)            = delete;
+    GuardedBuffer &operator=(const GuardedBuffer &) = delete;
+
+    // Null when this platform has no page protection or setting it up failed.
+    uint8_t *data() const { return m_data; }
+
+private:
+#if defined(_WIN32)
+    static size_t page_size()
+    {
+        SYSTEM_INFO info;
+        GetSystemInfo(&info);
+        return size_t(info.dwPageSize);
+    }
+    bool reserve()
+    {
+        m_base = static_cast<uint8_t *>(
+            VirtualAlloc(nullptr, m_total, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        return m_base != nullptr;
+    }
+    static bool protect(uint8_t *p, size_t len)
+    {
+        DWORD old = 0;
+        return VirtualProtect(p, len, PAGE_NOACCESS, &old) != 0;
+    }
+    void release()
+    {
+        if (m_base != nullptr) VirtualFree(m_base, 0, MEM_RELEASE);
+    }
+#elif defined(__unix__) || defined(__APPLE__)
+    static size_t page_size()
+    {
+        const long p = sysconf(_SC_PAGESIZE);
+        return p > 0 ? size_t(p) : 0;
+    }
+    bool reserve()
+    {
+        void *p = mmap(nullptr, m_total, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (p == MAP_FAILED) return false;
+        m_base = static_cast<uint8_t *>(p);
+        return true;
+    }
+    static bool protect(uint8_t *p, size_t len) { return mprotect(p, len, PROT_NONE) == 0; }
+    void release()
+    {
+        if (m_base != nullptr) munmap(m_base, m_total);
+    }
+#else
+    static size_t page_size() { return 0; }
+    bool reserve() { return false; }
+    static bool protect(uint8_t *, size_t) { return false; }
+    void release() {}
+#endif
+
+    uint8_t *m_base  = nullptr;
+    size_t   m_total = 0;
+    uint8_t *m_data  = nullptr;
+};
+
+} // namespace
+
+TEST_CASE("Fixed-block preview kernel matches reference for every block value", "[raster-scan]")
+{
+    for (size_t n : FixedBlockFactors) {
+        // Two rows of 256 uniform blocks: value v left to right, then 255 - v,
+        // so every value has different neighbours in the two rows.
+        const size_t W = 256 * n, H = 2 * n;
+        std::vector<uint8_t> px(W * H);
+        for (size_t y = 0; y < H; ++y)
+            for (size_t x = 0; x < W; ++x) {
+                const size_t v = x / n;
+                px[y * W + x] = uint8_t(y < n ? v : 255 - v);
+            }
+
+        const std::vector<uint8_t> prev = require_fixed_block_kernels_match(px.data(), W, H, n);
+
+        // A uniform block averages to its own value.
+        size_t wrong = 0;
+        for (size_t dx = 0; dx < 256; ++dx) {
+            if (prev[dx] != dx) ++wrong;
+            if (prev[256 + dx] != 255 - dx) ++wrong;
+        }
+        INFO("n = " << n);
+        REQUIRE(wrong == 0);
+    }
+}
+
+TEST_CASE("Fixed-block preview kernel divides every possible block sum like the reference",
+          "[raster-scan]")
+{
+    for (size_t n : FixedBlockFactors) {
+        // One row of blocks, block bx summing to bx: every sum from 0 to
+        // 255 n^2 (25,501 of them for n = 10) goes through the constant divisor.
+        const size_t area   = n * n;
+        const size_t blocks = 255 * area + 1;
+        const size_t W = blocks * n, H = n;
+        std::vector<uint8_t> px(W * H, 0);
+        for (size_t bx = 0; bx < blocks; ++bx)
+            fill_block_with_sum(px, W, n, bx, 0, unsigned(bx), bx % 2 == 1);
+
+        const std::vector<uint8_t> prev = require_fixed_block_kernels_match(px.data(), W, H, n);
+
+        size_t wrong = 0;
+        for (size_t bx = 0; bx < blocks; ++bx)
+            if (prev[bx] != bx / area) ++wrong;
+        INFO("n = " << n);
+        REQUIRE(wrong == 0);
+    }
+}
+
+TEST_CASE("Fixed-block preview kernel attributes every pixel to its own block", "[raster-scan]")
+{
+    for (size_t n : FixedBlockFactors) {
+        // 3 x 2 blocks of 100, except that each block's first pixel is 99, so
+        // every block sums to 100 n^2 - 1 and averages to 99. Adding 1 to any one
+        // pixel lifts exactly its own block to 100: a byte counted in the wrong
+        // block, or not counted, changes the output.
+        const size_t W = 3 * n, H = 2 * n;
+        std::vector<uint8_t> base(W * H, 100);
+        for (size_t by = 0; by < 2; ++by)
+            for (size_t bx = 0; bx < 3; ++bx)
+                base[by * n * W + bx * n] = 99;
+
+        for (size_t y = 0; y < H; ++y)
+            for (size_t x = 0; x < W; ++x) {
+                INFO("pixel (" << x << ", " << y << ")");
+                std::vector<uint8_t> px = base;
+                ++px[y * W + x];
+
+                const std::vector<uint8_t> prev =
+                    require_fixed_block_kernels_match(px.data(), W, H, n);
+
+                const size_t lifted = (y / n) * 3 + x / n;
+                size_t wrong = 0;
+                for (size_t i = 0; i < prev.size(); ++i)
+                    if (prev[i] != (i == lifted ? 100 : 99)) ++wrong;
+                REQUIRE(wrong == 0);
+            }
+    }
+}
+
+TEST_CASE("Fixed-block preview kernel matches reference on stripes that are not multiples of 8",
+          "[raster-scan]")
+{
+    for (size_t n : FixedBlockFactors)
+        for (size_t period : {size_t(3), size_t(7), size_t(11)})
+            for (bool diagonal : {false, true})
+                // Whole blocks only, and n - 1 extra columns and rows past the
+                // last whole block, which the fast path must leave unread.
+                for (size_t extra : {size_t(0), n - 1}) {
+                    INFO("period " << period << (diagonal ? ", diagonal" : ", vertical")
+                                   << ", extra " << extra);
+                    const size_t W = 24 * n + extra, H = 6 * n + extra;
+                    std::vector<uint8_t> px(W * H);
+                    for (size_t y = 0; y < H; ++y)
+                        for (size_t x = 0; x < W; ++x) {
+                            const size_t phase = (diagonal ? x + 2 * y : x) % period;
+                            px[y * W + x] = phase == 0 ? uint8_t(255) : uint8_t(19 * phase);
+                        }
+                    require_fixed_block_kernels_match(px.data(), W, H, n);
+                }
+}
+
+TEST_CASE("Fixed-block preview kernel does not depend on where the buffer starts",
+          "[raster-scan]")
+{
+    std::mt19937 rng(20260917u);
+
+    for (size_t n : FixedBlockFactors) {
+        const size_t W = 13 * n + 3, H = 4 * n + 1;
+        std::vector<uint8_t> px(W * H);
+        for (uint8_t &v : px)
+            v = rng() % 3 == 0 ? uint8_t(0) : uint8_t(rng() % 256);
+
+        // The same pixels copied to 16 successive offsets, so the first byte
+        // sits at every alignment modulo 16.
+        std::vector<uint8_t> storage(W * H + 16, 0);
+        std::vector<uint8_t> first;
+        for (size_t offset = 0; offset < 16; ++offset) {
+            INFO("n = " << n << ", offset " << offset);
+            std::fill(storage.begin(), storage.end(), uint8_t(0));
+            std::copy(px.begin(), px.end(), storage.begin() + std::ptrdiff_t(offset));
+
+            const std::vector<uint8_t> prev =
+                require_fixed_block_kernels_match(storage.data() + offset, W, H, n);
+            if (offset == 0)
+                first = prev;
+            else
+                REQUIRE(first_difference(prev, first) == NoDifference);
+        }
+    }
+}
+
+TEST_CASE("Fixed-block preview kernel never reads past either end of the buffer",
+          "[raster-scan]")
+{
+    for (GuardedBuffer::Side side : {GuardedBuffer::Side::End, GuardedBuffer::Side::Start})
+        for (size_t n : FixedBlockFactors)
+            for (size_t blocks_x : {size_t(1), size_t(3), size_t(7), size_t(13)})
+                for (size_t blocks_y : {size_t(1), size_t(2), size_t(5)}) {
+                    INFO((side == GuardedBuffer::Side::End ? "guard after" : "guard before")
+                         << ", n = " << n << ", " << blocks_x << " x " << blocks_y << " blocks");
+
+                    // Whole blocks only: the last block read ends on the buffer's
+                    // last byte and the first starts on its first byte, so the
+                    // guard page is one byte away from a block that is read.
+                    const size_t W = blocks_x * n, H = blocks_y * n;
+                    GuardedBuffer buf(W * H, side);
+                    if (buf.data() == nullptr) {
+                        WARN("No guard page available on this platform; skipping.");
+                        return;
+                    }
+                    std::fill(buf.data(), buf.data() + W * H, uint8_t(255));   // a full plate
+
+                    const std::vector<uint8_t> prev =
+                        require_fixed_block_kernels_match(buf.data(), W, H, n);
+                    REQUIRE(size_t(std::count(prev.begin(), prev.end(), uint8_t(255))) ==
+                            prev.size());
+
+                    // The tile-aware encoder over the same buffer, every tile
+                    // written, reads the same blocks.
+                    sla::TileMap tiles(W, H);
+                    for (size_t y = 0; y < H; ++y)
+                        tiles.mark_span(0, y, W);
+                    const std::vector<uint8_t> sparse = decode_preview(
+                        sla::SparsePNGPreviewEncoder{1.0 / double(n)}(buf.data(), W, H, 1, tiles),
+                        W / n, H / n);
+                    REQUIRE(first_difference(sparse, prev) == NoDifference);
+                }
+}
+
+TEST_CASE("Previews of an anti-aliased full-plate slab match the reference",
+          "[raster-scan][tiles]")
+{
+    if (!tile_tracking_available()) return;
+
+    struct Slab {
+        size_t w, h, n;
+        std::vector<std::pair<double, double>> corners;   // pixels, y down
+        const char *name;
+    };
+
+    // Slightly rotated quads over most of the plate, like fullplate-16k-slab:
+    // anti-aliased along the whole perimeter, solid 255 inside, and a margin of
+    // clean tiles on every side.
+    const std::vector<Slab> slabs = {
+        {15120, 6230, 10,
+         {{417.25, 220.5}, {14703.75, 231.25}, {14698.5, 6009.5}, {411.75, 5998.25}},
+         "16K, n = 10"},
+        {7536, 3240, 5,
+         {{208.25, 110.5}, {7328.75, 116.25}, {7326.5, 3120.5}, {205.75, 3114.25}},
+         "8K, n = 5"},
+    };
+
+    for (const Slab &s : slabs) {
+        INFO(s.name);
+        sla::RasterGrayscaleAAGammaPower raster({s.w, s.h}, {TileMmPerPx, TileMmPerPx}, {}, 1.);
+        raster.draw(pixel_polygon(s.h, s.corners));
+
+        const sla::TileMap *tiles = raster.written_tiles();
+        REQUIRE(tiles != nullptr);
+
+        const std::vector<uint8_t> px = raster_pixels(raster, s.w, s.h);
+        require_marks_cover_pixels(px, s.w, s.h, *tiles);    // I2 holds, so poisoning is safe
+
+        const size_t total = tiles->tiles_x() * tiles->tiles_y();
+        const size_t dirty = marked_tiles(*tiles).size();
+        REQUIRE(dirty * 10 > total * 8);      // mostly written, like the real slab
+        REQUIRE(dirty < total);               // with clean tiles left to skip
+
+        // Sparse encoder on the poisoned copy, dense encoder and reference on the
+        // real canvas: pixel for pixel, and the two PNG streams byte for byte.
+        const std::vector<uint8_t> poisoned = poison_clean_areas(px, s.w, s.h, *tiles);
+        const std::vector<uint8_t> prev =
+            require_sparse_preview_matches(poisoned, px, s.w, s.h, s.n, *tiles);
+
+        // Both kernels on the real canvas; the encoder was covered just above.
+        const std::vector<uint8_t> kernels =
+            require_fixed_block_kernels_match(px.data(), s.w, s.h, s.n, false);
+        REQUIRE(first_difference(kernels, prev) == NoDifference);
+
+        size_t white = 0, gray = 0;
+        for (uint8_t v : prev) {
+            if (v == 255) ++white;
+            else if (v != 0) ++gray;
+        }
+        REQUIRE(white * 10 > prev.size() * 8);   // solid interior
+        REQUIRE(gray > 0);                       // averaged anti-aliased edges
+    }
 }
