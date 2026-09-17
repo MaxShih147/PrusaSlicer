@@ -34,6 +34,9 @@
 #include <tuple>
 #include <vector>
 #include <cassert>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 //#include <libslic3r/ShortEdgeCollapse.hpp>
 
 #include <boost/log/trivial.hpp>
@@ -57,6 +60,10 @@
 #include "libslic3r/SLA/SupportIslands/SampleConfigFactory.hpp"
 #include "libslic3r/SLAPrint.hpp"
 #include "libslic3r/TriangleMesh.hpp"
+
+// Last on purpose: on MSVC this pulls in <windows.h>, whose macros must not leak
+// into the libslic3r headers above (see the note on ThreadBoundRasters).
+#include <tbb/enumerable_thread_specific.h>
 
 namespace Slic3r {
 
@@ -105,6 +112,63 @@ std::string PRINT_STEP_LABELS(size_t idx)
     }
     assert(false); return "Out of bounds!";
 }
+
+// Per-stage rasterization timing, enabled by SLA_RASTER_TIMING=1 (design D9).
+//
+// Every worker thread adds into its own slot of an enumerable_thread_specific, so
+// the per-layer path never takes a lock; the slots are merged once, after the
+// last layer. The result is written to stderr as exactly one line. It must never
+// reach stdout: the agent parses the "NN% => label" progress lines there, and
+// test_slice_progress_string_contract.py pins them.
+//
+// Stage totals are summed over threads, so they are thread-seconds; wall_s is
+// the elapsed time of the whole rasterization and is reported separately.
+class RasterStageClock
+{
+public:
+    using Duration = std::chrono::steady_clock::duration;
+
+    enum Stage : size_t {
+        Reset, DrawModel, PostProcess, DrawSupport, EncodeLayer, EncodePreview, StageCount
+    };
+
+    static bool requested()
+    {
+        const char *value = std::getenv("SLA_RASTER_TIMING");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }
+
+    void add(Stage stage, Duration elapsed) { m_totals.local().by_stage[stage] += elapsed; }
+
+    // The hooks SLAArchiveWriter::draw_layers() calls.
+    void add_reset(Duration elapsed) { add(Reset, elapsed); }
+    void add_encode_layer(Duration elapsed) { add(EncodeLayer, elapsed); }
+    void add_encode_preview(Duration elapsed) { add(EncodePreview, elapsed); }
+
+    void report(size_t layers, Duration wall) const
+    {
+        Totals sum;
+        for (const Totals &slot : m_totals)
+            for (size_t i = 0; i < StageCount; ++i)
+                sum.by_stage[i] += slot.by_stage[i];
+
+        const auto seconds = [](Duration d) { return std::chrono::duration<double>(d).count(); };
+        std::fprintf(stderr,
+                     "[raster-timing] {\"layers\":%zu,\"threads\":%zu,\"wall_s\":%.6f,\"thread_s\":{"
+                     "\"reset\":%.6f,\"draw_model\":%.6f,\"postprocess\":%.6f,\"draw_support\":%.6f,"
+                     "\"encode_layer\":%.6f,\"encode_preview\":%.6f}}\n",
+                     layers, m_totals.size(), seconds(wall),
+                     seconds(sum.by_stage[Reset]), seconds(sum.by_stage[DrawModel]), seconds(sum.by_stage[PostProcess]),
+                     seconds(sum.by_stage[DrawSupport]), seconds(sum.by_stage[EncodeLayer]), seconds(sum.by_stage[EncodePreview]));
+        std::fflush(stderr);
+    }
+
+private:
+    struct Totals {
+        std::array<Duration, StageCount> by_stage{}; // value-initialized: every stage starts at zero
+    };
+    tbb::enumerable_thread_specific<Totals> m_totals;
+};
 
 using namespace sla;
 
@@ -1682,25 +1746,45 @@ void SLAPrint::Steps::rasterize()
 
     execution::SpinningMutex<ExecutionTBB> slck;
 
+    // Null unless SLA_RASTER_TIMING=1; every timing statement below is skipped
+    // then, so the untimed path reads no clock.
+    std::unique_ptr<RasterStageClock> stage_clock_owner;
+    if (RasterStageClock::requested())
+        stage_clock_owner = std::make_unique<RasterStageClock>();
+    RasterStageClock *stage_clock = stage_clock_owner.get();
+
     // procedure to process one height level. This will run in parallel
     auto lvlfn =
-        [this, &slck, increment, &dstatus, &pst]
+        [this, &slck, increment, &dstatus, &pst, stage_clock]
         (sla::RasterBase& raster, size_t idx)
     {
         PrintLayer& printlayer = m_print->m_printer_input[idx];
         if(canceled()) return;
 
+        using Clock = std::chrono::steady_clock;
+        Clock::time_point t;
+        // Adds the time since t to `stage` and restarts t.
+        const auto lap = [stage_clock, &t](RasterStageClock::Stage stage) {
+            const Clock::time_point now = Clock::now();
+            stage_clock->add(stage, now - t);
+            t = now;
+        };
+
         // Three-stage dual-track rasterization:
         //  1) model track  — AA gamma (soft, anti-aliased edges)
+        if (stage_clock) t = Clock::now();
         for (const ExPolygon& poly : printlayer.transformed_slices())
             raster.draw(poly);
+        if (stage_clock) lap(RasterStageClock::DrawModel);
         //  2) post-process — SL1 blur + gray quantization on the MODEL ONLY
         //     (no-op for vector rasters / when no post-processor was injected)
         raster.apply_postprocess();
+        if (stage_clock) lap(RasterStageClock::PostProcess);
         //  3) support track — sharp binary, composited AFTER blur so support
         //     pixels are never softened and leave no background halo
         for (const ExPolygon& poly : printlayer.transformed_support_slices())
             raster.draw_binary(poly);
+        if (stage_clock) lap(RasterStageClock::DrawSupport);
 
         // Status indication guarded with the spinlock
         {
@@ -1718,8 +1802,14 @@ void SLAPrint::Steps::rasterize()
     if(canceled()) return;
 
     // Print all the layers in parallel
+    const auto raster_start = std::chrono::steady_clock::now();
     m_print->m_archiver->draw_layers(m_print->m_printer_input.size(), lvlfn,
-                                    [this]() { return canceled(); }, ex_tbb);
+                                    [this]() { return canceled(); }, ex_tbb, stage_clock);
+
+    // A canceled run did not rasterize every layer; its totals would mislead.
+    if (stage_clock && !canceled())
+        stage_clock->report(m_print->m_printer_input.size(),
+                            std::chrono::steady_clock::now() - raster_start);
 }
 
 std::string SLAPrint::Steps::label(SLAPrintObjectStep step)

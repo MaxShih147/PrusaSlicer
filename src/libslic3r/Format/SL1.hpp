@@ -21,6 +21,7 @@ class SL1Archive: public SLAArchiveWriter {
 protected:
     std::unique_ptr<sla::RasterBase> create_raster() const override;
     sla::RasterEncoder get_encoder() const override;
+    sla::SparseRasterEncoder get_sparse_encoder() const override;
 
     SLAPrinterConfig & cfg() { return m_cfg; }
     const SLAPrinterConfig & cfg() const { return m_cfg; }

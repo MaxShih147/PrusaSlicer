@@ -407,11 +407,18 @@ std::unique_ptr<sla::RasterBase> SL1Archive::create_raster() const
     // yields binary output). The dual-track pipeline runs this BEFORE drawing the
     // binary support, so support pixels are never blurred (see rasterize()).
     sla::RasterPostProcessor pp; // empty == no-op
+    bool pp_zero_preserving_pixel_local = false;
     if (m_cfg.anti_aliasing.getBool()) {
         const int aa_level_cfg        = m_cfg.anti_aliasing_level.getInt();
         const int anti_aliasing_level = 1 << (aa_level_cfg + 1); // 0,1,2 -> 2x,4x,8x
         const int gray_level          = m_cfg.gray_level.getInt();
         const int blur_config         = m_cfg.blur.getInt();
+
+        // Without blur, pp is only the quantization below: each pixel is
+        // computed from itself, and 0 is returned unchanged. That lets the
+        // raster quantize just the written tiles. Blur mixes neighbours and
+        // spreads into clean tiles, so it must keep the whole-buffer path.
+        pp_zero_preserving_pixel_local = (blur_config == 0);
 
         pp = [anti_aliasing_level, gray_level, blur_config]
              (void *ptr, size_t w, size_t h, size_t num_components)
@@ -470,7 +477,8 @@ std::unique_ptr<sla::RasterBase> SL1Archive::create_raster() const
         };
     }
 
-    return sla::create_raster_grayscale_aa(res, pxdim, gamma, tr, std::move(pp));
+    return sla::create_raster_grayscale_aa(res, pxdim, gamma, tr, std::move(pp),
+                                           pp_zero_preserving_pixel_local);
 }
 
 sla::RasterEncoder SL1Archive::get_encoder() const
@@ -487,6 +495,16 @@ sla::RasterEncoder SL1Archive::get_encoder() const
     // injected RasterPostProcessor (see create_raster), applied before the binary
     // support is drawn. The encoder is therefore a plain PNG writer.
     return sla::PNGRasterEncoder{};
+}
+
+sla::SparseRasterEncoder SL1Archive::get_sparse_encoder() const
+{
+    // Only the RLE path has a tile-aware encoder; the PNG writer reads the
+    // whole buffer anyway. Empty means draw_layers() uses get_encoder().
+    if (std::getenv("SLA_LAYER_RLE"))
+        return sla::SparseRLERasterEncoder{};
+
+    return {};
 }
 
 static void write_thumbnail(Zipper &zipper, const ThumbnailData &data)
