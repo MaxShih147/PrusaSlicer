@@ -1203,10 +1203,26 @@ void SLAPrint::Steps::generate_pad(SLAPrintObject &po) {
             // "No support/pad mesh generated" marker.
             //
             // Every other cause of an invalid pad stays fail-closed.
+            //
+            // The test used to be tree_mesh.empty() - no supports at all - and
+            // that missed the case where supports were grown but none of them
+            // reached the plate. routing_to_model() anchors a support to the
+            // model body when it can neither reach a nearby pillar nor the
+            // plate, and a pad has no footprint to grow from unless something
+            // stands on the plate. A run of exactly one such support therefore
+            // threw here and lost the support it had already built - which is
+            // every manual placement of a model-anchored support, since a
+            // manual generation grows one point at a time.
+            //
+            // An empty pad mesh IS that footprint being empty: create_pad()
+            // slices the support mesh upwards from the plate, and outside
+            // zero-elevation mode there is nothing else it could grow from. The
+            // configuration cannot be the cause here either - PadConfig's own
+            // validate() runs in SLAPrint::validate(), before any of this.
             const bool nothing_to_build_pad_from =
                 po.m_supportdata->pad_mesh.its.empty() &&
                 po.m_config.supports_enable.getBool() &&
-                po.m_supportdata->tree_mesh.empty();
+                !pcfg.embed_object.enabled;
 
             if (!nothing_to_build_pad_from)
                 throw Slic3r::SlicingError(
@@ -1214,7 +1230,7 @@ void SLAPrint::Steps::generate_pad(SLAPrintObject &po) {
                           "current configuration"));
 
             BOOST_LOG_TRIVIAL(warning)
-                << "Pad skipped: the support tree is empty, so there is no "
+                << "Pad skipped: nothing stands on the plate, so there is no "
                    "footprint to grow a pad from.";
 
             po.m_supportdata->pad_mesh = {};
