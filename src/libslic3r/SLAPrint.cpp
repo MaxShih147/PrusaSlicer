@@ -722,6 +722,14 @@ std::string SLAPrint::output_filename(const std::string &filename_base) const
 
 std::string SLAPrint::validate(std::vector<std::string>*) const
 {
+    return validate_error().message;
+}
+
+EngineError SLAPrint::validate_error() const
+{
+    // Every check, message and ordering below is the same as before this
+    // function existed; only the code, fields and values are new.
+
     for(SLAPrintObject * po : m_objects) {
 
         const ModelObject *mo = po->model_object();
@@ -730,32 +738,42 @@ std::string SLAPrint::validate(std::vector<std::string>*) const
         if(supports_en &&
            mo->sla_points_status == sla::PointsStatus::UserModified &&
            mo->sla_support_points.empty())
-            return _u8L("Cannot proceed without support points! "
-                     "Add support points or disable support generation.");
+            return make_engine_error(EngineErrorCode::SUPPORT_POINTS_REQUIRED,
+                         _u8L("Cannot proceed without support points! "
+                              "Add support points or disable support generation."),
+                         {"supports_enable"});
 
         sla::SupportTreeConfig cfg = make_support_cfg(po->config());
 
         double elv = cfg.object_elevation_mm;
-        
+
         sla::PadConfig padcfg = make_pad_cfg(po->config());
         sla::PadConfig::EmbedObject &builtinpad = padcfg.embed_object;
-        
+
         if(supports_en && !builtinpad.enabled && elv < cfg.head_fullwidth())
-            return _u8L(
-                "Elevation is too low for object. Use the \"Pad around "
-                "object\" feature to print the object without elevation.");
-        
+            return make_engine_error(EngineErrorCode::SUPPORT_ELEVATION_TOO_LOW,
+                         _u8L("Elevation is too low for object. Use the \"Pad around "
+                              "object\" feature to print the object without elevation."),
+                         {"support_object_elevation", "support_head_front_diameter",
+                          "support_pillar_diameter", "support_head_width",
+                          "support_head_penetration"},
+                         {{"min_support_object_elevation", cfg.head_fullwidth()},
+                          {"support_object_elevation", elv}});
+
         if(supports_en && builtinpad.enabled &&
            cfg.pillar_base_safety_distance_mm < builtinpad.object_gap_mm) {
-            return _u8L(
-                "The endings of the support pillars will be deployed on the "
-                "gap between the object and the pad. 'Support base safety "
-                "distance' has to be greater than the 'Pad object gap' "
-                "parameter to avoid this.");
+            return make_engine_error(EngineErrorCode::SUPPORT_PAD_GAP_CONFLICT,
+                         _u8L("The endings of the support pillars will be deployed on the "
+                              "gap between the object and the pad. 'Support base safety "
+                              "distance' has to be greater than the 'Pad object gap' "
+                              "parameter to avoid this."),
+                         {"support_base_safety_distance", "pad_object_gap"},
+                         {{"effective_support_base_safety_distance", cfg.pillar_base_safety_distance_mm},
+                          {"pad_object_gap", builtinpad.object_gap_mm}});
         }
-        
-        std::string pval = padcfg.validate();
-        if (!pval.empty()) return pval;
+
+        EngineError pval = padcfg.validate_error();
+        if (pval.failed()) return pval;
     }
 
     double expt_max = m_printer_config.max_exposure_time.getFloat();
@@ -763,43 +781,66 @@ std::string SLAPrint::validate(std::vector<std::string>*) const
     double expt_cur = m_material_config.exposure_time.getFloat();
 
     if (expt_cur < expt_min || expt_cur > expt_max)
-        return _u8L("Exposition time is out of printer profile bounds.");
+        return make_engine_error(EngineErrorCode::EXPOSURE_TIME_OUT_OF_RANGE,
+                     _u8L("Exposition time is out of printer profile bounds."),
+                     {"exposure_time"},
+                     {{"min_exposure_time", expt_min},
+                      {"max_exposure_time", expt_max},
+                      {"exposure_time", expt_cur}});
 
     double iexpt_max = m_printer_config.max_initial_exposure_time.getFloat();
     double iexpt_min = m_printer_config.min_initial_exposure_time.getFloat();
     double iexpt_cur = m_material_config.initial_exposure_time.getFloat();
 
     if (iexpt_cur < iexpt_min || iexpt_cur > iexpt_max)
-        return _u8L("Initial exposition time is out of printer profile bounds.");
+        return make_engine_error(EngineErrorCode::EXPOSURE_TIME_OUT_OF_RANGE,
+                     _u8L("Initial exposition time is out of printer profile bounds."),
+                     {"initial_exposure_time"},
+                     {{"min_initial_exposure_time", iexpt_min},
+                      {"max_initial_exposure_time", iexpt_max},
+                      {"initial_exposure_time", iexpt_cur}});
 
     for (const std::string& prefix : { "", "branching" }) {
+        // The branching variants have no counterpart in the agent's SLAConfig,
+        // so there is no panel field to point at: report the code alone.
+        auto fields_if_mapped = [&prefix](std::vector<std::string> fields) {
+            return prefix.empty() ? std::move(fields) : std::vector<std::string>{};
+        };
 
         double head_penetration = m_full_print_config.opt_float(prefix + "support_head_penetration");
         double head_width       = m_full_print_config.opt_float(prefix + "support_head_width");
 
         if (head_penetration > head_width) {
-            return _u8L("Invalid Head penetration\n"
-                        "Head penetration should not be greater than the Head width.\n"
-                        "Please check value of Head penetration in Print Settings or Material Overrides.");
+            return make_engine_error(EngineErrorCode::SUPPORT_HEAD_PENETRATION_INVALID,
+                         _u8L("Invalid Head penetration\n"
+                              "Head penetration should not be greater than the Head width.\n"
+                              "Please check value of Head penetration in Print Settings or Material Overrides."),
+                         fields_if_mapped({"support_head_penetration", "support_head_width"}));
         }
 
         double pinhead_d = m_full_print_config.opt_float(prefix + "support_head_front_diameter");
         double pillar_d  = m_full_print_config.opt_float(prefix + "support_pillar_diameter");
 
         if (pinhead_d > pillar_d) {
-            return _u8L("Invalid pinhead diameter\n"
-                        "Pinhead front diameter should be smaller than the Pillar diameter.\n"
-                        "Please check value of Pinhead front diameter in Print Settings or Material Overrides.");
+            return make_engine_error(EngineErrorCode::SUPPORT_HEAD_TOO_WIDE,
+                         _u8L("Invalid pinhead diameter\n"
+                              "Pinhead front diameter should be smaller than the Pillar diameter.\n"
+                              "Please check value of Pinhead front diameter in Print Settings or Material Overrides."),
+                         fields_if_mapped({"support_head_front_diameter", "support_pillar_diameter"}));
         }
     }
 
     if ((!m_material_config.use_tilt.get_at(0) && is_approx(m_material_config.tower_hop_height.get_at(0), 0.))
-        || (!m_material_config.use_tilt.get_at(1) && is_approx(m_material_config.tower_hop_height.get_at(1), 0.)))
-        return _u8L("Disabling the 'Use tilt' function causes the object to separate away from the film in the "
-                    "vertical direction only. Therefore, it is necessary to set the 'Tower hop height' parameter "
-                    "to reasonable value. The recommended value is 5 mm.");
+        || (!m_material_config.use_tilt.get_at(1) && is_approx(m_material_config.tower_hop_height.get_at(1), 0.))) {
+        // No registered code for this one yet: message only, as before.
+        EngineError err;
+        err.message = _u8L("Disabling the 'Use tilt' function causes the object to separate away from the film in the "
+                           "vertical direction only. Therefore, it is necessary to set the 'Tower hop height' parameter "
+                           "to reasonable value. The recommended value is 5 mm.");
+        return err;
+    }
 
-    return "";
+    return {};
 }
 
 void SLAPrint::export_print(const std::string &fname, const ThumbnailsList &thumbnails, const std::string &projectname)

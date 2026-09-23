@@ -54,6 +54,15 @@
 
 namespace Slic3r::CLI {
 
+void print_engine_error(const EngineError& err)
+{
+    // stdout, not stderr: stderr also carries BOOST_LOG and library noise, and
+    // the agent looks for this one line (design.md D2).
+    const std::string line = engine_error_line(err);
+    if (!line.empty())
+        boost::nowide::cout << line << std::endl;
+}
+
 static bool has_profile_sharing_action(const Data& cli)
 {
     return cli.actions_config.has("query-printer-models") || cli.actions_config.has("query-print-filament-profiles");
@@ -397,7 +406,7 @@ bool process_actions(Data& cli, const DynamicPrintConfig& print_config, std::vec
     if (actions.has("info")) {
         if (models.empty()) {
             boost::nowide::cerr << "error: cannot show info for empty models." << std::endl;
-            return 1;
+            return false;
         }
         // --info works on unrepaired model
         for (Model& model : models) {
@@ -414,7 +423,7 @@ bool process_actions(Data& cli, const DynamicPrintConfig& print_config, std::vec
 
     if (models.empty() && (actions.has("export_stl") || actions.has("export_obj") || actions.has("export_3mf"))) {
         boost::nowide::cerr << "error: cannot export empty models." << std::endl;
-        return 1;
+        return false;
     }
 
     const std::string output = cli.misc_config.has("output") ? cli.misc_config.opt_string("output") : "";
@@ -423,23 +432,23 @@ bool process_actions(Data& cli, const DynamicPrintConfig& print_config, std::vec
         for (auto& model : models)
             model.add_default_instances();
         if (!export_models(models, IO::STL, output))
-            return 1;
+            return false;
     }
     if (actions.has("export_obj")) {
         for (auto& model : models)
             model.add_default_instances();
         if (!export_models(models, IO::OBJ, output))
-            return 1;
+            return false;
     }
     if (actions.has("export_3mf")) {
         if (!export_models(models, IO::TMF, output))
-            return 1;
+            return false;
     }
 
     if (actions.has("export_hollow_stl")) {
         if (models.empty()) {
             boost::nowide::cerr << "error: cannot hollow empty models." << std::endl;
-            return 1;
+            return false;
         }
 
         for (Model& model : models) {
@@ -448,13 +457,13 @@ bool process_actions(Data& cli, const DynamicPrintConfig& print_config, std::vec
                 // Get the mesh from the first volume (simplified - assumes single volume)
                 if (mo->volumes.empty()) {
                     boost::nowide::cerr << "error: model object has no volumes." << std::endl;
-                    return 1;
+                    return false;
                 }
 
                 TriangleMesh mesh = mo->volumes.front()->mesh();
                 if (mesh.empty()) {
                     boost::nowide::cerr << "error: mesh is empty." << std::endl;
-                    return 1;
+                    return false;
                 }
 
                 // Get hollowing parameters from config
@@ -474,14 +483,14 @@ bool process_actions(Data& cli, const DynamicPrintConfig& print_config, std::vec
                 auto interior = sla::generate_interior(mesh.its, hc);
                 if (!interior) {
                     boost::nowide::cerr << "error: failed to generate interior mesh." << std::endl;
-                    return 1;
+                    return false;
                 }
 
                 // Get the interior mesh
                 indexed_triangle_set interior_its = sla::get_mesh(*interior);
                 if (interior_its.indices.empty()) {
                     boost::nowide::cerr << "error: interior mesh is empty. Try reducing wall thickness for smaller models." << std::endl;
-                    return 1;
+                    return false;
                 }
 
                 // Flip normals for proper visualization (interior faces outward in PrusaSlicer)
@@ -497,7 +506,7 @@ bool process_actions(Data& cli, const DynamicPrintConfig& print_config, std::vec
                 // Export the interior mesh
                 if (!its_write_stl_binary(outpath.c_str(), "hollow_interior", interior_its)) {
                     boost::nowide::cerr << "error: failed to write interior mesh to " << outpath << std::endl;
-                    return 1;
+                    return false;
                 }
 
                 boost::nowide::cout << "Hollow interior mesh exported to " << outpath << std::endl;
@@ -509,11 +518,11 @@ bool process_actions(Data& cli, const DynamicPrintConfig& print_config, std::vec
         PrinterTechnology       printer_technology = Preset::printer_technology(print_config);
         if (actions.has("export_gcode") && printer_technology == ptSLA) {
             boost::nowide::cerr << "error: cannot export G-code for an FFF configuration" << std::endl;
-            return 1;
+            return false;
         }
         else if (actions.has("export_sla") && printer_technology == ptFFF) {
             boost::nowide::cerr << "error: cannot export SLA slices for a SLA configuration" << std::endl;
-            return 1;
+            return false;
         }
         // Support points only exist in the SLA pipeline. Without this the FFF
         // branch below would run a full slice and hand back a G-code file -
@@ -637,6 +646,9 @@ bool process_actions(Data& cli, const DynamicPrintConfig& print_config, std::vec
                         // no output file is written; in particular this must NOT
                         // fall back to generating points automatically, which
                         // would silently discard the caller's edits.
+                        print_engine_error(make_engine_error(
+                            EngineErrorCode::SUPPORT_POINTS_MODEL_MISMATCH,
+                            sla::support_points_model_mismatch_marker));
                         boost::nowide::cerr << sla::support_points_model_mismatch_marker << std::endl;
                         boost::nowide::cerr << "  expected: "
                                             << sla::fingerprint_to_string(file.fingerprint) << std::endl;
@@ -676,7 +688,7 @@ bool process_actions(Data& cli, const DynamicPrintConfig& print_config, std::vec
                     TriangleMesh support_mesh;
                     if (!support_mesh.ReadSTLFile(support_path.c_str()) || support_mesh.empty()) {
                         boost::nowide::cerr << "error: failed to read --import-support-stl: " << support_path << std::endl;
-                        return 1;
+                        return false;
                     }
                     // Strip exact duplicate faces before the mesh reaches the slicer, so that
                     // slice_supports() and merge_slices_and_eval_stats() both work on a single
@@ -731,16 +743,27 @@ bool process_actions(Data& cli, const DynamicPrintConfig& print_config, std::vec
                     sla_print.set_preview_scale(scale);
             }
 
-            std::string err = print->validate();
-            if (!err.empty()) {
-                boost::nowide::cerr << err << std::endl;
-                return 1;
+            // SLA reports its validation failure with the engine error code;
+            // the message printed to stderr is the same text as before either way.
+            EngineError validation;
+            if (printer_technology == ptSLA)
+                validation = sla_print.validate_error();
+            else
+                validation.message = print->validate();
+            if (validation.failed()) {
+                print_engine_error(validation);
+                boost::nowide::cerr << validation.message << std::endl;
+                return false;
             }
 
             std::string outfile = output;
 
-            if (print->empty())
+            if (print->empty()) {
+                print_engine_error(make_engine_error(
+                    EngineErrorCode::MODEL_OUT_OF_BOUNDS,
+                    "Either the print is empty or no object is fully inside the print volume."));
                 boost::nowide::cout << "Nothing to print for " << outfile << " . Either the print is empty or no object is fully inside the print volume." << std::endl;
+            }
             else
                 try {
                 std::string outfile_final;
@@ -863,6 +886,11 @@ bool process_actions(Data& cli, const DynamicPrintConfig& print_config, std::vec
                             if (!sla::detail::in_float_range(mapped.x()) ||
                                 !sla::detail::in_float_range(mapped.y()) ||
                                 !sla::detail::in_float_range(mapped.z())) {
+                                // No fields: a zero instance scale lands here too,
+                                // so which setting caused it is not known here.
+                                print_engine_error(make_engine_error(
+                                    EngineErrorCode::SHRINKAGE_COMPENSATION_INVALID,
+                                    "the object transform is not invertible"));
                                 boost::nowide::cerr
                                     << "error: --export-support-points: the object transform is "
                                        "not invertible (a zero scale or a zero shrinkage "
@@ -1014,7 +1042,19 @@ bool process_actions(Data& cli, const DynamicPrintConfig& print_config, std::vec
                                     else if (has_pad)
                                         boost::nowide::cout << " (pad only)";
                                     boost::nowide::cout << std::endl;
+                                } else if (support_stl_only) {
+                                    // The STL is all this run was asked for, so
+                                    // not writing it fails the run.
+                                    print_engine_error(make_engine_error(
+                                        EngineErrorCode::SUPPORT_MESH_EXPORT_FAILED,
+                                        "Failed to export support mesh to " + support_path.string()));
+                                    boost::nowide::cerr << "Failed to export support mesh to " << support_path.string() << std::endl;
+                                    return false;
                                 } else {
+                                    // A slice: the .sl1 is already written and this
+                                    // file only feeds the UI, so the failure is
+                                    // reported and the slice stands, like the
+                                    // preview ZIP above.
                                     boost::nowide::cerr << "Failed to export support mesh to " << support_path.string() << std::endl;
                                 }
                             } else {
@@ -1037,6 +1077,10 @@ bool process_actions(Data& cli, const DynamicPrintConfig& print_config, std::vec
                 }
             }
             catch (const std::exception& ex) {
+                // Coded exceptions keep their original type (SlicingError,
+                // RuntimeError), so only a cross-cast finds the code.
+                if (const auto *carrier = dynamic_cast<const EngineErrorCarrier *>(&ex))
+                    print_engine_error(carrier->engine_error());
                 boost::nowide::cerr << ex.what() << std::endl;
                 return false;
             }

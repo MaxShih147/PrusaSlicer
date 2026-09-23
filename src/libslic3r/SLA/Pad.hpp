@@ -13,6 +13,7 @@
 
 #include "libslic3r/ExPolygon.hpp"
 #include "libslic3r/Polygon.hpp"
+#include "libslic3r/EngineErrorCodes.hpp"
 
 struct indexed_triangle_set;
 
@@ -89,6 +90,8 @@ struct PadConfig {
     inline double required_elevation() const { return wall_thickness_mm; }
 
     std::string validate() const;
+    // validate() with the failing fields and the threshold that was missed.
+    EngineError validate_error() const;
 };
 
 void create_pad(

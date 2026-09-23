@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "PrintBase.hpp"
+#include "EngineErrorCodes.hpp"
 #include "SLA/SupportTree.hpp"
 #include "SLA/SupportPointGenerator.hpp" // SupportPointGeneratorData
 #include "Point.hpp"
@@ -617,6 +618,9 @@ public:
     const SLAPrintStatistics&   print_statistics() const { return m_print_statistics; }
 
     std::string validate(std::vector<std::string>* warnings = nullptr) const override;
+    // validate() with the engine error code, the failing fields and the
+    // threshold that was missed. validate() returns this one's message.
+    EngineError validate_error() const;
 
     // An aggregation of SliceRecord-s from all the print objects for each
     // occupied layer. Slice record levels dont have to match exactly.

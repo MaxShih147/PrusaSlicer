@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "libslic3r/Model.hpp"
+#include "libslic3r/EngineErrorCodes.hpp"
 #include "CLI_DynamicPrintConfig.hpp"
 
 #ifdef SLIC3R_GUI
@@ -60,6 +61,9 @@ namespace Slic3r::CLI
     bool    has_full_config_from_profiles(const Data& cli);
     bool    process_profiles_sharing(const Data& cli);
     bool    process_actions(Data& cli, const DynamicPrintConfig& print_config, std::vector<Model>& models);
+    // Prints the "PHZ_ERROR {...}" line for `err` to stdout, where the agent
+    // reads it. Nothing is printed when `err` carries no code.
+    void    print_engine_error(const EngineError& err);
 
     // Implemented in GuiParams.cpp
 #ifdef SLIC3R_GUI

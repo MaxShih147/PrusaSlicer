@@ -708,13 +708,17 @@ void SLAPrint::Steps::slice_model(SLAPrintObject &po)
         // keyword: xgettext --add-comments only picks up a comment that ends on
         // the immediately preceding line, so parking it above the throw (where
         // it reads more naturally) silently drops it from the catalog.
-        throw Slic3r::RuntimeError(format(
-            //TRN To be shown at the status bar on SLA slicing error. %1% is the
-            //    object name, %2% the object height and %3% the layer height in mm.
-            _u8L("Model named: %1% can not be sliced: no slice level falls inside the "
-                 "model. The layer height (%3% mm) is too large relative to the height "
-                 "of the object (%2% mm). Try lowering the layer height."),
-            po.model_object()->name, model_height, lhd));
+        // Code only, no fields: on the support-generation path lhd is the
+        // agent's coarse detection layer height, not the value the user set.
+        throw CodedRuntimeError(make_engine_error(
+            EngineErrorCode::MODEL_MESH_UNSLICEABLE,
+            format(
+                //TRN To be shown at the status bar on SLA slicing error. %1% is the
+                //    object name, %2% the object height and %3% the layer height in mm.
+                _u8L("Model named: %1% can not be sliced: no slice level falls inside the "
+                     "model. The layer height (%3% mm) is too large relative to the height "
+                     "of the object (%2% mm). Try lowering the layer height."),
+                po.model_object()->name, model_height, lhd)));
     }
 
     po.m_model_height_levels.clear();
@@ -1225,9 +1229,10 @@ void SLAPrint::Steps::generate_pad(SLAPrintObject &po) {
                 !pcfg.embed_object.enabled;
 
             if (!nothing_to_build_pad_from)
-                throw Slic3r::SlicingError(
+                throw CodedSlicingError(make_engine_error(
+                        EngineErrorCode::PAD_GENERATION_FAILED,
                         _u8L("No pad can be generated for this model with the "
-                          "current configuration"));
+                          "current configuration")));
 
             BOOST_LOG_TRIVIAL(warning)
                 << "Pad skipped: nothing stands on the plate, so there is no "
@@ -1366,10 +1371,11 @@ void SLAPrint::Steps::initialize_printer_input()
 
         for(const SliceRecord& slicerecord : o->get_slice_index()) {
             if (!slicerecord.is_valid())
-                throw Slic3r::SlicingError(
+                throw CodedSlicingError(make_engine_error(
+                    EngineErrorCode::UNPRINTABLE_OBJECT,
                     _u8L("There are unprintable objects. Try to "
                       "adjust support settings to make the "
-                      "objects printable."));
+                      "objects printable.")));
 
             coord_t lvlid = slicerecord.print_level() - gndlvl;
 
