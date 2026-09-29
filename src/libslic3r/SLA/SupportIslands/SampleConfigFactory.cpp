@@ -98,6 +98,25 @@ SampleConfig SampleConfigFactory::create(float support_head_diameter_in_mm) {
     return result;
 }
 
+SampleConfig SampleConfigFactory::apply_min_distance(const SampleConfig &current, float min_distance_mm) {
+    if (min_distance_mm <= 0.f)
+        return current;
+
+    const coord_t floor_distance = static_cast<coord_t>(scale_(min_distance_mm));
+    SampleConfig result = current; // copy
+    // These are MAXIMUM spacings - how far apart the sampler may leave two
+    // points while still covering an island. Asking for a minimum only means
+    // something if the maximum is at least as large, so each is raised to meet
+    // the floor and none is ever lowered. An island too small to hold two
+    // points that far apart still gets its one or two: those are decided by
+    // max_length_for_*_support_point*, which are left alone.
+    result.thin_max_distance = std::max(result.thin_max_distance, floor_distance);
+    result.thick_inner_max_distance = std::max(result.thick_inner_max_distance, floor_distance);
+    result.thick_outline_max_distance = std::max(result.thick_outline_max_distance, floor_distance);
+    verify(result);
+    return result;
+}
+
 SampleConfig SampleConfigFactory::apply_density(const SampleConfig &current, float density) {
     if (is_approx(density, 1.f))
         return current;

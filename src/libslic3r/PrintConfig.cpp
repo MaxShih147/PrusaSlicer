@@ -4706,6 +4706,19 @@ void PrintConfigDef::init_sla_params()
     def->min = 0;
     def->set_default_value(new ConfigOptionInt(100));
 
+    def = this->add("support_points_min_distance", coFloat);
+    def->label = L("Support points minimum distance");
+    def->category = L("Supports");
+    def->tooltip = L("Support points on the same layer are never placed closer "
+                     "together than this. 0 leaves the spacing to the automatic "
+                     "placement, which is what it was before this setting "
+                     "existed. The generator's own figure is 3.2 mm, so that is "
+                     "the value which reproduces it.");
+    def->sidetext = L("mm");
+    def->min = 0;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(0.));
+
     def = this->add("pad_enable", coBool);
     def->label = L("Use pad");
     def->category = L("Pad");

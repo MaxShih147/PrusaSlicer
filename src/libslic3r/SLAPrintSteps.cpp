@@ -894,6 +894,10 @@ void SLAPrint::Steps::support_points(SLAPrintObject &po)
     // the density config value is in percents:
     SupportPointGeneratorConfig config;
     config.density_relative = float(cfg.support_points_density_relative / 100.f);
+    // How close two points on a layer may ever be. Nothing else in this
+    // function needs to know about it: the generator applies it where it
+    // decides whether a candidate is already supported.
+    config.min_distance = float(cfg.support_points_min_distance);
         
     switch (cfg.support_tree_type) {
     case SupportTreeType::Default:
@@ -941,8 +945,10 @@ void SLAPrint::Steps::support_points(SLAPrintObject &po)
     // use static variable to propagate data from GUI
     config.island_configuration = SampleConfigFactory::get_sample_config(config.density_relative);
 #else // USE_ISLAND_GUI_FOR_SETTINGS
-    config.island_configuration = SampleConfigFactory::apply_density(
-            SampleConfigFactory::create(config.head_diameter), config.density_relative);
+    config.island_configuration = SampleConfigFactory::apply_min_distance(
+        SampleConfigFactory::apply_density(
+            SampleConfigFactory::create(config.head_diameter), config.density_relative),
+        config.min_distance);
 #endif // USE_ISLAND_GUI_FOR_SETTINGS
 
     // scaling for the sub operations

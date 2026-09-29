@@ -1192,6 +1192,7 @@ PRINT_CONFIG_CLASS_DEFINE(
 
     /////// Following options influence automatic support points placement:
     ((ConfigOptionInt, support_points_density_relative))
+    ((ConfigOptionFloat, support_points_min_distance))
 
     // Now for the base pool (pad) /////////////////////////////////////////////
 

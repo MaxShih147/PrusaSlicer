@@ -1153,6 +1153,7 @@ bool SLAPrintObject::invalidate_state_by_config_options(const std::vector<t_conf
             steps.emplace_back(slaposObjectSlice);
         } else if (
                opt_key == "support_points_density_relative"
+            || opt_key == "support_points_min_distance"
             || opt_key == "support_enforcers_only"
             // The two critical angles belong here, not with the rest of the
             // support settings below, because the overhang filter now runs in

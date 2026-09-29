@@ -241,6 +241,21 @@ NearPoints create_near_points(
 }
 
 /// <summary>
+/// The reach a support point starts life with.
+///
+/// A point's current_radius is what decides whether a later candidate counts
+/// as already supported, so this is where the minimum distance between two
+/// points on a layer is really set. The curve's own first x is the figure the
+/// generator was tuned around; the user's floor raises it and never lowers it.
+/// </summary>
+coord_t initial_influence_radius(const SupportPointGeneratorConfig &config) {
+    float radius = config.support_curve.front().x();
+    if (config.min_distance > radius)
+        radius = config.min_distance;
+    return static_cast<coord_t>(scale_(radius));
+}
+
+/// <summary>
 /// Add support point to near_points when it is neccessary
 /// </summary>
 /// <param name="part">Current part - keep samples</param>
@@ -278,7 +293,7 @@ void support_part_overhangs(
                 },
                 /* position_on_layer */ p,
                 /* radius_curve_index */ 0,
-                /* current_radius */ static_cast<coord_t>(scale_(config.support_curve.front().x()))
+                /* current_radius */ initial_influence_radius(config)
                 });
         }    
     }
@@ -309,7 +324,7 @@ void support_island(const LayerPart &part, NearPoints& near_points, float part_z
             },
             /* position_on_layer */ sample->point,
             /* radius_curve_index */ 0,
-            /* current_radius */ static_cast<coord_t>(scale_(cfg.support_curve.front().x()))
+            /* current_radius */ initial_influence_radius(cfg)
         });
 }
 
@@ -331,7 +346,7 @@ void support_peninsulas(const Peninsulas& peninsulas, NearPoints& near_points, f
                 },
                 /* position_on_layer */ support->point,
                 /* radius_curve_index */ 0,
-                /* current_radius */ static_cast<coord_t>(scale_(cfg.support_curve.front().x()))
+                /* current_radius */ initial_influence_radius(cfg)
             });
     }   
 }
@@ -484,6 +499,10 @@ coord_t calc_influence_radius(float z_distance, const SupportPointGeneratorConfi
     float island_support_distance_sq = sqr(config.support_curve.front().x());
     if (!is_approx(config.density_relative, 1.f, 1e-4f)) // exist relative density
         island_support_distance_sq /= config.density_relative;
+    // The user's floor, after density rather than alongside it: asking for
+    // points no closer than d has to mean that whatever else is set.
+    if (config.min_distance > 0.f)
+        island_support_distance_sq = std::max(island_support_distance_sq, sqr(config.min_distance));
     float z_distance_sq = sqr(z_distance);
     if (z_distance_sq >= island_support_distance_sq)
         return 0.f;
@@ -497,6 +516,11 @@ void prepare_supports_for_layer(LayerSupportPoints &supports, float layer_z,
     auto set_radius = [&config](LayerSupportPoint &support, float radius) {
         if (!is_approx(config.density_relative, 1.f, 1e-4f)) // exist relative density
             radius = std::sqrt(sqr(radius) / config.density_relative);
+        // Same floor as calc_influence_radius, for the same reason: this is the
+        // other place a point's reach is decided, and a floor honoured in only
+        // one of them is not a floor.
+        if (config.min_distance > 0.f)
+            radius = std::max(radius, config.min_distance);
         support.current_radius = static_cast<coord_t>(scale_(radius));
     };
 
@@ -1483,8 +1507,13 @@ LayerSupportPoints generate_support_points(
         const_cast<SupportPointGeneratorConfig &>(config).support_curve = load_curve_from_file();
 #endif // USE_ISLAND_GUI_FOR_SETTINGS
 
-    // Maximal radius of supported area of one support point
-    double max_support_radius = config.support_curve.back().x();
+    // Maximal radius of supported area of one support point.
+    // This bounds the SEARCH for an already-supported neighbour, so it has to
+    // cover the floor as well: a candidate 12mm from its neighbour is only
+    // rejected if the search looked that far in the first place.
+    double max_support_radius = std::max(
+        double(config.support_curve.back().x()),
+        double(config.min_distance));
     // check distance to nearest support points from grid
     coord_t maximal_radius = static_cast<coord_t>(scale_(max_support_radius));
 
