@@ -20,6 +20,15 @@ public:
     static bool verify(SampleConfig &cfg);
     static SampleConfig create(float support_head_diameter_in_mm);
     static SampleConfig apply_density(const SampleConfig& cfg, float density);
+
+    /// <summary>
+    /// Raise the sampler's spacings so they never sit below a floor the user
+    /// asked for.
+    /// </summary>
+    /// <param name="cfg">Configuration to raise</param>
+    /// <param name="min_distance_mm">The floor; 0 leaves the config alone</param>
+    /// <returns>A copy with no spacing below the floor</returns>
+    static SampleConfig apply_min_distance(const SampleConfig& cfg, float min_distance_mm);
 #ifdef USE_ISLAND_GUI_FOR_SETTINGS
 private:
     // TODO: REMOVE IT. Do not use in production

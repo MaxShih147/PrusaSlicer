@@ -1088,6 +1088,7 @@ PRINT_CONFIG_CLASS_DEFINE(
 
     // How much bridge (supporting another pinhead) can be placed on a pillar.
     ((ConfigOptionInt,   support_max_bridges_on_pillar))
+    ((ConfigOptionBool,  support_auxiliary_pillars))
 
     // How the pillars are bridged together
     ((ConfigOptionEnum<SLAPillarConnectionMode>, support_pillar_connection_mode))
@@ -1152,6 +1153,7 @@ PRINT_CONFIG_CLASS_DEFINE(
 
     // How much bridge (supporting another pinhead) can be placed on a pillar.
     ((ConfigOptionInt,   branchingsupport_max_bridges_on_pillar))
+    ((ConfigOptionBool,  branchingsupport_auxiliary_pillars))
 
     // How the pillars are bridged together
     ((ConfigOptionEnum<SLAPillarConnectionMode>, branchingsupport_pillar_connection_mode))
@@ -1190,6 +1192,7 @@ PRINT_CONFIG_CLASS_DEFINE(
 
     /////// Following options influence automatic support points placement:
     ((ConfigOptionInt, support_points_density_relative))
+    ((ConfigOptionFloat, support_points_min_distance))
 
     // Now for the base pool (pad) /////////////////////////////////////////////
 

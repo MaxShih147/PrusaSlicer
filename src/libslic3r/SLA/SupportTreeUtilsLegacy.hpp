@@ -86,7 +86,15 @@ std::optional<DiffBridge> search_widening_path(Ex                     policy,
         double t    = std::get<2>(oresult.optimum);
         Vec3d  endp = jp + t * spheric_to_dir(polar, azimuth);
 
-        return DiffBridge(jp, endp, radius, sm.cfg.head_back_radius_mm);
+        // End radius is new_radius, the width this search was asked to reach -
+        // not the global default. The caller widens a mini pillar up to the
+        // radius its own support point asked for and then tests
+        // `radius >= that radius` to decide whether a pillar base fits; handing
+        // back the global value made that test fail for every point wider than
+        // the default, dropping its pedestal and sinking the ground level into
+        // the pad. Identical to the old behaviour whenever new_radius is the
+        // configured head_back_radius_mm, which is every all-default input.
+        return DiffBridge(jp, endp, radius, new_radius);
     }
 
     return {};
@@ -106,11 +114,36 @@ std::pair<bool, long> create_ground_pillar(
     const Vec3d           &sourcedir,
     double                 radius,
     double                 end_radius,
-    long                   head_id = SupportTreeNode::ID_UNSET)
+    long                   head_id = SupportTreeNode::ID_UNSET,
+    // The support point whose per-point sizes this pillar adopts. Defaults to
+    // head_id. It is a separate parameter because head_id does double duty
+    // below: passing it also attaches the pillar directly to that head. A
+    // caller that reaches the ground through an intermediate bridge must leave
+    // head_id unset while still naming the point the sizes come from.
+    long                   size_point_id = SupportTreeNode::ID_UNSET)
 {
     Vec3d  jp           = pinhead_junctionpt, endp = jp, dir = sourcedir;
     long   pillar_id    = SupportTreeNode::ID_UNSET;
     bool   can_add_base = false, non_head = false;
+
+    // This pillar's own sizes, resolved from the support point it grew from.
+    // Both ids are ID_UNSET for pillars with no originating point, and the
+    // resolvers then hand back the global configuration unchanged.
+    const long   spid      = size_point_id >= 0 ? size_point_id : head_id;
+    const double pt_back_r = resolved_head_back_radius_mm(sm, spid);
+    const double pt_base_r = resolved_base_radius_mm(sm, spid);
+    const double pt_slope  = resolved_bridge_slope(sm, spid);
+
+    // The zero-elevation branch below divides by sqrt(1 - slope^2) with slope
+    // in radians, so anything at or above 1 rad (~57.3 deg) puts a negative
+    // number under the root. The result is a NaN that std::min() silently
+    // passes through as "no limit" - a lost ground clearance cap rather than an
+    // error. The expression predates per-point sizing (it was equally reachable
+    // by configuring support_bracing_angle above 57.3 deg); per-point angles
+    // just make it easy to hit. Clamp rather than reshape the formula: the
+    // configured default of 45 deg is far below the limit, so nothing that
+    // worked before changes.
+    const double pt_slope_sq = std::min(pt_slope * pt_slope, 1. - EPSILON);
 
     double gndlvl = 0.; // The Z level where pedestals should be
     double jp_gnd = 0.; // The lowest Z where a junction center can be
@@ -120,25 +153,25 @@ std::pair<bool, long> create_ground_pillar(
 
     auto to_floor = [&gndlvl](const Vec3d &p) { return Vec3d{p.x(), p.y(), gndlvl}; };
 
-    auto eval_limits = [&sm, &radius, &can_add_base, &gndlvl, &gap_dist, &jp_gnd]
+    auto eval_limits = [&sm, &radius, &can_add_base, &gndlvl, &gap_dist, &jp_gnd,
+                        pt_back_r, pt_base_r]
         (bool base_en = true)
     {
-        can_add_base  = base_en && radius >= sm.cfg.head_back_radius_mm;
-        double base_r = can_add_base ? sm.cfg.base_radius_mm : 0.;
+        can_add_base  = base_en && radius >= pt_back_r;
+        double base_r = can_add_base ? pt_base_r : 0.;
         gndlvl        = ground_level(sm);
         if (!can_add_base) gndlvl -= sm.pad_cfg.wall_thickness_mm;
-        jp_gnd   = gndlvl + (can_add_base ? 0. : sm.cfg.head_back_radius_mm);
+        jp_gnd   = gndlvl + (can_add_base ? 0. : pt_back_r);
         gap_dist = sm.cfg.pillar_base_safety_distance_mm + base_r + EPSILON;
     };
 
     eval_limits();
 
          // We are dealing with a mini pillar that's potentially too long
-    if (radius < sm.cfg.head_back_radius_mm && jp.z() - gndlvl > 20 * radius)
+    if (radius < pt_back_r && jp.z() - gndlvl > 20 * radius)
     {
         std::optional<DiffBridge> diffbr =
-            search_widening_path(policy, sm, jp, dir, radius,
-                                 sm.cfg.head_back_radius_mm);
+            search_widening_path(policy, sm, jp, dir, radius, pt_back_r);
 
         if (diffbr && diffbr->endp.z() > jp_gnd) {
             auto &br = builder.add_diffbridge(*diffbr);
@@ -159,7 +192,7 @@ std::pair<bool, long> create_ground_pillar(
         // original sourcedir's azimuth but the polar angle is saturated to the
         // configured bridge slope.
         auto [polar, azimuth] = dir_to_spheric(dir);
-        polar = PI - sm.cfg.bridge_slope;
+        polar = PI - pt_slope;
         Vec3d d = spheric_to_dir(polar, azimuth).normalized();
         auto sd = radius * sm.cfg.safety_distance_mm / sm.cfg.head_back_radius_mm;
         double t = beam_mesh_hit(policy, sm.emesh, Beam{endp, d, radius, r2}, sd).distance();
@@ -167,7 +200,7 @@ std::pair<bool, long> create_ground_pillar(
         t = 0.;
 
         double zd = endp.z() - jp_gnd;
-        double tmax2 = zd / std::sqrt(1 - sm.cfg.bridge_slope * sm.cfg.bridge_slope);
+        double tmax2 = zd / std::sqrt(1 - pt_slope_sq);
         tmax = std::min(tmax, tmax2);
 
         Vec3d nexp = endp;
@@ -187,7 +220,7 @@ std::pair<bool, long> create_ground_pillar(
             eval_limits(can_add_base);
 
             zd = endp.z() - jp_gnd;
-            tmax2 = zd / std::sqrt(1 - sm.cfg.bridge_slope * sm.cfg.bridge_slope);
+            tmax2 = zd / std::sqrt(1 - pt_slope_sq);
             tmax = std::min(tmax, tmax2);
 
             while (((dlast = std::sqrt(sm.emesh.squared_distance(to_floor(nexp)))) < gap_dist ||
@@ -217,8 +250,7 @@ std::pair<bool, long> create_ground_pillar(
                                             builder.add_pillar(gp, h, radius, end_radius);
 
     if (can_add_base)
-        builder.add_pillar_base(pillar_id, sm.cfg.base_height_mm,
-                                sm.cfg.base_radius_mm);
+        builder.add_pillar_base(pillar_id, sm.cfg.base_height_mm, pt_base_r);
 
     return {true, pillar_id};
 }
@@ -229,7 +261,12 @@ std::pair<bool, long> connect_to_ground(Ex                     policy,
                                         const SupportableMesh &sm,
                                         const Junction        &j,
                                         const Vec3d           &dir,
-                                        double                 end_r)
+                                        double                 end_r,
+                                        // Carried through so the pillar can
+                                        // resolve its own base radius and
+                                        // bracing angle; ID_UNSET keeps the
+                                        // global configuration.
+                                        long head_id = SupportTreeNode::ID_UNSET)
 {
     auto   hjp = j.pos;
     double r   = j.r;
@@ -251,7 +288,10 @@ std::pair<bool, long> connect_to_ground(Ex                     policy,
         return {false, SupportTreeNode::ID_UNSET};
 
     Vec3d endp = hjp + d * dir;
-    auto ret = create_ground_pillar(policy, builder, sm, endp, dir, r, end_r);
+    // head_id goes in as the sizing point only: this route always inserts a
+    // bridge below, so the pillar must not be attached to the head directly.
+    auto ret = create_ground_pillar(policy, builder, sm, endp, dir, r, end_r,
+                                    SupportTreeNode::ID_UNSET, head_id);
 
     if (ret.second >= 0) {
         builder.add_bridge(hjp, endp, r);
@@ -267,11 +307,18 @@ std::pair<bool, long> search_ground_route(Ex                     policy,
                                           const SupportableMesh &sm,
                                           const Junction        &j,
                                           double                 end_radius,
-                                          const Vec3d &init_dir = DOWN)
+                                          const Vec3d &init_dir = DOWN,
+                                          // Sizing point for the resulting
+                                          // pillar; ID_UNSET keeps the global
+                                          // configuration.
+                                          long head_id = SupportTreeNode::ID_UNSET)
 {
     double downdst = j.pos.z() - ground_level(sm);
 
-    auto res = connect_to_ground(policy, builder, sm, j, init_dir, end_radius);
+    const double pt_slope = resolved_bridge_slope(sm, head_id);
+
+    auto res = connect_to_ground(policy, builder, sm, j, init_dir, end_radius,
+                                 head_id);
     if (res.first)
         return res;
 
@@ -292,12 +339,13 @@ std::pair<bool, long> search_ground_route(Ex                     policy,
             return beam_mesh_hit(policy, sm.emesh, beam, sd).distance();
         },
         initvals({polar, azimuth}),  // let's start with what we have
-        bounds({ {PI - sm.cfg.bridge_slope, PI}, {-PI, PI} })
+        bounds({ {PI - pt_slope, PI}, {-PI, PI} })
         );
 
     Vec3d bridgedir = spheric_to_dir(oresult.optimum).normalized();
 
-    return connect_to_ground(policy, builder, sm, j, bridgedir, end_radius);
+    return connect_to_ground(policy, builder, sm, j, bridgedir, end_radius,
+                             head_id);
 }
 
 }} // namespace Slic3r::sla

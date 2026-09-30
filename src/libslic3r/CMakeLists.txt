@@ -640,9 +640,12 @@ target_link_libraries(libslic3r PRIVATE
     qoi
     fastfloat
     int128
-    nlohmann_json::nlohmann_json
 )
+# nlohmann_json is PUBLIC because SLA/SupportPointIO.hpp - a public header of
+# libslic3r - includes nlohmann/json.hpp. Keeping it PRIVATE would force every
+# consumer (src/CLI, the tests) to find_package and link it again on its own.
 target_link_libraries(libslic3r PUBLIC
+    nlohmann_json::nlohmann_json
     Eigen3::Eigen
     semver
     admesh

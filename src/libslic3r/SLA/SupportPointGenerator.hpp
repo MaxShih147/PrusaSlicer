@@ -33,6 +33,18 @@ struct SupportPointGeneratorConfig{
     float density_relative{1.f};
 
     /// <summary>
+    /// How close two support points on the same layer may ever be, in mm.
+    /// 0 means no floor, which is the behaviour before this existed.
+    ///
+    /// The generator's own measure of "already supported" is a sphere around
+    /// each point whose radius starts at support_curve's first x, and
+    /// density_relative scales that. This is applied after the scaling rather
+    /// than alongside it, so it is a guarantee the user can rely on and not
+    /// another term density can multiply away.
+    /// </summary>
+    float min_distance{0.f}; // [in mm]
+
+    /// <summary>
     /// Size range for support point interface (head)
     /// </summary>
     float head_diameter = 0.4f; // [in mm]

@@ -58,11 +58,19 @@ DefaultSupportTree::DefaultSupportTree(SupportTreeBuilder &   builder,
 }
 
 bool DefaultSupportTree::execute(SupportTreeBuilder    &builder,
-                                const SupportableMesh &sm)
+                                const SupportableMesh &sm,
+                                PriorAttachments      *out_attached)
 {
     if(sm.pts.empty()) return false;
 
     DefaultSupportTree alg(builder, sm);
+
+    // Seed the pillars carried in from earlier generations. They go into the
+    // builder so interconnect() can take them by reference, and into the
+    // spatial index so neighbour queries find them - but they are flagged
+    // frozen, so merged_mesh() never emits their geometry and the caller's
+    // existing support mesh stays byte-identical.
+    alg.adopt_prior_pillars();
 
        // Let's define the individual steps of the processing. We can experiment
        // later with the ordering and the dependencies between them.
@@ -175,6 +183,9 @@ bool DefaultSupportTree::execute(SupportTreeBuilder    &builder,
         report_penetration_failsafes(alg.m_penetration_stats,
                                      "Default support tree");
 
+    if (out_attached)
+        *out_attached = alg.prior_attachments();
+
     return pc == ABORT;
 }
 
@@ -264,7 +275,7 @@ bool DefaultSupportTree::interconnect(const Pillar &pillar,
     while(ej.z() >= eupper.z() /*endz*/) {
         if(bridge_mesh_distance(sj, dirv(sj, ej), pillar.r_start) >= bridge_distance)
         {
-            m_builder.add_crossbridge(sj, ej, pillar.r_start);
+            m_builder.add_crossbridge_between(pillar.id, nextpillar.id, sj, ej, pillar.r_start);
             was_connected = true;
         }
 
@@ -276,7 +287,7 @@ bool DefaultSupportTree::interconnect(const Pillar &pillar,
                 bridge_mesh_distance(sjback, dirv(sjback, ejback),
                                      pillar.r_start) >= bridge_distance) {
                 // need to check collision for the cross stick
-                m_builder.add_crossbridge(sjback, ejback, pillar.r_start);
+                m_builder.add_crossbridge_between(pillar.id, nextpillar.id, sjback, ejback, pillar.r_start);
                 was_connected = true;
             }
         }
@@ -312,7 +323,11 @@ bool DefaultSupportTree::connect_to_nearpillar(const Head &head,
     Vec3d bridgestart = headjp;
     Vec3d bridgeend = nearjp_u;
     double max_len = r * m_sm.cfg.max_bridge_length_mm / m_sm.cfg.head_back_radius_mm;
-    double max_slope = m_sm.cfg.bridge_slope;
+    // This head's own bracing angle. Most heads in a cluster reach the ground
+    // through this bridge rather than through their own pillar, so leaving the
+    // global value here would make a custom angle do nothing for every head
+    // except the cluster centroid.
+    double max_slope = resolved_bridge_slope(m_sm, head.id);
     double zdiff = 0.0;
 
        // check the default situation if feasible for a bridge
@@ -358,14 +373,21 @@ bool DefaultSupportTree::connect_to_nearpillar(const Head &head,
     if (m_builder.bridgecount(nearpillar()) < m_sm.cfg.max_bridges_on_pillar) {
         // A partial pillar is needed under the starting head.
         if(zdiff > 0) {
-            m_builder.add_pillar(head.id, headjp.z() - bridgestart.z());
+            // A partial pillar is needed under the starting head. It is this
+            // head's own, and the bar then runs from ITS top across to the near
+            // pillar - so both ends of that bar have an owner, and the head has
+            // a pillar to be grouped with.
+            const long own = m_builder.add_pillar(head.id, headjp.z() - bridgestart.z());
+            const size_t first_junction = m_builder.junctioncount();
             m_builder.add_junction(bridgestart, r);
-            m_builder.add_bridge(bridgestart, bridgeend, r);
+            m_builder.own_junctions_from(first_junction, own);
+            m_builder.add_bridge_between(nearpillar_id, bridgestart, bridgeend, r, own);
         } else {
-            m_builder.add_bridge(head.id, bridgeend);
+            m_builder.add_bridge_to_pillar(head.id, bridgeend, nearpillar_id);
         }
 
         m_builder.increment_bridges(nearpillar());
+        note_prior_attachment(nearpillar_id);
     } else return false;
 
     return true;
@@ -425,7 +447,7 @@ void DefaultSupportTree::add_pinheads()
             NaNd,
             sp.head_front_radius,
             0.,
-            m_sm.cfg.head_penetration_mm,
+            point_head_penetration_mm(sp, m_sm.cfg.head_penetration_mm),
             Vec3d::Zero(),         // dir
             sp.pos.cast<double>()  // displacement
             );
@@ -461,35 +483,67 @@ void DefaultSupportTree::add_pinheads()
         // (Quaternion::FromTwoVectors) and apply the rotation to the
         // arrow head.
 
+        // Everything below reads this point's own sizes, falling back to the
+        // global configuration wherever the point leaves a field unset. Note
+        // back_r is a parameter rather than a lookup: filterfn() re-enters
+        // itself with the global fallback radius when the resolved one leaves
+        // no room for a head.
+        const SupportPoint &sp    = m_sm.pts[fidx];
+        const double pt_back_r    = point_head_back_radius_mm(sp, m_sm.cfg.head_back_radius_mm);
+        const double pt_width     = point_head_width_mm(sp, m_sm.cfg.head_width_mm);
+        const double pt_penetr    = point_head_penetration_mm(sp, m_sm.cfg.head_penetration_mm);
+        const double pt_slope     = point_bracing_angle_rad(sp, m_sm.cfg.bridge_slope);
+
+        // A caller that placed this support by hand may have said which way its
+        // head points. Dragging one moves the PILLAR while the tip stays in the
+        // model, so the head leans and stretches to bridge the gap - somewhere
+        // the search below, which only ever looks around the surface normal,
+        // would never go. Taken as given: the caller is choosing, and the checks
+        // that follow exist to second-guess a normal, not a decision.
+        if (point_has_head_dir(m_sm.pts[fidx])) {
+            const SupportPoint &sp0 = m_sm.pts[fidx];
+            // Filled in the same way the search below fills it, on the head
+            // already built from this point's position and penetration.
+            Head &h = heads[fidx];
+            h.id        = fidx;
+            h.dir       = sp0.head_dir.cast<double>().normalized();
+            h.width_mm  = point_head_width_mm(sp0, m_sm.cfg.head_width_mm);
+            h.r_back_mm = point_head_back_radius_mm(sp0, m_sm.cfg.head_back_radius_mm);
+            return;
+        }
+
         auto [polar, azimuth] = dir_to_spheric(n);
 
         // skip if the tilt is not sane
         if (polar < PI - m_sm.cfg.normal_cutoff_angle) return;
 
-        // Skip surfaces that tilt too far from horizontal to count as an
-        // overhang. Rearranged, this places a head only where the surface's
-        // slope from the horizontal plane is at most
-        // (PI/2 - overhang_angle_threshold) -- so a SMALLER threshold supports
-        // MORE surfaces: 0 supports every overhang, PI/2 supports only
-        // perfectly horizontal down-facing surfaces. (The direction is
-        // deliberate and frozen; see capability sla-overhang-threshold-semantics.)
-        if (polar < M_PI / 2.0 + m_sm.cfg.overhang_angle_threshold) return;
+        // NO overhang angle gate here, on purpose. It runs once, upstream, in
+        // Phase 3 of support_points() (step slaposSupportPoints), so that an
+        // exported point list no longer carries points this step would have
+        // dropped for angle, and so that an IMPORTED list is never re-filtered.
+        // Angle is the only dimension made to agree that way - a point can
+        // still lose its head below to collision or to cluster dedup.
+        // Re-adding a passes_overhang_filter() call here brings back both the
+        // orphan points and the silent re-filtering of the user's own points
+        // (capability sla-overhang-threshold-semantics).
 
         // We saturate the polar angle to 3pi/4
-        polar = std::max(polar, PI - m_sm.cfg.bridge_slope);
+        polar = std::max(polar, PI - pt_slope);
 
         // save the head (pinpoint) position
         Vec3d hp = m_points.row(fidx);
 
-        double lmin = m_sm.cfg.head_width_mm, lmax = lmin;
+        double lmin = pt_width, lmax = lmin;
 
-        if (back_r < m_sm.cfg.head_back_radius_mm) {
-            lmin = 0., lmax = m_sm.cfg.head_penetration_mm;
+        // back_r below this point's own radius means filterfn() re-entered with
+        // the global fallback radius, i.e. this is a mini pillar.
+        if (back_r < pt_back_r) {
+            lmin = 0., lmax = pt_penetr;
         }
 
         // The distance needed for a pinhead to not collide with model.
         double w = lmin + 2 * back_r + 2 * m_sm.cfg.head_front_radius_mm -
-                   m_sm.cfg.head_penetration_mm;
+                   pt_penetr;
 
         double pin_r = double(m_sm.pts[fidx].head_front_radius);
 
@@ -523,7 +577,7 @@ void DefaultSupportTree::add_pinheads()
                 },
                 initvals({polar, azimuth, (lmin + lmax) / 2.}), // start with what we have
                 bounds({
-                    {PI - m_sm.cfg.bridge_slope, PI},    // Must not exceed the slope limit
+                    {PI - pt_slope, PI},    // Must not exceed the slope limit
                     {-PI, PI}, // azimuth can be a full search
                     {lmin, lmax}
                 }));
@@ -558,9 +612,12 @@ void DefaultSupportTree::add_pinheads()
             // leave the pillar starting at the old junction while the head mesh
             // ends at the new one - a gap of up to the configured penetration.
             h.penetration_mm = clamped_head_penetration(m_sm.emesh, hp, nn,
-                                                        m_sm.cfg.head_penetration_mm,
+                                                        pt_penetr,
                                                         &m_penetration_stats);
         } else if (back_r > m_sm.cfg.head_fallback_radius_mm) {
+            // The fallback radius stays global: it is the "no room for a real
+            // head, try a mini pillar" escape hatch, not one of the point's
+            // own sizes.
             filterfn(fidx, i, m_sm.cfg.head_fallback_radius_mm);
         }
     };
@@ -568,7 +625,10 @@ void DefaultSupportTree::add_pinheads()
     execution::for_each(
         suptree_ex_policy, size_t(0), filtered_indices.size(),
         [this, &filterfn, &filtered_indices](size_t i) {
-            filterfn(filtered_indices[i], i, m_sm.cfg.head_back_radius_mm);
+            const unsigned fidx = filtered_indices[i];
+            filterfn(fidx, i,
+                     point_head_back_radius_mm(m_sm.pts[fidx],
+                                               m_sm.cfg.head_back_radius_mm));
         },
         execution::max_concurrency(suptree_ex_policy));
 
@@ -622,8 +682,13 @@ void DefaultSupportTree::classify()
                             const PointIndexEl &e2) {
         double d2d = distance(to_2d(e1.first), to_2d(e2.first));
         double d3d = distance(e1.first, e2.first);
-        return d2d < 2 * m_sm.cfg.base_radius_mm
-               && d3d < m_sm.cfg.max_bridge_length_mm;
+        // The 2D test asks "would these two pillar bases overlap", so it has to
+        // add up the two bases actually being built, not twice the global one.
+        // .second is the head id, which is the support point index. With every
+        // point on the default this is exactly 2 * base_radius_mm as before.
+        double bases = resolved_base_radius_mm(m_sm, long(e1.second)) +
+                       resolved_base_radius_mm(m_sm, long(e2.second));
+        return d2d < bases && d3d < m_sm.cfg.max_bridge_length_mm;
     };
 
     m_pillar_clusters = cluster(ground_head_indices, pointfn, predicate,
@@ -710,7 +775,8 @@ bool DefaultSupportTree::connect_to_ground(Head &head)
                                                      {head.junction_point(),
                                                       head.r_back_mm},
                                                      head.r_back_mm,
-                                                     head.dir);
+                                                     head.dir,
+                                                     head.id);
 
     if (pillar_id >= 0) {
         // Save the pillar endpoint in the spatial index
@@ -746,7 +812,9 @@ bool DefaultSupportTree::connect_to_model_body(Head &head)
     h = std::min(hit.distance() - head.r_back_mm, h);
 
     // If this is a mini pillar dont bother with the tail width, can be 0.
-    if (head.r_back_mm < m_sm.cfg.head_back_radius_mm) h = std::max(h, 0.);
+    // "Mini" is relative to the radius this point asked for, not the global one.
+    if (head.r_back_mm < resolved_head_back_radius_mm(m_sm, head.id))
+        h = std::max(h, 0.);
     else if (h <= 0.) return false;
 
     Vec3d endp{hjp.x(), hjp.y(), hjp.z() - hit.distance() + h};
@@ -796,7 +864,7 @@ bool DefaultSupportTree::connect_to_model_body(Head &head)
     // bite by exactly the amount that was trimmed.
     const double anchor_penetration =
         clamped_head_penetration(m_sm.emesh, hitp, taildir,
-                                 m_sm.cfg.head_penetration_mm,
+                                 resolved_head_penetration_mm(m_sm, head.id),
                                  &m_penetration_stats);
 
     double dist = (hitp - endp).norm() + anchor_penetration;
@@ -884,6 +952,43 @@ void DefaultSupportTree::routing_to_model()
         execution::max_concurrency(suptree_ex_policy));
 }
 
+void DefaultSupportTree::adopt_prior_pillars()
+{
+    m_prior_pillar_ids.clear();
+    m_prior_pillar_ids.reserve(m_sm.prior.size());
+
+    for (const PriorPillar &pp : m_sm.prior) {
+        long pid = m_builder.add_frozen_pillar(pp.endpoint, pp.height,
+                                               pp.r_start, pp.r_end,
+                                               pp.links, pp.bridges);
+        m_pillar_index.insert(m_builder.pillar(pid).endpoint(), unsigned(pid));
+        m_prior_pillar_ids.push_back(pid);
+        m_prior_caller_ids[pid] = pp.id;
+    }
+}
+
+void DefaultSupportTree::note_prior_attachment(long pillar_id)
+{
+    if (pillar_id < 0 || size_t(pillar_id) >= m_builder.pillarcount())
+        return;
+    if (m_builder.pillar(pillar_id).frozen)
+        m_attached_prior_ids.insert(pillar_id);
+}
+
+PriorAttachments DefaultSupportTree::prior_attachments() const
+{
+    PriorAttachments out;
+    out.reserve(m_attached_prior_ids.size());
+    for (long pid : m_attached_prior_ids) {
+        const auto it = m_prior_caller_ids.find(pid);
+        if (it == m_prior_caller_ids.end())
+            continue;
+        const Pillar &p = m_builder.pillar(pid);
+        out.push_back(PriorAttachment{it->second, p.links, p.bridges});
+    }
+    return out;
+}
+
 void DefaultSupportTree::interconnect_pillars()
 {
     // Now comes the algorithm that connects pillars with each other.
@@ -952,6 +1057,11 @@ void DefaultSupportTree::interconnect_pillars()
 
             if(interconnect(pillar, neighborpillar)) {
                 pairs.insert(hashval);
+                // Bracing to a pillar carried in from an earlier generation is
+                // the whole point of additive support: report it, and report
+                // what it did to that pillar's link count.
+                note_prior_attachment(a);
+                note_prior_attachment(b);
 
                 // If the interconnection length between the two pillars is
                 // less than 50% of the longer pillar's height, don't count
@@ -970,8 +1080,15 @@ void DefaultSupportTree::interconnect_pillars()
         }
     };
 
-    // Run the cascade for the pillars in the index
-    m_pillar_index.foreach(cascadefn);
+    // Run the cascade for the pillars in the index. A frozen pillar is a
+    // neighbour, never a subject: cascading from it could add bracing that
+    // changes how the caller's existing support reads, which is exactly what
+    // an additive generation must not do. It can still be braced TO, because
+    // cascadefn queries the index and finds it.
+    m_pillar_index.foreach([this, &cascadefn](const PointIndexEl &el) {
+        if (!m_builder.pillar(el.second).frozen)
+            cascadefn(el);
+    });
 
     // We would be done here if we could allow some pillars to not be
     // connected with any neighbors. But this might leave the support tree
@@ -981,12 +1098,20 @@ void DefaultSupportTree::interconnect_pillars()
     // lonely pillars. One or even two additional pillar might get inserted
     // depending on the length of the lonely pillar.
 
+    // Propping a lonely pillar is the engine deciding the user needs more
+    // supports than they asked for. Where placement is the user's, it is not.
+    if (!m_sm.cfg.auxiliary_pillars) return;
+
     size_t pillarcount = m_builder.pillarcount();
 
     // Again, go through all pillars, this time in the whole support tree
     // not just the index.
     for(size_t pid = 0; pid < pillarcount; pid++) {
         auto pillar = [this, pid]() { return m_builder.pillar(pid); };
+
+        // Never prop up a frozen pillar: it was already resolved when it was
+        // generated, and adding to it now would change existing geometry.
+        if (pillar().frozen) continue;
 
         // Decide how many additional pillars will be needed:
 
@@ -1059,21 +1184,39 @@ void DefaultSupportTree::interconnect_pillars()
                 Vec3d s = spts[n];
                 Pillar p(Vec3d{s.x(), s.y(), gnd}, s.z() - gnd, pillar().r_start);
 
+                // The bracing is made against a pillar that does not exist yet:
+                // interconnect() is the test for whether this prop can be placed
+                // at all, and only a prop that passes is added. So the bars it
+                // makes have no id at that end until the pillar has one.
+                const size_t first_cross = m_builder.crossbridgecount();
+
                 if (interconnect(pillar(), p)) {
                     Pillar &pp = m_builder.pillar(m_builder.add_pillar(p));
+
+                    m_builder.own_crossbridges_from(first_cross, pp.id);
+
+                    // An auxiliary pillar carries no head, so this is the only
+                    // thing that says which support it belongs to.
+                    pp.props_for = pillar().id;
 
                     add_pillar_base(pp.id);
 
                     m_pillar_index.insert(pp.endpoint(), unsigned(pp.id));
 
+                    size_t first_junction = m_builder.junctioncount();
                     m_builder.add_junction(s, pillar().r_start);
+                    m_builder.own_junctions_from(first_junction, pp.id);
                     double t = bridge_mesh_distance(pillarsp, dirv(pillarsp, s),
                                                     pillar().r_start);
                     if (distance(pillarsp, s) < t)
-                        m_builder.add_bridge(pillarsp, s, pillar().r_start);
+                        m_builder.add_bridge_between(pp.id, pillarsp, s,
+                                                     pillar().r_start, pillar().id);
 
-                    if (pillar().endpoint().z() > ground_level(m_sm) + pillar().r_start)
+                    if (pillar().endpoint().z() > ground_level(m_sm) + pillar().r_start) {
+                        first_junction = m_builder.junctioncount();
                         m_builder.add_junction(pillar().endpoint(), pillar().r_start);
+                        m_builder.own_junctions_from(first_junction, pillar().id);
+                    }
 
                     newpills.emplace_back(pp.id);
                     m_builder.increment_links(pillar());

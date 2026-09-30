@@ -40,6 +40,10 @@
 #include "libslic3r/MultipleBeds.hpp"
 #include "libslic3r/BuildVolume.hpp"
 #include "libslic3r/SLA/Hollowing.hpp"
+#include "libslic3r/SLA/ModelFingerprint.hpp"
+#include "libslic3r/SLA/SupportPointIO.hpp"
+#include "libslic3r/SLA/PriorPillarIO.hpp"
+#include "libslic3r/SLA/SupportTreeIO.hpp"
 #include "libslic3r/TriangleMesh.hpp"
 
 #include "CLI/CLI.hpp"
@@ -49,6 +53,15 @@
 #include "stb_image_resize2.h"
 
 namespace Slic3r::CLI {
+
+void print_engine_error(const EngineError& err)
+{
+    // stdout, not stderr: stderr also carries BOOST_LOG and library noise, and
+    // the agent looks for this one line (design.md D2).
+    const std::string line = engine_error_line(err);
+    if (!line.empty())
+        boost::nowide::cout << line << std::endl;
+}
 
 static bool has_profile_sharing_action(const Data& cli)
 {
@@ -333,6 +346,51 @@ bool process_actions(Data& cli, const DynamicPrintConfig& print_config, std::vec
     DynamicPrintConfig& actions     = cli.actions_config;
     DynamicPrintConfig& transform   = cli.transform_config;
 
+    // Reads one CLI string option, treating an empty value as absent.
+    auto opt_path = [](const DynamicPrintConfig &cfg, const char *key) -> std::string {
+        return cfg.has(key) ? cfg.opt_string(key) : std::string();
+    };
+
+    const std::string import_support_points_path = opt_path(cli.misc_config, "import_support_points");
+    const std::string export_support_pillars_path = opt_path(cli.misc_config, "export_support_pillars");
+    const std::string export_support_tree_path = opt_path(cli.misc_config, "export_support_tree");
+    const std::string export_pad_stl_path = opt_path(cli.misc_config, "export_pad_stl");
+    const std::string export_brace_stls_dir = opt_path(cli.misc_config, "export_brace_stls");
+    const std::string export_support_points_path = opt_path(actions, "export_support_points");
+
+    // An empty path is a typo, never a way of saying "not this time". Treating
+    // it as absent would leave the caller waiting for a file that was never
+    // going to be written, with a successful exit code to go with it.
+    if (cli.misc_config.has("import_support_points") && import_support_points_path.empty()) {
+        boost::nowide::cerr << "error: --import-support-points needs a file path" << std::endl;
+        return false;
+    }
+    if (actions.has("export_support_points") && export_support_points_path.empty()) {
+        boost::nowide::cerr << "error: --export-support-points needs a file path" << std::endl;
+        return false;
+    }
+
+    // The support point interface and --import-support-stl are mutually
+    // exclusive. One hands the engine a finished support mesh; the other
+    // describes the points the engine should build one FROM. Accepting both
+    // would mean silently ignoring one of them, so this is checked here, at the
+    // top of the function, before any output file exists.
+    {
+        const std::string stl_path = opt_path(cli.misc_config, "import_support_stl");
+        const char *conflicting = nullptr;
+        if (!import_support_points_path.empty())
+            conflicting = "--import-support-points";
+        else if (!export_support_points_path.empty())
+            conflicting = "--export-support-points";
+
+        if (!stl_path.empty() && conflicting != nullptr) {
+            boost::nowide::cerr << "error: " << conflicting
+                                << " cannot be combined with --import-support-stl"
+                                << std::endl;
+            return false;
+        }
+    }
+
     // doesn't need any aditional input 
 
     if (actions.has("help")) {
@@ -348,7 +406,7 @@ bool process_actions(Data& cli, const DynamicPrintConfig& print_config, std::vec
     if (actions.has("info")) {
         if (models.empty()) {
             boost::nowide::cerr << "error: cannot show info for empty models." << std::endl;
-            return 1;
+            return false;
         }
         // --info works on unrepaired model
         for (Model& model : models) {
@@ -365,7 +423,7 @@ bool process_actions(Data& cli, const DynamicPrintConfig& print_config, std::vec
 
     if (models.empty() && (actions.has("export_stl") || actions.has("export_obj") || actions.has("export_3mf"))) {
         boost::nowide::cerr << "error: cannot export empty models." << std::endl;
-        return 1;
+        return false;
     }
 
     const std::string output = cli.misc_config.has("output") ? cli.misc_config.opt_string("output") : "";
@@ -374,23 +432,23 @@ bool process_actions(Data& cli, const DynamicPrintConfig& print_config, std::vec
         for (auto& model : models)
             model.add_default_instances();
         if (!export_models(models, IO::STL, output))
-            return 1;
+            return false;
     }
     if (actions.has("export_obj")) {
         for (auto& model : models)
             model.add_default_instances();
         if (!export_models(models, IO::OBJ, output))
-            return 1;
+            return false;
     }
     if (actions.has("export_3mf")) {
         if (!export_models(models, IO::TMF, output))
-            return 1;
+            return false;
     }
 
     if (actions.has("export_hollow_stl")) {
         if (models.empty()) {
             boost::nowide::cerr << "error: cannot hollow empty models." << std::endl;
-            return 1;
+            return false;
         }
 
         for (Model& model : models) {
@@ -399,13 +457,13 @@ bool process_actions(Data& cli, const DynamicPrintConfig& print_config, std::vec
                 // Get the mesh from the first volume (simplified - assumes single volume)
                 if (mo->volumes.empty()) {
                     boost::nowide::cerr << "error: model object has no volumes." << std::endl;
-                    return 1;
+                    return false;
                 }
 
                 TriangleMesh mesh = mo->volumes.front()->mesh();
                 if (mesh.empty()) {
                     boost::nowide::cerr << "error: mesh is empty." << std::endl;
-                    return 1;
+                    return false;
                 }
 
                 // Get hollowing parameters from config
@@ -425,14 +483,14 @@ bool process_actions(Data& cli, const DynamicPrintConfig& print_config, std::vec
                 auto interior = sla::generate_interior(mesh.its, hc);
                 if (!interior) {
                     boost::nowide::cerr << "error: failed to generate interior mesh." << std::endl;
-                    return 1;
+                    return false;
                 }
 
                 // Get the interior mesh
                 indexed_triangle_set interior_its = sla::get_mesh(*interior);
                 if (interior_its.indices.empty()) {
                     boost::nowide::cerr << "error: interior mesh is empty. Try reducing wall thickness for smaller models." << std::endl;
-                    return 1;
+                    return false;
                 }
 
                 // Flip normals for proper visualization (interior faces outward in PrusaSlicer)
@@ -448,7 +506,7 @@ bool process_actions(Data& cli, const DynamicPrintConfig& print_config, std::vec
                 // Export the interior mesh
                 if (!its_write_stl_binary(outpath.c_str(), "hollow_interior", interior_its)) {
                     boost::nowide::cerr << "error: failed to write interior mesh to " << outpath << std::endl;
-                    return 1;
+                    return false;
                 }
 
                 boost::nowide::cout << "Hollow interior mesh exported to " << outpath << std::endl;
@@ -456,15 +514,47 @@ bool process_actions(Data& cli, const DynamicPrintConfig& print_config, std::vec
         }
     }
 
-    if (actions.has("slice") || actions.has("export_gcode") || actions.has("export_sla") || actions.has("export_support_stl") || actions.has("export_preview_pngs")) {
+    if (actions.has("slice") || actions.has("export_gcode") || actions.has("export_sla") || actions.has("export_support_stl") || actions.has("export_preview_pngs") || !export_support_points_path.empty()) {
         PrinterTechnology       printer_technology = Preset::printer_technology(print_config);
         if (actions.has("export_gcode") && printer_technology == ptSLA) {
             boost::nowide::cerr << "error: cannot export G-code for an FFF configuration" << std::endl;
-            return 1;
+            return false;
         }
         else if (actions.has("export_sla") && printer_technology == ptFFF) {
             boost::nowide::cerr << "error: cannot export SLA slices for a SLA configuration" << std::endl;
-            return 1;
+            return false;
+        }
+        // Support points only exist in the SLA pipeline. Without this the FFF
+        // branch below would run a full slice and hand back a G-code file -
+        // a completely different artifact from the one that was asked for -
+        // while never writing the JSON and still exiting successfully.
+        else if (!export_support_points_path.empty() && printer_technology == ptFFF) {
+            boost::nowide::cerr << "error: --export-support-points requires an SLA configuration"
+                                << std::endl;
+            return false;
+        }
+        // Same reasoning in the other direction: an import that the SLA branch
+        // never reaches would be silently ignored.
+        else if (!import_support_points_path.empty() && printer_technology == ptFFF) {
+            boost::nowide::cerr << "error: --import-support-points requires an SLA configuration"
+                                << std::endl;
+            return false;
+        }
+
+        // The interchange file describes ONE object, and both paths below run
+        // once per input model. Left unchecked, two inputs would take turns
+        // writing the same export path and only the last one would survive -
+        // silently, with a successful exit code. Refused up front, before any
+        // slicing happens.
+        if (models.size() != 1) {
+            const char *which = !export_support_points_path.empty() ? "--export-support-points"
+                              : !import_support_points_path.empty() ? "--import-support-points"
+                                                                    : nullptr;
+            if (which != nullptr) {
+                boost::nowide::cerr << "error: " << which << " handles a single input model; "
+                                    << models.size() << " were given" << std::endl;
+                return false;
+            }
         }
 
         const Vec2crd           gap{ s_multiple_beds.get_bed_gap() };
@@ -501,6 +591,87 @@ bool process_actions(Data& cli, const DynamicPrintConfig& print_config, std::vec
                     fff_print.auto_assign_extruders(mo);
             }
 
+            // Load a caller supplied support point list (--import-support-points).
+            //
+            // This runs BEFORE print->apply() on purpose. apply() decides which
+            // pipeline steps are invalidated from the model's contents and
+            // copies that state into the print object, so points written after
+            // it would sit in the model with nothing looking at them.
+            // --import-support-stl below is the opposite case: it operates on an
+            // SLAPrintObject, which does not exist until apply() has run.
+            if (printer_technology == ptSLA && !import_support_points_path.empty()) {
+                boost::nowide::ifstream ifs(import_support_points_path);
+                if (!ifs.good()) {
+                    boost::nowide::cerr << "error: failed to open --import-support-points: "
+                                        << import_support_points_path << std::endl;
+                    return false;
+                }
+                std::ostringstream text;
+                text << ifs.rdbuf();
+
+                // The globals the file falls back to for any size it does not
+                // name. Built from the print config because no SLAPrintObject
+                // exists yet at this point.
+                SLAPrintObjectConfig obj_cfg;
+                obj_cfg.apply(print_config, true);
+                const sla::SupportTreeConfig scfg = make_support_cfg(obj_cfg);
+
+                sla::SupportPointFile file;
+                std::string parse_err;
+                if (!sla::support_points_from_string(text.str(), scfg, file, parse_err)) {
+                    boost::nowide::cerr << "error: --import-support-points: " << parse_err
+                                        << std::endl;
+                    return false;
+                }
+
+                // The interchange format carries a flat point list with no
+                // object_id dimension yet (openspec task 9.8 is still open), so
+                // there is no way to say which object a point belongs to.
+                // Refusing beats guessing.
+                if (model.objects.size() != 1) {
+                    boost::nowide::cerr << "error: --import-support-points handles a single object "
+                                           "per file; this model has " << model.objects.size()
+                                        << std::endl;
+                    return false;
+                }
+
+                ModelObject *mo = model.objects.front();
+
+                if (file.has_fingerprint) {
+                    const sla::ModelFingerprint current = sla::model_fingerprint(*mo);
+                    if (!sla::fingerprint_matches(file.fingerprint, current)) {
+                        // A fixed, untranslatable marker: the backend classifier
+                        // matches on this line to tell "the model changed" apart
+                        // from "support generation failed". Nothing is sliced and
+                        // no output file is written; in particular this must NOT
+                        // fall back to generating points automatically, which
+                        // would silently discard the caller's edits.
+                        print_engine_error(make_engine_error(
+                            EngineErrorCode::SUPPORT_POINTS_MODEL_MISMATCH,
+                            sla::support_points_model_mismatch_marker));
+                        boost::nowide::cerr << sla::support_points_model_mismatch_marker << std::endl;
+                        boost::nowide::cerr << "  expected: "
+                                            << sla::fingerprint_to_string(file.fingerprint) << std::endl;
+                        boost::nowide::cerr << "  actual:   "
+                                            << sla::fingerprint_to_string(current) << std::endl;
+                        return false;
+                    }
+                } else {
+                    // A hand written list that only adds a few points has no
+                    // fingerprint to carry. Loading it is allowed, but the caller
+                    // is told that nothing was verified.
+                    boost::nowide::cerr << "warning: --import-support-points file carries no model "
+                                           "fingerprint; loaded without checking it against the model."
+                                        << std::endl;
+                }
+
+                mo->sla_support_points = file.points;
+                mo->sla_points_status  = sla::PointsStatus::UserModified;
+                boost::nowide::cout << "Loaded " << file.points.size()
+                                    << " support points from " << import_support_points_path
+                                    << std::endl;
+            }
+
             update_instances_outside_state(model, print_config);
             MultipleBedsUtils::with_single_bed_model_fff(model, 0, [&print, &model, &print_config]()
             {
@@ -517,7 +688,7 @@ bool process_actions(Data& cli, const DynamicPrintConfig& print_config, std::vec
                     TriangleMesh support_mesh;
                     if (!support_mesh.ReadSTLFile(support_path.c_str()) || support_mesh.empty()) {
                         boost::nowide::cerr << "error: failed to read --import-support-stl: " << support_path << std::endl;
-                        return 1;
+                        return false;
                     }
                     // Strip exact duplicate faces before the mesh reaches the slicer, so that
                     // slice_supports() and merge_slices_and_eval_stats() both work on a single
@@ -539,22 +710,60 @@ bool process_actions(Data& cli, const DynamicPrintConfig& print_config, std::vec
                 }
             }
 
+            // Additive generation: hand the engine the pillars of the support
+            // that is already on the plate. They are braced to and counted
+            // towards the new pillar's link budget, but never re-emitted.
+            const std::string prior_supports_path = opt_path(cli.misc_config, "prior_supports");
+            if (printer_technology == ptSLA && !prior_supports_path.empty()) {
+                boost::nowide::ifstream pifs(prior_supports_path);
+                if (!pifs.good()) {
+                    boost::nowide::cerr << "error: failed to open --prior-supports: "
+                                        << prior_supports_path << std::endl;
+                    return false;
+                }
+                std::ostringstream ptext;
+                ptext << pifs.rdbuf();
+
+                sla::PriorPillars priors;
+                std::string prior_err;
+                if (!sla::prior_pillars_from_string(ptext.str(), priors, prior_err)) {
+                    boost::nowide::cerr << "error: --prior-supports: " << prior_err << std::endl;
+                    return false;
+                }
+                if (!sla_print.attach_prior_pillars(priors))
+                    boost::nowide::cerr << "warning: --prior-supports provided but no SLA object to attach to." << std::endl;
+                else
+                    boost::nowide::cout << "Loaded " << priors.size()
+                                        << " prior support pillars from " << prior_supports_path << std::endl;
+            }
+
             if (actions.has("export_preview_pngs") && printer_technology == ptSLA) {
                 double scale = actions.opt_float("export_preview_pngs");
                 if (scale > 0.)
                     sla_print.set_preview_scale(scale);
             }
 
-            std::string err = print->validate();
-            if (!err.empty()) {
-                boost::nowide::cerr << err << std::endl;
-                return 1;
+            // SLA reports its validation failure with the engine error code;
+            // the message printed to stderr is the same text as before either way.
+            EngineError validation;
+            if (printer_technology == ptSLA)
+                validation = sla_print.validate_error();
+            else
+                validation.message = print->validate();
+            if (validation.failed()) {
+                print_engine_error(validation);
+                boost::nowide::cerr << validation.message << std::endl;
+                return false;
             }
 
             std::string outfile = output;
 
-            if (print->empty())
+            if (print->empty()) {
+                print_engine_error(make_engine_error(
+                    EngineErrorCode::MODEL_OUT_OF_BOUNDS,
+                    "Either the print is empty or no object is fully inside the print volume."));
                 boost::nowide::cout << "Nothing to print for " << outfile << " . Either the print is empty or no object is fully inside the print volume." << std::endl;
+            }
             else
                 try {
                 std::string outfile_final;
@@ -570,7 +779,27 @@ bool process_actions(Data& cli, const DynamicPrintConfig& print_config, std::vec
                     && !actions.has("slice")
                     && !actions.has("export_gcode")
                     && !actions.has("export_preview_pngs");
-                if (support_stl_only) {
+                // Points-only fast path: stop one step earlier still, right
+                // after the support points are computed. Nothing downstream -
+                // support tree, pad, slicing, rasterization - is needed to write
+                // the point list, and skipping the tree is where the speed comes
+                // from. Note this deliberately excludes export_support_stl:
+                // asking for both is legal, and the pad stop below already runs
+                // past the support point step.
+                const bool support_points_only = printer_technology == ptSLA
+                    && !export_support_points_path.empty()
+                    && !actions.has("export_support_stl")
+                    && !actions.has("export_sla")
+                    && !actions.has("slice")
+                    && !actions.has("export_gcode")
+                    && !actions.has("export_preview_pngs");
+
+                if (support_points_only) {
+                    PrintBase::TaskParams task_params;
+                    task_params.to_object_step = slaposSupportPoints;
+                    sla_print.set_task(task_params);
+                }
+                else if (support_stl_only) {
                     PrintBase::TaskParams task_params;
                     task_params.to_object_step = slaposPad;
                     sla_print.set_task(task_params);
@@ -584,9 +813,9 @@ bool process_actions(Data& cli, const DynamicPrintConfig& print_config, std::vec
                 }
                 else {
                     outfile = sla_print.output_filepath(outfile);
-                    if (support_stl_only) {
-                        // No sl1 archive in this mode; keep a filename stem for
-                        // the *_support.stl output below.
+                    if (support_stl_only || support_points_only) {
+                        // No sl1 archive in either of these modes; keep a
+                        // filename stem for the *_support.stl output below.
                         outfile_final = outfile;
                     }
                     else {
@@ -615,6 +844,88 @@ bool process_actions(Data& cli, const DynamicPrintConfig& print_config, std::vec
                         }
                     }
 
+                    // Write the support point list (--export-support-points).
+                    if (!export_support_points_path.empty()) {
+                        if (sla_print.objects().size() != 1) {
+                            boost::nowide::cerr << "error: --export-support-points handles a single "
+                                                   "object per file; this print has "
+                                                << sla_print.objects().size() << std::endl;
+                            return false;
+                        }
+
+                        const SLAPrintObject *po = sla_print.objects().front();
+                        if (!po->is_step_done(slaposSupportPoints)) {
+                            boost::nowide::cerr << "error: --export-support-points: the support point "
+                                                   "step did not run" << std::endl;
+                            return false;
+                        }
+
+                        // Back into the coordinate system of the file the caller
+                        // handed in. trafo() is used through its accessor and
+                        // inverted whole: it folds in the shrinkage compensation
+                        // and a left handed mirroring, and rebuilding it by hand
+                        // would quietly lose both.
+                        const Transform3d to_object_space = po->trafo().inverse();
+
+                        sla::SupportPoints out_points;
+                        const std::vector<sla::SupportPoint> &pts = po->get_support_points();
+                        out_points.reserve(pts.size());
+                        for (const sla::SupportPoint &sp : pts) {
+                            const Vec3d mapped = to_object_space * sp.pos.cast<double>();
+
+                            // trafo() is only invertible while its linear part
+                            // is non-singular, and it is built as
+                            // Diagonal(correction) * instance.linear() - either
+                            // factor can collapse to zero through a zero
+                            // shrinkage compensation or a zero instance scale.
+                            // Eigen answers a singular inverse with infinities
+                            // rather than an exception, so the check has to be
+                            // on the result. in_float_range() also covers the
+                            // narrowing to float below, which is undefined
+                            // behaviour for anything past FLT_MAX.
+                            if (!sla::detail::in_float_range(mapped.x()) ||
+                                !sla::detail::in_float_range(mapped.y()) ||
+                                !sla::detail::in_float_range(mapped.z())) {
+                                // No fields: a zero instance scale lands here too,
+                                // so which setting caused it is not known here.
+                                print_engine_error(make_engine_error(
+                                    EngineErrorCode::SHRINKAGE_COMPENSATION_INVALID,
+                                    "the object transform is not invertible"));
+                                boost::nowide::cerr
+                                    << "error: --export-support-points: the object transform is "
+                                       "not invertible (a zero scale or a zero shrinkage "
+                                       "compensation), so support point coordinates cannot be "
+                                       "mapped back to the input model" << std::endl;
+                                return false;
+                            }
+
+                            sla::SupportPoint moved = sp;
+                            moved.pos = mapped.cast<float>();
+                            out_points.push_back(moved);
+                        }
+
+                        const sla::SupportTreeConfig scfg = make_support_cfg(po->config());
+                        const sla::ModelFingerprint fp = sla::model_fingerprint(*po->model_object());
+
+                        boost::nowide::ofstream ofs(export_support_points_path);
+                        if (!ofs.good()) {
+                            boost::nowide::cerr << "error: failed to open --export-support-points for "
+                                                   "writing: " << export_support_points_path << std::endl;
+                            return false;
+                        }
+                        ofs << sla::support_points_to_string(out_points, fp, scfg) << std::endl;
+                        ofs.close();
+                        if (!ofs) {
+                            boost::nowide::cerr << "error: failed to write --export-support-points: "
+                                                << export_support_points_path << std::endl;
+                            return false;
+                        }
+
+                        boost::nowide::cout << "Support points exported to "
+                                            << export_support_points_path << " ("
+                                            << out_points.size() << " points)" << std::endl;
+                    }
+
                     // Export support mesh (including pad) as STL if requested
                     if (actions.has("export_support_stl")) {
                         for (const SLAPrintObject* po : sla_print.objects()) {
@@ -640,6 +951,84 @@ bool process_actions(Data& cli, const DynamicPrintConfig& print_config, std::vec
                                 }
                             }
 
+                            // The pillars this generation grew, for handing to
+                            // the next one as --prior-supports. Written even when
+                            // the mesh is empty: "nothing grew" is a real answer
+                            // the caller has to be able to record.
+                            if (!export_support_pillars_path.empty()) {
+                                const std::string doc = sla::prior_pillars_to_string(
+                                    po->generated_pillars(), po->get_elevation(),
+                                    po->prior_attachments());
+                                boost::nowide::ofstream pofs(export_support_pillars_path);
+                                if (pofs.good()) {
+                                    pofs << doc;
+                                    boost::nowide::cout << "Support pillars exported to "
+                                                        << export_support_pillars_path << " ("
+                                                        << po->generated_pillars().size()
+                                                        << " pillars)" << std::endl;
+                                } else {
+                                    boost::nowide::cerr << "Failed to export support pillars to "
+                                                        << export_support_pillars_path << std::endl;
+                                }
+                            }
+
+                            // The pad on its own. The support mesh export merges
+                            // it in, which is right for printing and wrong for a
+                            // caller drawing from the element list: a pad is an
+                            // extruded footprint, not pillars and bracing, so the
+                            // tree has no way to carry it.
+                            if (!export_pad_stl_path.empty()) {
+                                TriangleMesh pad_only = po->pad_mesh();
+                                if (!pad_only.empty()) {
+                                    if (pad_only.write_binary(export_pad_stl_path.c_str()))
+                                        boost::nowide::cout << "Pad mesh exported to " << export_pad_stl_path << std::endl;
+                                    else
+                                        boost::nowide::cerr << "Failed to export pad mesh to " << export_pad_stl_path << std::endl;
+                                } else {
+                                    boost::nowide::cout << "No pad mesh generated" << std::endl;
+                                }
+                            }
+
+                            // The same support as data rather than triangles.
+                            // Written even when nothing grew, for the same
+                            // reason the pillar list is.
+                            if (!export_support_tree_path.empty()) {
+                                const auto &els = po->support_tree_elements();
+                                const std::string doc = sla::support_tree_to_string(
+                                    els, po->get_elevation());
+                                boost::nowide::ofstream tofs(export_support_tree_path);
+                                if (tofs.good()) {
+                                    tofs << doc;
+                                    boost::nowide::cout << "Support tree exported to "
+                                                        << export_support_tree_path << " ("
+                                                        << els.pillars.size() << " pillars, "
+                                                        << els.bridges.size() << " bars)"
+                                                        << std::endl;
+                                } else {
+                                    boost::nowide::cerr << "Failed to export support tree to "
+                                                        << export_support_tree_path << std::endl;
+                                }
+                            }
+
+                            // Braces reaching pillars from earlier generations,
+                            // one file each. Separate from the support mesh so
+                            // that removing such a pillar can take its brace
+                            // with it, leaving the support itself untouched.
+                            if (!export_brace_stls_dir.empty()) {
+                                boost::system::error_code ec;
+                                boost::filesystem::create_directories(export_brace_stls_dir, ec);
+                                for (const auto &[prior_id, its] : po->frozen_braces()) {
+                                    if (its.empty()) continue;
+                                    TriangleMesh bm{its};
+                                    boost::filesystem::path bp(export_brace_stls_dir);
+                                    bp /= ("brace_" + std::to_string(prior_id) + ".stl");
+                                    if (bm.write_binary(bp.string().c_str()))
+                                        boost::nowide::cout << "Brace mesh exported to " << bp.string() << std::endl;
+                                    else
+                                        boost::nowide::cerr << "Failed to export brace mesh to " << bp.string() << std::endl;
+                                }
+                            }
+
                             if (!combined_mesh.empty()) {
                                 boost::filesystem::path support_path(outfile_final);
                                 std::string stem = support_path.stem().string();
@@ -653,7 +1042,19 @@ bool process_actions(Data& cli, const DynamicPrintConfig& print_config, std::vec
                                     else if (has_pad)
                                         boost::nowide::cout << " (pad only)";
                                     boost::nowide::cout << std::endl;
+                                } else if (support_stl_only) {
+                                    // The STL is all this run was asked for, so
+                                    // not writing it fails the run.
+                                    print_engine_error(make_engine_error(
+                                        EngineErrorCode::SUPPORT_MESH_EXPORT_FAILED,
+                                        "Failed to export support mesh to " + support_path.string()));
+                                    boost::nowide::cerr << "Failed to export support mesh to " << support_path.string() << std::endl;
+                                    return false;
                                 } else {
+                                    // A slice: the .sl1 is already written and this
+                                    // file only feeds the UI, so the failure is
+                                    // reported and the slice stands, like the
+                                    // preview ZIP above.
                                     boost::nowide::cerr << "Failed to export support mesh to " << support_path.string() << std::endl;
                                 }
                             } else {
@@ -662,7 +1063,7 @@ bool process_actions(Data& cli, const DynamicPrintConfig& print_config, std::vec
                         }
                     }
                 }
-                if (!support_stl_only) {
+                if (!support_stl_only && !support_points_only) {
                     if (outfile != outfile_final) {
                         if (Slic3r::rename_file(outfile, outfile_final)) {
                             boost::nowide::cerr << "Renaming file " << outfile << " to " << outfile_final << " failed" << std::endl;
@@ -676,6 +1077,10 @@ bool process_actions(Data& cli, const DynamicPrintConfig& print_config, std::vec
                 }
             }
             catch (const std::exception& ex) {
+                // Coded exceptions keep their original type (SlicingError,
+                // RuntimeError), so only a cross-cast finds the code.
+                if (const auto *carrier = dynamic_cast<const EngineErrorCarrier *>(&ex))
+                    print_engine_error(carrier->engine_error());
                 boost::nowide::cerr << ex.what() << std::endl;
                 return false;
             }

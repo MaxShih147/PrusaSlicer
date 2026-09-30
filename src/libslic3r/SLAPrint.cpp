@@ -83,6 +83,7 @@ sla::SupportTreeConfig make_support_cfg(const SLAPrintObjectConfig& c)
                 scfg.safety_distance_mm : c.support_base_safety_distance.getFloat();
 
         scfg.max_bridges_on_pillar = unsigned(c.support_max_bridges_on_pillar.getInt());
+        scfg.auxiliary_pillars = c.support_auxiliary_pillars.getBool();
         scfg.max_weight_on_model_support = c.support_max_weight_on_model.getFloat();
         break;
     }
@@ -112,6 +113,7 @@ sla::SupportTreeConfig make_support_cfg(const SLAPrintObjectConfig& c)
                 scfg.safety_distance_mm : c.branchingsupport_base_safety_distance.getFloat();
 
         scfg.max_bridges_on_pillar = unsigned(c.branchingsupport_max_bridges_on_pillar.getInt());
+        scfg.auxiliary_pillars = c.branchingsupport_auxiliary_pillars.getBool();
         scfg.max_weight_on_model_support = c.branchingsupport_max_weight_on_model.getFloat();
         break;
     }
@@ -695,6 +697,14 @@ bool SLAPrint::attach_imported_support(const indexed_triangle_set &its)
     return true;
 }
 
+bool SLAPrint::attach_prior_pillars(const sla::PriorPillars &pillars)
+{
+    if (m_objects.empty())
+        return false;
+    m_objects.front()->set_prior_pillars(pillars);
+    return true;
+}
+
 std::string SLAPrint::output_filename(const std::string &filename_base) const
 {
     DynamicConfig config = this->finished() ? this->print_statistics().config() : this->print_statistics().placeholders();
@@ -712,6 +722,14 @@ std::string SLAPrint::output_filename(const std::string &filename_base) const
 
 std::string SLAPrint::validate(std::vector<std::string>*) const
 {
+    return validate_error().message;
+}
+
+EngineError SLAPrint::validate_error() const
+{
+    // Every check, message and ordering below is the same as before this
+    // function existed; only the code, fields and values are new.
+
     for(SLAPrintObject * po : m_objects) {
 
         const ModelObject *mo = po->model_object();
@@ -720,32 +738,42 @@ std::string SLAPrint::validate(std::vector<std::string>*) const
         if(supports_en &&
            mo->sla_points_status == sla::PointsStatus::UserModified &&
            mo->sla_support_points.empty())
-            return _u8L("Cannot proceed without support points! "
-                     "Add support points or disable support generation.");
+            return make_engine_error(EngineErrorCode::SUPPORT_POINTS_REQUIRED,
+                         _u8L("Cannot proceed without support points! "
+                              "Add support points or disable support generation."),
+                         {"supports_enable"});
 
         sla::SupportTreeConfig cfg = make_support_cfg(po->config());
 
         double elv = cfg.object_elevation_mm;
-        
+
         sla::PadConfig padcfg = make_pad_cfg(po->config());
         sla::PadConfig::EmbedObject &builtinpad = padcfg.embed_object;
-        
+
         if(supports_en && !builtinpad.enabled && elv < cfg.head_fullwidth())
-            return _u8L(
-                "Elevation is too low for object. Use the \"Pad around "
-                "object\" feature to print the object without elevation.");
-        
+            return make_engine_error(EngineErrorCode::SUPPORT_ELEVATION_TOO_LOW,
+                         _u8L("Elevation is too low for object. Use the \"Pad around "
+                              "object\" feature to print the object without elevation."),
+                         {"support_object_elevation", "support_head_front_diameter",
+                          "support_pillar_diameter", "support_head_width",
+                          "support_head_penetration"},
+                         {{"min_support_object_elevation", cfg.head_fullwidth()},
+                          {"support_object_elevation", elv}});
+
         if(supports_en && builtinpad.enabled &&
            cfg.pillar_base_safety_distance_mm < builtinpad.object_gap_mm) {
-            return _u8L(
-                "The endings of the support pillars will be deployed on the "
-                "gap between the object and the pad. 'Support base safety "
-                "distance' has to be greater than the 'Pad object gap' "
-                "parameter to avoid this.");
+            return make_engine_error(EngineErrorCode::SUPPORT_PAD_GAP_CONFLICT,
+                         _u8L("The endings of the support pillars will be deployed on the "
+                              "gap between the object and the pad. 'Support base safety "
+                              "distance' has to be greater than the 'Pad object gap' "
+                              "parameter to avoid this."),
+                         {"support_base_safety_distance", "pad_object_gap"},
+                         {{"effective_support_base_safety_distance", cfg.pillar_base_safety_distance_mm},
+                          {"pad_object_gap", builtinpad.object_gap_mm}});
         }
-        
-        std::string pval = padcfg.validate();
-        if (!pval.empty()) return pval;
+
+        EngineError pval = padcfg.validate_error();
+        if (pval.failed()) return pval;
     }
 
     double expt_max = m_printer_config.max_exposure_time.getFloat();
@@ -753,43 +781,66 @@ std::string SLAPrint::validate(std::vector<std::string>*) const
     double expt_cur = m_material_config.exposure_time.getFloat();
 
     if (expt_cur < expt_min || expt_cur > expt_max)
-        return _u8L("Exposition time is out of printer profile bounds.");
+        return make_engine_error(EngineErrorCode::EXPOSURE_TIME_OUT_OF_RANGE,
+                     _u8L("Exposition time is out of printer profile bounds."),
+                     {"exposure_time"},
+                     {{"min_exposure_time", expt_min},
+                      {"max_exposure_time", expt_max},
+                      {"exposure_time", expt_cur}});
 
     double iexpt_max = m_printer_config.max_initial_exposure_time.getFloat();
     double iexpt_min = m_printer_config.min_initial_exposure_time.getFloat();
     double iexpt_cur = m_material_config.initial_exposure_time.getFloat();
 
     if (iexpt_cur < iexpt_min || iexpt_cur > iexpt_max)
-        return _u8L("Initial exposition time is out of printer profile bounds.");
+        return make_engine_error(EngineErrorCode::EXPOSURE_TIME_OUT_OF_RANGE,
+                     _u8L("Initial exposition time is out of printer profile bounds."),
+                     {"initial_exposure_time"},
+                     {{"min_initial_exposure_time", iexpt_min},
+                      {"max_initial_exposure_time", iexpt_max},
+                      {"initial_exposure_time", iexpt_cur}});
 
     for (const std::string& prefix : { "", "branching" }) {
+        // The branching variants have no counterpart in the agent's SLAConfig,
+        // so there is no panel field to point at: report the code alone.
+        auto fields_if_mapped = [&prefix](std::vector<std::string> fields) {
+            return prefix.empty() ? std::move(fields) : std::vector<std::string>{};
+        };
 
         double head_penetration = m_full_print_config.opt_float(prefix + "support_head_penetration");
         double head_width       = m_full_print_config.opt_float(prefix + "support_head_width");
 
         if (head_penetration > head_width) {
-            return _u8L("Invalid Head penetration\n"
-                        "Head penetration should not be greater than the Head width.\n"
-                        "Please check value of Head penetration in Print Settings or Material Overrides.");
+            return make_engine_error(EngineErrorCode::SUPPORT_HEAD_PENETRATION_INVALID,
+                         _u8L("Invalid Head penetration\n"
+                              "Head penetration should not be greater than the Head width.\n"
+                              "Please check value of Head penetration in Print Settings or Material Overrides."),
+                         fields_if_mapped({"support_head_penetration", "support_head_width"}));
         }
 
         double pinhead_d = m_full_print_config.opt_float(prefix + "support_head_front_diameter");
         double pillar_d  = m_full_print_config.opt_float(prefix + "support_pillar_diameter");
 
         if (pinhead_d > pillar_d) {
-            return _u8L("Invalid pinhead diameter\n"
-                        "Pinhead front diameter should be smaller than the Pillar diameter.\n"
-                        "Please check value of Pinhead front diameter in Print Settings or Material Overrides.");
+            return make_engine_error(EngineErrorCode::SUPPORT_HEAD_TOO_WIDE,
+                         _u8L("Invalid pinhead diameter\n"
+                              "Pinhead front diameter should be smaller than the Pillar diameter.\n"
+                              "Please check value of Pinhead front diameter in Print Settings or Material Overrides."),
+                         fields_if_mapped({"support_head_front_diameter", "support_pillar_diameter"}));
         }
     }
 
     if ((!m_material_config.use_tilt.get_at(0) && is_approx(m_material_config.tower_hop_height.get_at(0), 0.))
-        || (!m_material_config.use_tilt.get_at(1) && is_approx(m_material_config.tower_hop_height.get_at(1), 0.)))
-        return _u8L("Disabling the 'Use tilt' function causes the object to separate away from the film in the "
-                    "vertical direction only. Therefore, it is necessary to set the 'Tower hop height' parameter "
-                    "to reasonable value. The recommended value is 5 mm.");
+        || (!m_material_config.use_tilt.get_at(1) && is_approx(m_material_config.tower_hop_height.get_at(1), 0.))) {
+        // No registered code for this one yet: message only, as before.
+        EngineError err;
+        err.message = _u8L("Disabling the 'Use tilt' function causes the object to separate away from the film in the "
+                           "vertical direction only. Therefore, it is necessary to set the 'Tower hop height' parameter "
+                           "to reasonable value. The recommended value is 5 mm.");
+        return err;
+    }
 
-    return "";
+    return {};
 }
 
 void SLAPrint::export_print(const std::string &fname, const ThumbnailsList &thumbnails, const std::string &projectname)
@@ -1102,7 +1153,23 @@ bool SLAPrintObject::invalidate_state_by_config_options(const std::vector<t_conf
             steps.emplace_back(slaposObjectSlice);
         } else if (
                opt_key == "support_points_density_relative"
+            || opt_key == "support_points_min_distance"
             || opt_key == "support_enforcers_only"
+            // The two critical angles belong here, not with the rest of the
+            // support settings below, because the overhang filter now runs in
+            // slaposSupportPoints (Phase 3 of SLAPrintSteps.cpp's
+            // support_points()) rather than in the support tree. Changing one
+            // of them changes which points EXIST, so the point list itself has
+            // to be recomputed - invalidating only slaposSupportTree would
+            // rebuild the tree from a stale, differently-filtered list.
+            //
+            // The one-shot CLI process the backend drives recomputes
+            // everything anyway and cannot observe this; the registration is
+            // for the GUI and any other caller that keeps an SLAPrintObject
+            // alive across a config edit
+            // (capability sla-overhang-threshold-semantics).
+            || opt_key == "support_critical_angle"
+            || opt_key == "branchingsupport_critical_angle"
             ) {
             steps.emplace_back(slaposSupportPoints);
         } else if (
@@ -1118,6 +1185,15 @@ bool SLAPrintObject::invalidate_state_by_config_options(const std::vector<t_conf
             || opt_key == "support_buildplate_only"
             || opt_key == "support_base_diameter"
             || opt_key == "support_base_height"
+            // KEPT, BUT NEVER REACHED: this is an else-if chain and both
+            // critical angles now match the slaposSupportPoints branch above.
+            // They stay listed here to document that the support tree is still
+            // a dependent of these settings, and because invalidating
+            // slaposSupportPoints propagates to slaposSupportTree anyway
+            // (invalidate_step(), a few functions down). If the branch above is
+            // ever removed, these two become live again with the old behaviour
+            // - which would be wrong once the filter lives in step 5
+            // (openspec change align-support-point-overhang-filter, D5).
             || opt_key == "support_critical_angle"
             || opt_key == "support_bracing_angle"
             || opt_key == "support_max_bridge_length"
@@ -1135,7 +1211,7 @@ bool SLAPrintObject::invalidate_state_by_config_options(const std::vector<t_conf
             || opt_key == "branchingsupport_buildplate_only"
             || opt_key == "branchingsupport_base_diameter"
             || opt_key == "branchingsupport_base_height"
-            || opt_key == "branchingsupport_critical_angle"
+            || opt_key == "branchingsupport_critical_angle" // kept, never reached - see the note above
             || opt_key == "branchingsupport_bracing_angle"
             || opt_key == "branchingsupport_max_bridge_length"
             || opt_key == "branchingsupport_max_pillar_link_distance"

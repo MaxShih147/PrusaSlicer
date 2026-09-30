@@ -464,14 +464,15 @@ bool optimize_pinhead_placement(Ex                     policy,
     // skip if the tilt is not sane
     if (polar < PI - m.cfg.normal_cutoff_angle) return false;
 
-    // Skip surfaces that tilt too far from horizontal to count as an overhang.
-    // Rearranged, this places a head only where the surface's slope from the
-    // horizontal plane is at most (PI/2 - overhang_angle_threshold) -- so a
-    // SMALLER threshold supports MORE surfaces: 0 supports every overhang,
-    // PI/2 supports only perfectly horizontal down-facing surfaces. Must stay
-    // identical to the Default tree's copy in DefaultSupportTree.cpp
+    // NO overhang angle gate here, on purpose. It runs once, upstream, in
+    // Phase 3 of support_points() (step slaposSupportPoints), so that an
+    // exported point list no longer carries points this step would have
+    // dropped for angle, and so that an IMPORTED list is never re-filtered.
+    // Angle is the only dimension made to agree that way - a point can still
+    // lose its head below to collision or to cluster dedup.
+    // Re-adding a passes_overhang_filter() call here brings back both the
+    // orphan points and the silent re-filtering of the user's own points
     // (capability sla-overhang-threshold-semantics).
-    if (polar < M_PI / 2.0 + m.cfg.overhang_angle_threshold) return false;
 
     // We saturate the polar angle to 3pi/4
     polar = std::max(polar, PI - m.cfg.bridge_slope);
@@ -615,6 +616,11 @@ inline long build_ground_connection(SupportTreeBuilder &builder,
     auto it = conn.path.begin();
     auto itnx = std::next(it);
 
+    // The route is laid down before the pillar it ends in exists, so remember
+    // where these start and hand them over once it does.
+    const size_t first_junction = builder.junctioncount();
+    const size_t first_bridge   = builder.diffbridgecount();
+
     while (itnx != conn.path.end()) {
         builder.add_diffbridge(*it, *itnx);
         builder.add_junction(*itnx);
@@ -641,6 +647,9 @@ inline long build_ground_connection(SupportTreeBuilder &builder,
 
     if (conn.pillar_base->r_top >= sm.cfg.head_back_radius_mm)
         builder.add_pillar_base(ret, conn.pillar_base->height, conn.pillar_base->r_bottom);
+
+    builder.own_junctions_from(first_junction, ret);
+    builder.own_diffbridges_from(first_bridge, ret);
 
     return ret;
 }

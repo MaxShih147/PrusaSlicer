@@ -4147,6 +4147,18 @@ void PrintConfigDef::init_sla_support_params(const std::string &prefix)
     def->mode = comExpert;
     def->set_default_value(new ConfigOptionInt(prefix == "branching" ? 2 : 3));
 
+    def = this->add(prefix + "support_auxiliary_pillars", coBool);
+    def->label = L("Auxiliary support pillars");
+    def->tooltip = L(
+        "Let the engine prop up a pillar that stands too tall with nothing "
+        "braced to it, by adding one or two pillars of its own beside it. Turn "
+        "off where the user places supports by hand: one placement should "
+        "produce one support, not three. A tall lone pillar is then likelier to "
+        "fail on the printer, which becomes the placer's call rather than the "
+        "engine's.");
+    def->mode = comExpert;
+    def->set_default_value(new ConfigOptionBool(true));
+
     def = this->add(prefix + "support_max_weight_on_model", coFloat);
     def->label = L("Max weight on model");
     def->category = L("Supports");
@@ -4693,6 +4705,19 @@ void PrintConfigDef::init_sla_params()
     def->sidetext = L("%");
     def->min = 0;
     def->set_default_value(new ConfigOptionInt(100));
+
+    def = this->add("support_points_min_distance", coFloat);
+    def->label = L("Support points minimum distance");
+    def->category = L("Supports");
+    def->tooltip = L("Support points on the same layer are never placed closer "
+                     "together than this. 0 leaves the spacing to the automatic "
+                     "placement, which is what it was before this setting "
+                     "existed. The generator's own figure is 3.2 mm, so that is "
+                     "the value which reproduces it.");
+    def->sidetext = L("mm");
+    def->min = 0;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(0.));
 
     def = this->add("pad_enable", coBool);
     def->label = L("Use pad");
@@ -6013,6 +6038,11 @@ CLIActionsConfigDef::CLIActionsConfigDef()
     def->cli = "export-support-stl";
     def->set_default_value(new ConfigOptionBool(false));
 
+    def = this->add("export_support_points", coString);
+    def->label = L("Export SLA Support Points");
+    def->tooltip = L("Compute the SLA support points and write them to the given JSON file. When this is the only requested output, the pipeline stops right after the support point step: no support tree, pad, archive or preview is produced.");
+    def->cli = "export-support-points";
+
     def = this->add("export_hollow_stl", coBool);
     def->label = L("Export Hollow Interior STL");
     def->tooltip = L("Generate hollow interior mesh and export as STL.");
@@ -6128,6 +6158,36 @@ CLIMiscConfigDef::CLIMiscConfigDef()
     def->label = L("Import Support STL");
     def->tooltip = L("Load an externally generated support mesh (STL) and use it as the SLA support track instead of generating supports. The mesh must share the model's world coordinate origin.");
     def->cli = "import-support-stl";
+
+    def = this->add("import_support_points", coString);
+    def->label = L("Import SLA Support Points");
+    def->tooltip = L("Load a support point list (JSON, as written by --export-support-points) and use it instead of running automatic support point detection. The file carries a fingerprint of the model it was generated from; slicing is refused if it does not match the model being sliced.");
+    def->cli = "import-support-points";
+
+    def = this->add("export_support_pillars", coString);
+    def->label = L("Export SLA Support Pillars");
+    def->tooltip = L("Write the pillars this generation produced (JSON) so a later generation can be handed them with --prior-supports and brace to them additively.");
+    def->cli = "export-support-pillars";
+
+    def = this->add("export_support_tree", coString);
+    def->label = L("Export SLA Support Tree");
+    def->tooltip = L("Write the support tree as data (JSON): heads, pillars, junctions, pedestals and one record per bar of bracing. This is everything the support mesh is built from, before it is built - a caller that has it can draw the support itself, point at one bar and remove that bar, none of which a single STL allows.");
+    def->cli = "export-support-tree";
+
+    def = this->add("export_pad_stl", coString);
+    def->label = L("Export SLA Pad");
+    def->tooltip = L("Write the pad on its own (STL). The support mesh export merges the pad into it, which is right for printing but wrong for a caller that draws the support tree from --export-support-tree: the tree describes pillars and bracing and has no way to describe a pad, so without this the pad simply goes missing from what the caller draws.");
+    def->cli = "export-pad-stl";
+
+    def = this->add("export_brace_stls", coString);
+    def->label = L("Export SLA Support Braces");
+    def->tooltip = L("Directory to write the braces this generation grew to pillars given by --prior-supports, one STL per pillar reached (brace_<id>.stl). They are kept out of the main support mesh so that removing one of those pillars can take its brace with it, without regenerating the support the brace was grown with.");
+    def->cli = "export-brace-stls";
+
+    def = this->add("prior_supports", coString);
+    def->label = L("Prior SLA Support Pillars");
+    def->tooltip = L("Load the pillars of an already generated support (JSON) so a newly placed support can brace to them. The prior pillars take part in neighbour queries and bracing but are never re-emitted, so the existing support mesh the caller already holds stays valid and unchanged.");
+    def->cli = "prior-supports";
 
     def = this->add("datadir", coString);
     def->label = L("Data directory");

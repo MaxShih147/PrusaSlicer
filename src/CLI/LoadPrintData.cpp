@@ -165,6 +165,8 @@ static bool process_input_files(std::vector<Model>& models, DynamicPrintConfig& 
             return false;
         }
         if (model.objects.empty()) {
+            print_engine_error(make_engine_error(EngineErrorCode::INVALID_MODEL,
+                                                 "file is empty: " + file));
             boost::nowide::cerr << "Error: file is empty: " << file << std::endl;
             continue;
         }

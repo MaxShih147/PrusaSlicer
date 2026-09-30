@@ -84,7 +84,67 @@ void SupportTreeBuilder::add_pillar_base(long pid, double baseheight, double rad
                              std::max(radius, pll.r_start), pll.r_start);
 
     m_pedestals.back().id = m_pedestals.size() - 1;
+    m_pedestals.back().pillar_id = pid;
     m_meshcache_valid = false;
+}
+
+std::map<long, indexed_triangle_set>
+SupportTreeBuilder::frozen_brace_meshes(size_t steps) const
+{
+    std::map<long, indexed_triangle_set> out;
+    auto collect = [&](const std::vector<Bridge> &src) {
+        for (const Bridge &b : src) {
+            const long target = bridge_frozen_target(b);
+            if (target == SupportTreeNode::ID_UNSET) continue;
+            its_merge(out[target], get_mesh(b, steps));
+        }
+    };
+    collect(m_bridges);
+    collect(m_crossbridges);
+    return out;
+}
+
+indexed_triangle_set SupportTreeBuilder::full_mesh(size_t steps) const
+{
+    // Everything, frozen included. merged_mesh() leaves the frozen pillars out
+    // for the caller's sake; the pad is grown from the tree's FOOTPRINT and
+    // belongs to the whole plate, so it has to see them or each added support
+    // gets a pad the size of itself.
+    indexed_triangle_set merged;
+
+    for (auto &head : m_heads)
+        if (head.is_valid()) its_merge(merged, get_mesh(head, steps));
+
+    for (auto &pill : m_pillars) {
+        its_merge(merged, get_mesh(pill, steps));
+        // A frozen pillar carries no Pedestal of its own here - it was made in
+        // an earlier run - so give it a footprint to grow the pad from.
+        if (pill.frozen && pill.height > EPSILON) {
+            Pedestal ped{pill.endpoint(), std::min(pill.height, 1.0),
+                         pill.r_start, pill.r_start};
+            its_merge(merged, get_mesh(ped, steps));
+        }
+    }
+
+    for (auto &pedest : m_pedestals)
+        its_merge(merged, get_mesh(pedest, steps));
+
+    for (auto &j : m_junctions)
+        its_merge(merged, get_mesh(j, steps));
+
+    for (auto &bs : m_bridges)
+        its_merge(merged, get_mesh(bs, steps));
+
+    for (auto &bs : m_crossbridges)
+        its_merge(merged, get_mesh(bs, steps));
+
+    for (auto &bs : m_diffbridges)
+        its_merge(merged, get_mesh(bs, steps));
+
+    for (auto &anch : m_anchors)
+        its_merge(merged, get_mesh(anch, steps));
+
+    return merged;
 }
 
 const indexed_triangle_set &SupportTreeBuilder::merged_mesh(size_t steps) const
@@ -100,6 +160,10 @@ const indexed_triangle_set &SupportTreeBuilder::merged_mesh(size_t steps) const
     
     for (auto &pill : m_pillars) {
         if (ctl().stopcondition()) break;
+        // Frozen pillars belong to an earlier generation: the caller already
+        // holds that geometry and expects it back unchanged, so emitting it
+        // here would duplicate it.
+        if (pill.frozen) continue;
         its_merge(merged, get_mesh(pill, steps));
     }
 
@@ -115,11 +179,16 @@ const indexed_triangle_set &SupportTreeBuilder::merged_mesh(size_t steps) const
 
     for (auto &bs : m_bridges) {
         if (ctl().stopcondition()) break;
+        // A brace reaching a frozen pillar is handed over separately: it has to
+        // be removable on its own when that pillar goes, and merging it in here
+        // would mean regrowing this whole support to take one brace away.
+        if (bridge_reaches_frozen(bs)) continue;
         its_merge(merged, get_mesh(bs, steps));
     }
     
     for (auto &bs : m_crossbridges) {
         if (ctl().stopcondition()) break;
+        if (bridge_reaches_frozen(bs)) continue;
         its_merge(merged, get_mesh(bs, steps));
     }
 

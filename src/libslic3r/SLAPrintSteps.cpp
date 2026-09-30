@@ -10,6 +10,11 @@
 #include <libslic3r/SLA/Pad.hpp>
 #include <libslic3r/SLA/SupportPointGenerator.hpp>
 #include <libslic3r/SLA/ZCorrection.hpp>
+// Phase 3 of support_points() needs dir_to_spheric() and per-point mesh
+// normals; the overhang predicate itself arrives with SLA/SupportTree.hpp,
+// which SLAPrintSteps.hpp already pulls in.
+#include <libslic3r/Geometry.hpp>
+#include <libslic3r/MeshNormals.hpp>
 #include <libslic3r/ElephantFootCompensation.hpp>
 #include <libslic3r/CSGMesh/ModelToCSGMesh.hpp>
 #include <libslic3r/CSGMesh/SliceCSGMesh.hpp>
@@ -767,13 +772,17 @@ void SLAPrint::Steps::slice_model(SLAPrintObject &po)
         // keyword: xgettext --add-comments only picks up a comment that ends on
         // the immediately preceding line, so parking it above the throw (where
         // it reads more naturally) silently drops it from the catalog.
-        throw Slic3r::RuntimeError(format(
-            //TRN To be shown at the status bar on SLA slicing error. %1% is the
-            //    object name, %2% the object height and %3% the layer height in mm.
-            _u8L("Model named: %1% can not be sliced: no slice level falls inside the "
-                 "model. The layer height (%3% mm) is too large relative to the height "
-                 "of the object (%2% mm). Try lowering the layer height."),
-            po.model_object()->name, model_height, lhd));
+        // Code only, no fields: on the support-generation path lhd is the
+        // agent's coarse detection layer height, not the value the user set.
+        throw CodedRuntimeError(make_engine_error(
+            EngineErrorCode::MODEL_MESH_UNSLICEABLE,
+            format(
+                //TRN To be shown at the status bar on SLA slicing error. %1% is the
+                //    object name, %2% the object height and %3% the layer height in mm.
+                _u8L("Model named: %1% can not be sliced: no slice level falls inside the "
+                     "model. The layer height (%3% mm) is too large relative to the height "
+                     "of the object (%2% mm). Try lowering the layer height."),
+                po.model_object()->name, model_height, lhd)));
     }
 
     po.m_model_height_levels.clear();
@@ -949,6 +958,10 @@ void SLAPrint::Steps::support_points(SLAPrintObject &po)
     // the density config value is in percents:
     SupportPointGeneratorConfig config;
     config.density_relative = float(cfg.support_points_density_relative / 100.f);
+    // How close two points on a layer may ever be. Nothing else in this
+    // function needs to know about it: the generator applies it where it
+    // decides whether a candidate is already supported.
+    config.min_distance = float(cfg.support_points_min_distance);
         
     switch (cfg.support_tree_type) {
     case SupportTreeType::Default:
@@ -959,14 +972,47 @@ void SLAPrint::Steps::support_points(SLAPrintObject &po)
         config.head_diameter = float(cfg.branchingsupport_head_front_diameter);
         break;
     }
+
+    // Inputs for the Phase 3 overhang filter further down. They get their OWN
+    // switch rather than riding along with head_diameter above, because the two
+    // group the tree types DIFFERENTLY and the split is not a mistake:
+    //
+    //   head_diameter (above)   Default + Organic | Branching
+    //   these two (below)       Default | Branching + Organic
+    //
+    // The grouping here is not a free choice - it has to be whatever
+    // make_support_cfg() (SLAPrint.cpp) does, because Phase 3 must reach the
+    // same verdict as the support tree, which reads the config that function
+    // builds. There, Branching falls through into Organic and both take the
+    // branchingsupport_ keys, for BOTH the critical angle (-> the config's
+    // overhang_angle_threshold) and half the head diameter (-> its
+    // head_front_radius_mm, the eps the tree hands to normals()). Folding
+    // Organic in with Default here - as head_diameter does - would leave step 5
+    // and step 6 judging an Organic build against different settings.
+    double overhang_threshold_rad = 0.;
+    double normal_eps_mm          = 0.;
+
+    switch (cfg.support_tree_type) {
+    case SupportTreeType::Default:
+        overhang_threshold_rad = cfg.support_critical_angle.getFloat() * PI / 180.0;
+        normal_eps_mm          = 0.5 * cfg.support_head_front_diameter.getFloat();
+        break;
+    case SupportTreeType::Branching:
+    case SupportTreeType::Organic:
+        overhang_threshold_rad = cfg.branchingsupport_critical_angle.getFloat() * PI / 180.0;
+        normal_eps_mm          = 0.5 * cfg.branchingsupport_head_front_diameter.getFloat();
+        break;
+    }
     
     // copy current configuration for sampling islands
 #ifdef USE_ISLAND_GUI_FOR_SETTINGS
     // use static variable to propagate data from GUI
     config.island_configuration = SampleConfigFactory::get_sample_config(config.density_relative);
 #else // USE_ISLAND_GUI_FOR_SETTINGS
-    config.island_configuration = SampleConfigFactory::apply_density(
-            SampleConfigFactory::create(config.head_diameter), config.density_relative);
+    config.island_configuration = SampleConfigFactory::apply_min_distance(
+        SampleConfigFactory::apply_density(
+            SampleConfigFactory::create(config.head_diameter), config.density_relative),
+        config.min_distance);
 #endif // USE_ISLAND_GUI_FOR_SETTINGS
 
     // scaling for the sub operations
@@ -1024,6 +1070,56 @@ void SLAPrint::Steps::support_points(SLAPrintObject &po)
     double allowed_move = grid_pitch + std::numeric_limits<float>::epsilon();
     SupportPoints support_points =
         move_on_mesh_surface(layer_support_points, emesh, allowed_move, cancel);
+
+    // Phase 3: drop the points whose surface is not tilted far enough downwards
+    // to count as an overhang. This is the ONLY place the overhang angle is
+    // applied - the support tree steps do not repeat it - so the list exported
+    // by --export-support-points describes exactly the points that will grow a
+    // head (capability sla-overhang-threshold-semantics).
+    //
+    // The position in this function is not free; all three bounds are load
+    // bearing:
+    //   * NOT before move_on_mesh_surface(). Normals have to be taken at the
+    //     coordinates that were snapped onto the mesh. A point still sitting at
+    //     its sampling layer height can be a whole layer off the surface, and
+    //     the closest-face projection would then report a neighbouring face.
+    //   * NOT after the permanent_supports append below. Those are the caller's
+    //     own points; filtering them here would undo the exemption that lets a
+    //     user place a support anywhere they like.
+    //   * NOT after filter_support_points_by_modifiers(). An enforcer means
+    //     "put supports here", and running it later would let an enforcer
+    //     resurrect a point this filter just rejected.
+    //
+    // There is deliberately NO short-circuit for a zero threshold: the test
+    // still rejects upward-facing normals, and skipping it would leave step 5
+    // and step 6 looking at different point sets.
+    const size_t pts_before_overhang_filter = support_points.size();
+    if (!support_points.empty()) {
+        PointSet point_matrix(support_points.size(), 3);
+        for (size_t i = 0; i < support_points.size(); ++i)
+            point_matrix.row(Eigen::Index(i)) = support_points[i].pos.cast<double>();
+
+        // Same mesh, same eps and same routine the support tree uses, so a
+        // point that survives here cannot be re-judged differently there.
+        PointSet nmls = Slic3r::normals(ex_tbb, point_matrix, emesh,
+                                        normal_eps_mm, cancel);
+
+        SupportPoints kept;
+        kept.reserve(support_points.size());
+        for (size_t i = 0; i < support_points.size(); ++i) {
+            Vec3d n = nmls.row(Eigen::Index(i));
+            const double polar = Geometry::dir_to_spheric(n).first;
+            if (sla::passes_overhang_filter(polar, overhang_threshold_rad))
+                kept.push_back(support_points[i]);
+        }
+
+        support_points = std::move(kept);
+    }
+
+    BOOST_LOG_TRIVIAL(debug)
+        << "Overhang filter kept " << support_points.size() << " of "
+        << pts_before_overhang_filter << " support point(s) at a threshold of "
+        << overhang_threshold_rad * 180.0 / PI << " deg";
 
     // The Generator count with permanent support positions but do not convert to LayerSupportPoints.
     // To preserve permanent 3d position it is necessary to append points after move_on_mesh_surface
@@ -1096,6 +1192,9 @@ void SLAPrint::Steps::support_tree(SLAPrintObject &po)
 
     po.m_supportdata->input.cfg = make_support_cfg(po.m_config);
     po.m_supportdata->input.pad_cfg = make_pad_cfg(po.m_config);
+    // Additive generation: the pillars already on the plate take part in
+    // neighbour queries and bracing, but are never re-emitted.
+    po.m_supportdata->input.prior = po.prior_pillars();
 
     // scaling for the sub operations
     double d = objectstep_scale * OBJ_STEP_LEVELS[slaposSupportTree] / 100.0;
@@ -1178,18 +1277,35 @@ void SLAPrint::Steps::generate_pad(SLAPrintObject &po) {
             // "No support/pad mesh generated" marker.
             //
             // Every other cause of an invalid pad stays fail-closed.
+            //
+            // The test used to be tree_mesh.empty() - no supports at all - and
+            // that missed the case where supports were grown but none of them
+            // reached the plate. routing_to_model() anchors a support to the
+            // model body when it can neither reach a nearby pillar nor the
+            // plate, and a pad has no footprint to grow from unless something
+            // stands on the plate. A run of exactly one such support therefore
+            // threw here and lost the support it had already built - which is
+            // every manual placement of a model-anchored support, since a
+            // manual generation grows one point at a time.
+            //
+            // An empty pad mesh IS that footprint being empty: create_pad()
+            // slices the support mesh upwards from the plate, and outside
+            // zero-elevation mode there is nothing else it could grow from. The
+            // configuration cannot be the cause here either - PadConfig's own
+            // validate() runs in SLAPrint::validate(), before any of this.
             const bool nothing_to_build_pad_from =
                 po.m_supportdata->pad_mesh.its.empty() &&
                 po.m_config.supports_enable.getBool() &&
-                po.m_supportdata->tree_mesh.empty();
+                !pcfg.embed_object.enabled;
 
             if (!nothing_to_build_pad_from)
-                throw Slic3r::SlicingError(
+                throw CodedSlicingError(make_engine_error(
+                        EngineErrorCode::PAD_GENERATION_FAILED,
                         _u8L("No pad can be generated for this model with the "
-                          "current configuration"));
+                          "current configuration")));
 
             BOOST_LOG_TRIVIAL(warning)
-                << "Pad skipped: the support tree is empty, so there is no "
+                << "Pad skipped: nothing stands on the plate, so there is no "
                    "footprint to grow a pad from.";
 
             po.m_supportdata->pad_mesh = {};
@@ -1325,10 +1441,11 @@ void SLAPrint::Steps::initialize_printer_input()
 
         for(const SliceRecord& slicerecord : o->get_slice_index()) {
             if (!slicerecord.is_valid())
-                throw Slic3r::SlicingError(
+                throw CodedSlicingError(make_engine_error(
+                    EngineErrorCode::UNPRINTABLE_OBJECT,
                     _u8L("There are unprintable objects. Try to "
                       "adjust support settings to make the "
-                      "objects printable."));
+                      "objects printable.")));
 
             coord_t lvlid = slicerecord.print_level() - gndlvl;
 

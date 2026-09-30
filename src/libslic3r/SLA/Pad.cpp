@@ -527,14 +527,48 @@ void create_pad(const ExPolygons &    sup_blueprint,
 
 std::string PadConfig::validate() const
 {
+    return validate_error().message;
+}
+
+EngineError PadConfig::validate_error() const
+{
     static const double constexpr MIN_BRIM_SIZE_MM = .1;
 
+    // The decision is the original expression, verbatim (the agent's
+    // test_param_rules_contract.py pins its text): only which of the three
+    // failed is worked out afterwards, for the structured report.
     if (brim_size_mm < MIN_BRIM_SIZE_MM ||
         bottom_offset() > brim_size_mm + wing_distance() ||
-        get_waffle_offset(*this) <= MIN_BRIM_SIZE_MM)
-        return _u8L("Pad brim size is too small for the current configuration.");
+        get_waffle_offset(*this) <= MIN_BRIM_SIZE_MM) {
+        const bool brim_below_min    = brim_size_mm < MIN_BRIM_SIZE_MM;
+        const bool slope_too_shallow = !brim_below_min &&
+                                       bottom_offset() > brim_size_mm + wing_distance();
 
-    return "";
+        EngineError err;
+        err.code    = EngineErrorCode::PAD_CONFIG_INVALID;
+        err.message = _u8L("Pad brim size is too small for the current configuration.");
+
+        if (slope_too_shallow) {
+            // bottom_offset() > brim + wing_distance() reduces to
+            // thickness / tan(slope) > brim, so the shallowest slope that passes is
+            // atan(thickness / brim). Reported rounded UP to 0.1 degree: rounding
+            // down would name a value this same check still rejects.
+            const double exact_min_deg = std::atan(wall_thickness_mm / brim_size_mm) * 180. / PI;
+            err.fields = {"pad_wall_slope", "pad_wall_thickness", "pad_brim_size"};
+            err.values = {{"min_pad_wall_slope", std::ceil(exact_min_deg * 10.) / 10.},
+                          {"pad_wall_slope", wall_slope * 180. / PI}};
+        } else if (brim_below_min) {
+            err.fields = {"pad_brim_size"};
+            err.values = {{"min_pad_brim_size", MIN_BRIM_SIZE_MM},
+                          {"pad_brim_size", brim_size_mm}};
+        } else {
+            err.fields = {"pad_brim_size"};
+        }
+
+        return err;
+    }
+
+    return {};
 }
 
 }} // namespace Slic3r::sla
