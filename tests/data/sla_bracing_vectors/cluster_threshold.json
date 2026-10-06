@@ -1,0 +1,19 @@
+{
+  "id": "cluster_threshold",
+  "description": "Axes exactly 1.2 apart (r 0.5 each) do not hug: A blocks A'-X.",
+  "cfg": {"safety_clearance":0.2,"min_shared_angle_deg":20,"pair_cap":3,"max_link_distance":10,"min_pillar_distance":1,"rescue_height":15,"bridge_slope_deg":45,"ground_z":0,"base_height":1,"base_radius":2,"connection_mode":"dynamic"},
+  "pillars": [
+    {"id":0,"endpoint":[0,0,0.0],"height":14,"r":0.5,"links":1,"pairs":3,"frozen":true},
+    {"id":1,"endpoint":[1.2,0,0.0],"height":14,"r":0.5,"links":0,"pairs":0,"frozen":false},
+    {"id":2,"endpoint":[-6,0.5,0.0],"height":14,"r":0.5,"links":0,"pairs":0,"frozen":false}
+  ],
+  "bars": [],
+  "expect": {
+    "accepted": [],
+    "rejected": [
+      {"phase":"greedy","pair":[0,1],"reason":"pair_cap"},
+      {"phase":"greedy","pair":[0,2],"reason":"pair_cap"},
+      {"phase":"greedy","pair":[1,2],"reason":"obstacle_pillar"}
+    ]
+  }
+}

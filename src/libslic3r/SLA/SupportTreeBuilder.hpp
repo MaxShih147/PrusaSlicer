@@ -166,6 +166,10 @@ struct Pillar: public SupportTreeNode {
     // How many pillars are cascaded with this one
     unsigned links = 0;
 
+    // How many pillars this one is braced to, counted whether or not the
+    // bracing adds to `links`. See PriorPillar::pairs.
+    unsigned pairs = 0;
+
     // The pillar this one was grown to prop up, for an auxiliary pillar. Such a
     // pillar carries no head of its own, so without this there is nothing to say
     // which support it belongs to.
@@ -226,6 +230,16 @@ struct Bridge: public SupportTreeNode {
     // with it - on its own, without regenerating the support it belongs to.
     long owner_a = ID_UNSET;
     long owner_b = ID_UNSET;
+
+    // Written by the builder function that made the bar, never afterwards.
+    BridgeKind kind = BridgeKind::unset;
+
+    // Truss bars only: laid by the rescue or the safety net of the bracing
+    // planner, judged bar by bar in 3D instead of by the plan rule between
+    // groups. For measurement; not exported.
+    bool relaxed = false;
+    // ... of which the safety net laid it (relaxed is set as well).
+    bool fallback = false;
     
     Bridge(const Vec3d &j1,
            const Vec3d &j2,
@@ -281,14 +295,35 @@ class SupportTreeBuilder {
     mutable bool m_meshcache_valid = false;
     mutable double m_model_height = 0; // the full height of the model
     
+    // What a bar is for and which pillars it joins, written by the function
+    // that makes it.
+    struct BridgeTags
+    {
+        BridgeKind kind;
+        long       owner_a  = SupportTreeNode::ID_UNSET;
+        long       owner_b  = SupportTreeNode::ID_UNSET;
+        bool       relaxed  = false;
+        bool       fallback = false;
+    };
+
+    // Bars are added from parallel routing, so everything about a bar is
+    // written here, under the lock, and the caller gets a copy taken under the
+    // same lock: writing through, or even reading, a reference into the vector
+    // after the lock is gone races with another thread growing that vector.
     template<class BridgeT, class...Args>
-    const BridgeT& _add_bridge(std::vector<BridgeT> &br, Args&&... args)
+    BridgeT _add_bridge(std::vector<BridgeT> &br, const BridgeTags &tags, Args&&... args)
     {
         std::lock_guard<Mutex> lk(m_mutex);
         br.emplace_back(std::forward<Args>(args)...);
-        br.back().id = long(br.size() - 1);
+        BridgeT &b = br.back();
+        b.id       = long(br.size() - 1);
+        b.kind     = tags.kind;
+        b.owner_a  = tags.owner_a;
+        b.owner_b  = tags.owner_b;
+        b.relaxed  = tags.relaxed;
+        b.fallback = tags.fallback;
         m_meshcache_valid = false;
-        return br.back();
+        return b;
     }
     
 public:
@@ -341,7 +376,7 @@ public:
     /// Register a pillar from an earlier generation. It participates in the
     /// spatial index and in bracing decisions, but merged_mesh() skips it.
     long add_frozen_pillar(const Vec3d &endp, double h, double r_start, double r_end,
-                           unsigned links, unsigned bridges)
+                           unsigned links, unsigned bridges, unsigned pairs)
     {
         std::lock_guard<Mutex> lk(m_mutex);
         m_pillars.emplace_back(endp, h, r_start, r_end);
@@ -351,6 +386,7 @@ public:
         pillar.frozen = true;
         pillar.links = links;
         pillar.bridges = bridges;
+        pillar.pairs = pairs;
         m_meshcache_valid = false;
         return pillar.id;
     }
@@ -380,6 +416,15 @@ public:
         
         if(pillar.id >= 0 && size_t(pillar.id) < m_pillars.size()) 
             m_pillars[size_t(pillar.id)].links++;
+    }
+
+    void increment_pairs(const Pillar& pillar)
+    {
+        std::lock_guard<Mutex> lk(m_mutex);
+        assert(pillar.id >= 0 && size_t(pillar.id) < m_pillars.size());
+
+        if(pillar.id >= 0 && size_t(pillar.id) < m_pillars.size())
+            m_pillars[size_t(pillar.id)].pairs++;
     }
     
     unsigned bridgecount(const Pillar &pillar) const {
@@ -411,41 +456,49 @@ public:
         return m_junctions.back();
     }
     
-    const Bridge& add_bridge(const Vec3d &s, const Vec3d &e, double r)
+    // The functions adding bars return a copy, not a reference into the
+    // vector: see _add_bridge.
+
+    /// A free-standing bar. The kind has no default on purpose: every caller
+    /// says what the bar is for. `pillar_id` is the pillar it reaches, if any.
+    Bridge add_bridge(const Vec3d &s, const Vec3d &e, double r, BridgeKind kind,
+                      long pillar_id = SupportTreeNode::ID_UNSET)
     {
-        return _add_bridge(m_bridges, s, e, r);
+        return _add_bridge(m_bridges, {kind, SupportTreeNode::ID_UNSET, pillar_id}, s, e, r);
     }
-    
-    const Bridge& add_bridge(long headid, const Vec3d &endp)
+
+    /// A head's bar to `endp`; `pillar_id` is the pillar it reaches, if any.
+    Bridge add_bridge(long headid, const Vec3d &endp,
+                      long pillar_id = SupportTreeNode::ID_UNSET)
     {
         std::lock_guard<Mutex> lk(m_mutex);
         assert(headid >= 0 && size_t(headid) < m_head_indices.size());
-        
+
         Head &h = m_heads[m_head_indices[size_t(headid)]];
         m_bridges.emplace_back(h.junction_point(), endp, h.r_back_mm);
-        m_bridges.back().id = long(m_bridges.size() - 1);
-        
-        h.bridge_id = m_bridges.back().id;
+        Bridge &b = m_bridges.back();
+        b.id      = long(m_bridges.size() - 1);
+        b.kind    = BridgeKind::head;
+        b.owner_b = pillar_id;
+
+        h.bridge_id = b.id;
         m_meshcache_valid = false;
-        return m_bridges.back();
+        return b;
     }
-    
-    template<class...Args> const Bridge& add_crossbridge(Args&&... args)
+
+    template<class...Args> Bridge add_crossbridge(Args&&... args)
     {
-        return _add_bridge(m_crossbridges, std::forward<Args>(args)...);
+        return _add_bridge(m_crossbridges, {BridgeKind::truss}, std::forward<Args>(args)...);
     }
 
     /// A crossbridge that knows which two pillars it joins.
-    const Bridge& add_crossbridge_between(long pillar_a, long pillar_b,
-                                          const Vec3d &s, const Vec3d &e, double r)
+    Bridge add_crossbridge_between(long pillar_a, long pillar_b,
+                                   const Vec3d &s, const Vec3d &e, double r,
+                                   bool relaxed, bool fallback = false)
     {
-        const Bridge &b = _add_bridge(m_crossbridges, s, e, r);
-        // _add_bridge hands back a const reference into the vector it just grew;
-        // the ids are bookkeeping rather than geometry, so writing them through
-        // the vector keeps that accessor honest about the geometry.
-        m_crossbridges[size_t(b.id)].owner_a = pillar_a;
-        m_crossbridges[size_t(b.id)].owner_b = pillar_b;
-        return m_crossbridges[size_t(b.id)];
+        return _add_bridge(m_crossbridges,
+                           {BridgeKind::truss, pillar_a, pillar_b, relaxed, fallback},
+                           s, e, r);
     }
 
     /// A free-standing bridge that knows which pillars it joins.
@@ -453,27 +506,43 @@ public:
     /// `from_pillar` is optional because not every bar starts on one; when it
     /// does, saying so is what lets a caller group the bar with both ends
     /// rather than only the one it reached.
-    const Bridge& add_bridge_between(long pillar_id, const Vec3d &s,
-                                     const Vec3d &e, double r,
-                                     long from_pillar = SupportTreeNode::ID_UNSET)
+    /// `kind` has no default, like add_bridge(): a head reaching a pillar and a
+    /// pillar reaching its prop are both made here.
+    Bridge add_bridge_between(long pillar_id, const Vec3d &s,
+                              const Vec3d &e, double r, BridgeKind kind,
+                              long from_pillar = SupportTreeNode::ID_UNSET)
     {
-        const Bridge &b = add_bridge(s, e, r);
-        m_bridges[size_t(b.id)].owner_a = from_pillar;
-        m_bridges[size_t(b.id)].owner_b = pillar_id;
-        return m_bridges[size_t(b.id)];
+        return _add_bridge(m_bridges, {kind, from_pillar, pillar_id}, s, e, r);
     }
 
     /// A head-to-pillar bridge that knows which pillar it reached.
-    const Bridge& add_bridge_to_pillar(long headid, const Vec3d &endp, long pillar_id)
+    Bridge add_bridge_to_pillar(long headid, const Vec3d &endp, long pillar_id)
     {
-        const Bridge &b = add_bridge(headid, endp);
-        m_bridges[size_t(b.id)].owner_b = pillar_id;
-        return m_bridges[size_t(b.id)];
+        return add_bridge(headid, endp, pillar_id);
     }
 
-    template<class...Args> const DiffBridge& add_diffbridge(Args&&... args)
+    template<class...Args> DiffBridge add_diffbridge(Args&&... args)
     {
-        return _add_bridge(m_diffbridges, std::forward<Args>(args)...);
+        return _add_bridge(m_diffbridges, {BridgeKind::route}, std::forward<Args>(args)...);
+    }
+
+    /// Name the pillar at the far end of a bar laid before that pillar existed.
+    ///
+    /// A route to the ground lays its last bar down BEFORE the pillar it ends
+    /// on, like its junctions (own_junctions_from).
+    void own_bridge(long bridge_id, long pillar_id)
+    {
+        std::lock_guard<Mutex> lk(m_mutex);
+        assert(bridge_id >= 0 && size_t(bridge_id) < m_bridges.size());
+        m_bridges[size_t(bridge_id)].owner_b = pillar_id;
+    }
+
+    /// The same for a widening bar.
+    void own_diffbridge(long bridge_id, long pillar_id)
+    {
+        std::lock_guard<Mutex> lk(m_mutex);
+        assert(bridge_id >= 0 && size_t(bridge_id) < m_diffbridges.size());
+        m_diffbridges[size_t(bridge_id)].owner_b = pillar_id;
     }
     
     Head &head(unsigned id)

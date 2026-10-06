@@ -19,6 +19,7 @@
 #include "SupportTreeUtilsLegacy.hpp"
 #include "libslic3r/AABBMesh.hpp"
 #include "libslic3r/Execution/Execution.hpp"
+#include "libslic3r/SLA/BracingPlanner.hpp"
 #include "libslic3r/SLA/Pad.hpp"
 #include "libslic3r/SLA/SupportTree.hpp"
 #include "libslic3r/SLA/SupportTreeBuilder.hpp"
@@ -186,8 +187,9 @@ class DefaultSupportTree {
         return bridge_mesh_intersect(std::forward<Args>(args)...).distance();
     }
 
-    // Helper function for interconnecting two pillars with zig-zag bridges.
-    bool interconnect(const Pillar& pillar, const Pillar& nextpillar);
+    // Writes the zig-zag bars of a group the BracingPlanner accepted between
+    // two pillars, tagged as truss. Returns the number of bars written.
+    unsigned interconnect(const bracing::BuiltTruss &truss);
 
     // For connecting a head to a nearby pillar.
     bool connect_to_nearpillar(const Head& head, long nearpillar_id);

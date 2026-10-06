@@ -206,97 +206,21 @@ AABBMesh::hit_result DefaultSupportTree::bridge_mesh_intersect(
     return sla::beam_mesh_hit(suptree_ex_policy, m_sm.emesh, {src, dir, r}, sd);
 }
 
-bool DefaultSupportTree::interconnect(const Pillar &pillar,
-                                     const Pillar &nextpillar)
+unsigned DefaultSupportTree::interconnect(const bracing::BuiltTruss &truss)
 {
-    // We need to get the starting point of the zig-zag pattern. We have to
-    // be aware that the two head junctions are at different heights. We
-    // may start from the lowest junction and call it a day but this
-    // strategy would leave unconnected a lot of pillar duos where the
-    // shorter pillar is too short to start a new bridge but the taller
-    // pillar could still be bridged with the shorter one.
-    bool was_connected = false;
+    // The planner has laid the zig-zag out (geom::truss_bars, the layout this
+    // function used to compute) and judged it bar by bar: against the model,
+    // through the callback built in interconnect_pillars(), and against every
+    // other bar. Here the bars that passed are written down, as truss
+    // crossbridges between the two pillars, each as thick as the thinner one.
+    // Groups the rescue or the safety net laid were judged bar by bar in 3D
+    // rather than by the plan rule; the bars say so.
+    const bool relaxed = truss.rescued || truss.fallback;
+    for (const bracing::Segment3 &bar : truss.bars)
+        m_builder.add_crossbridge_between(truss.a, truss.b, bar.a, bar.b, bar.r, relaxed,
+                                          truss.fallback);
 
-    Vec3d supper = pillar.startpoint();
-    Vec3d slower = nextpillar.startpoint();
-    Vec3d eupper = pillar.endpoint();
-    Vec3d elower = nextpillar.endpoint();
-
-    double zmin = ground_level(m_sm) + m_sm.cfg.base_height_mm;
-    eupper.z() = std::max(eupper.z(), zmin);
-    elower.z() = std::max(elower.z(), zmin);
-
-       // The usable length of both pillars should be positive
-    if(slower.z() - elower.z() < 0) return false;
-    if(supper.z() - eupper.z() < 0) return false;
-
-    double pillar_dist = distance(Vec2d{slower.x(), slower.y()},
-                                      Vec2d{supper.x(), supper.y()});
-    double bridge_distance = pillar_dist / std::cos(-m_sm.cfg.bridge_slope);
-    double zstep = pillar_dist * std::tan(-m_sm.cfg.bridge_slope);
-
-    if(pillar_dist < 2 * m_sm.cfg.head_back_radius_mm ||
-        pillar_dist > m_sm.cfg.max_pillar_link_distance_mm) return false;
-
-    if(supper.z() < slower.z()) supper.swap(slower);
-    if(eupper.z() < elower.z()) eupper.swap(elower);
-
-    double startz = 0, endz = 0;
-
-    startz = slower.z() - zstep < supper.z() ? slower.z() - zstep : slower.z();
-    endz = eupper.z() + zstep > elower.z() ? eupper.z() + zstep : eupper.z();
-
-    if(slower.z() - eupper.z() < std::abs(zstep)) {
-        // no space for even one cross
-
-           // Get max available space
-        startz = std::min(supper.z(), slower.z() - zstep);
-        endz = std::max(eupper.z() + zstep, elower.z());
-
-           // Align to center
-        double available_dist = (startz - endz);
-        double rounds = std::floor(available_dist / std::abs(zstep));
-        startz -= 0.5 * (available_dist - rounds * std::abs(zstep));
-    }
-
-    auto pcm = m_sm.cfg.pillar_connection_mode;
-    bool docrosses =
-        pcm == PillarConnectionMode::cross ||
-        (pcm == PillarConnectionMode::dynamic &&
-         pillar_dist > 2*m_sm.cfg.base_radius_mm);
-
-       // 'sj' means starting junction, 'ej' is the end junction of a bridge.
-       // They will be swapped in every iteration thus the zig-zag pattern.
-       // According to a config parameter, a second bridge may be added which
-       // results in a cross connection between the pillars.
-    Vec3d sj = supper, ej = slower; sj.z() = startz; ej.z() = sj.z() + zstep;
-
-       // TODO: This is a workaround to not have a faulty last bridge
-    while(ej.z() >= eupper.z() /*endz*/) {
-        if(bridge_mesh_distance(sj, dirv(sj, ej), pillar.r_start) >= bridge_distance)
-        {
-            m_builder.add_crossbridge_between(pillar.id, nextpillar.id, sj, ej, pillar.r_start);
-            was_connected = true;
-        }
-
-           // double bridging: (crosses)
-        if(docrosses) {
-            Vec3d sjback(ej.x(), ej.y(), sj.z());
-            Vec3d ejback(sj.x(), sj.y(), ej.z());
-            if (sjback.z() <= slower.z() && ejback.z() >= eupper.z() &&
-                bridge_mesh_distance(sjback, dirv(sjback, ejback),
-                                     pillar.r_start) >= bridge_distance) {
-                // need to check collision for the cross stick
-                m_builder.add_crossbridge_between(pillar.id, nextpillar.id, sjback, ejback, pillar.r_start);
-                was_connected = true;
-            }
-        }
-
-        sj.swap(ej);
-        ej.z() = sj.z() + zstep;
-    }
-
-    return was_connected;
+    return unsigned(truss.bars.size());
 }
 
 bool DefaultSupportTree::connect_to_nearpillar(const Head &head,
@@ -381,7 +305,8 @@ bool DefaultSupportTree::connect_to_nearpillar(const Head &head,
             const size_t first_junction = m_builder.junctioncount();
             m_builder.add_junction(bridgestart, r);
             m_builder.own_junctions_from(first_junction, own);
-            m_builder.add_bridge_between(nearpillar_id, bridgestart, bridgeend, r, own);
+            m_builder.add_bridge_between(nearpillar_id, bridgestart, bridgeend, r,
+                                         BridgeKind::head, own);
         } else {
             m_builder.add_bridge_to_pillar(head.id, bridgeend, nearpillar_id);
         }
@@ -960,7 +885,7 @@ void DefaultSupportTree::adopt_prior_pillars()
     for (const PriorPillar &pp : m_sm.prior) {
         long pid = m_builder.add_frozen_pillar(pp.endpoint, pp.height,
                                                pp.r_start, pp.r_end,
-                                               pp.links, pp.bridges);
+                                               pp.links, pp.bridges, pp.pairs);
         m_pillar_index.insert(m_builder.pillar(pid).endpoint(), unsigned(pid));
         m_prior_pillar_ids.push_back(pid);
         m_prior_caller_ids[pid] = pp.id;
@@ -984,7 +909,7 @@ PriorAttachments DefaultSupportTree::prior_attachments() const
         if (it == m_prior_caller_ids.end())
             continue;
         const Pillar &p = m_builder.pillar(pid);
-        out.push_back(PriorAttachment{it->second, p.links, p.bridges});
+        out.push_back(PriorAttachment{it->second, p.links, p.bridges, p.pairs});
     }
     return out;
 }
@@ -993,102 +918,107 @@ void DefaultSupportTree::interconnect_pillars()
 {
     // Now comes the algorithm that connects pillars with each other.
     // Ideally every pillar should be connected with at least one of its
-    // neighbors if that neighbor is within max_pillar_link_distance
+    // neighbors if that neighbor is within max_pillar_link_distance.
+    //
+    // Which pairs get braced is decided by the BracingPlanner: every candidate
+    // pair at once, shortest first, so a near neighbour is braced before a far
+    // one can reach over it; no two groups may cross or crowd each other in
+    // plan view, none may pass a third pillar, and every bar keeps its distance
+    // from the bars already there. See BracingPlanner.hpp and openspec change
+    // sla-bracing-planar-topology.
 
     // Pillars with height exceeding H1 will require at least one neighbor
     // to connect with. Height exceeding H2 require two neighbors.
     double H1 = m_sm.cfg.max_solo_pillar_height_mm;
     double H2 = m_sm.cfg.max_dual_pillar_height_mm;
-    double d = m_sm.cfg.max_pillar_link_distance_mm;
 
-    // A connection between two pillars only counts if the height ratio is
-    // bigger than 50%
-    double min_height_ratio = 0.5;
+    using namespace bracing;
 
-    std::set<unsigned long> pairs;
+    // The planner is pure geometry and does not see SupportTreeConfig; the pair
+    // cap it was given must still be the count the legacy cascade used.
+    static_assert(PAIR_CAP == SupportTreeConfig::pillar_cascade_neighbors,
+                  "PAIR_CAP must match legacy cascade neighbor count");
 
-    // A function to connect one pillar with its neighbors. THe number of
-    // neighbors is given in the configuration. This function if called
-    // for every pillar in the pillar index. A pair of pillar will not
-    // be connected multiple times this is ensured by the 'pairs' set which
-    // remembers the processed pillar pairs
-    auto cascadefn =
-        [this, d, &pairs, min_height_ratio, H1] (const PointIndexEl& el)
-    {
-        Vec3d qp = el.first;    // endpoint of the pillar
+    PlannerConfig pc;
+    pc.solo_height         = H1;
+    pc.max_link_distance   = m_sm.cfg.max_pillar_link_distance_mm;
+    pc.min_pillar_distance = 2 * m_sm.cfg.head_back_radius_mm;
+    pc.truss.bridge_slope_rad = m_sm.cfg.bridge_slope;
+    pc.truss.ground_z         = ground_level(m_sm);
+    pc.truss.base_height      = m_sm.cfg.base_height_mm;
+    pc.truss.base_radius      = m_sm.cfg.base_radius_mm;
+    pc.truss.mode             = m_sm.cfg.pillar_connection_mode;
 
-        const Pillar& pillar = m_builder.pillar(el.second); // actual pillar
+    // The model test interconnect() always made on a bar: clear for the bar's
+    // whole length, which is the pillar distance over cos(slope).
+    const double cos_slope = std::cos(-m_sm.cfg.bridge_slope);
+    BracingPlanner planner(pc, [this, cos_slope](const Vec3d &from, const Vec3d &to, double r) {
+        const double len = (Vec2d{to.x(), to.y()} - Vec2d{from.x(), from.y()}).norm() / cos_slope;
+        return bridge_mesh_distance(from, dirv(from, to), r) >= len;
+    });
 
-        // Get the max number of neighbors a pillar should connect to
-        unsigned neighbors = m_sm.cfg.pillar_cascade_neighbors;
+    // The pillars in the index are the ones bracing has always worked with.
+    // The rest (a head's own short pillar under a bar to a neighbour) are
+    // never braced, but stand in the way like every other pillar.
+    std::set<long> braceable;
+    m_pillar_index.foreach([&braceable](const PointIndexEl &el) {
+        braceable.insert(long(el.second));
+    });
 
-        // connections are already enough for the pillar
-        if(pillar.links >= neighbors) return;
-
-        double max_d = d * pillar.r_start / m_sm.cfg.head_back_radius_mm;
-        // Query all remaining points within reach
-        auto qres = m_pillar_index.query([qp, max_d](const PointIndexEl& e){
-            return distance(e.first, qp) < max_d;
-        });
-
-        // sort the result by distance (have to check if this is needed)
-        std::sort(qres.begin(), qres.end(),
-                  [qp](const PointIndexEl& e1, const PointIndexEl& e2){
-                      return distance(e1.first, qp) < distance(e2.first, qp);
-                  });
-
-        for(auto& re : qres) { // process the queried neighbors
-
-            if(re.second == el.second) continue; // Skip self
-
-            auto a = el.second, b = re.second;
-
-            // Get unique hash for the given pair (order doesn't matter)
-            auto hashval = pairhash(a, b);
-
-            // Search for the pair amongst the remembered pairs
-            if(pairs.find(hashval) != pairs.end()) continue;
-
-            const Pillar& neighborpillar = m_builder.pillar(re.second);
-
-            // this neighbor is occupied, skip
-            if (neighborpillar.links >= neighbors) continue;
-            if (neighborpillar.r_start < pillar.r_start) continue;
-
-            if(interconnect(pillar, neighborpillar)) {
-                pairs.insert(hashval);
-                // Bracing to a pillar carried in from an earlier generation is
-                // the whole point of additive support: report it, and report
-                // what it did to that pillar's link count.
-                note_prior_attachment(a);
-                note_prior_attachment(b);
-
-                // If the interconnection length between the two pillars is
-                // less than 50% of the longer pillar's height, don't count
-                if(pillar.height < H1 ||
-                    neighborpillar.height / pillar.height > min_height_ratio)
-                    m_builder.increment_links(pillar);
-
-                if(neighborpillar.height < H1 ||
-                    pillar.height / neighborpillar.height > min_height_ratio)
-                    m_builder.increment_links(neighborpillar);
-
-            }
-
-            // connections are enough for one pillar
-            if(pillar.links >= neighbors) break;
-        }
+    auto geom_of = [](const Pillar &p, bool can_brace) {
+        PillarGeom g;
+        g.id        = p.id;
+        g.xy        = {p.endpt.x(), p.endpt.y()};
+        g.foot_z    = p.endpt.z();
+        g.height    = p.height;
+        g.r         = p.r_start;
+        g.links     = p.links;
+        g.pairs     = p.pairs;
+        g.frozen    = p.frozen;
+        g.braceable = can_brace;
+        return g;
     };
 
-    // Run the cascade for the pillars in the index. A frozen pillar is a
-    // neighbour, never a subject: cascading from it could add bracing that
-    // changes how the caller's existing support reads, which is exactly what
-    // an additive generation must not do. It can still be braced TO, because
-    // cascadefn queries the index and finds it.
-    m_pillar_index.foreach([this, &cascadefn](const PointIndexEl &el) {
-        if (!m_builder.pillar(el.second).frozen)
-            cascadefn(el);
-    });
+    for (const Pillar &p : m_builder.pillars())
+        planner.add_pillar(geom_of(p, braceable.count(p.id) > 0));
+
+    // Every bar that is already there - pins bridged to pillars, routes around
+    // the model - is in the way of the bracing, bar by bar in 3D.
+    for (const Bridge &b : m_builder.bridges())
+        planner.add_obstacle_bar({{b.startp, b.endp, b.r}, b.owner_a, b.owner_b});
+    for (const DiffBridge &b : m_builder.diffbridges())
+        planner.add_obstacle_bar({{b.startp, b.endp, std::max(b.r, b.end_r)},
+                                  b.owner_a, b.owner_b});
+    for (const Bridge &b : m_builder.crossbridges())
+        planner.add_truss_bar(b.owner_a, b.owner_b, {b.startp, b.endp, b.r});
+
+    // The planner keeps the counts as it decides; the builder follows it.
+    auto sync_counts = [this, &planner](long id) {
+        const PillarGeom &g = planner.pillar(id);
+        const Pillar     &p = m_builder.pillar(id);
+        while (p.links < g.links) m_builder.increment_links(p);
+        while (p.pairs < g.pairs) m_builder.increment_pairs(p);
+    };
+
+    auto lay = [this, &planner, &sync_counts](const Decision &d) {
+        if (d.reason != Reason::accepted) return false;
+        interconnect(planner.built()[size_t(d.truss)]);
+        sync_counts(d.edge.a);
+        sync_counts(d.edge.b);
+        // Bracing to a pillar carried in from an earlier generation is the
+        // whole point of additive support: report it, and what it did to that
+        // pillar's counts.
+        note_prior_attachment(d.edge.a);
+        note_prior_attachment(d.edge.b);
+        return true;
+    };
+
+    for (const Decision &d : planner.run_greedy()) lay(d);
+
+    // A tall pillar left with no link gets one more try, with the bars judged
+    // one by one in 3D instead of the plan rule between groups - before any
+    // prop is grown for it.
+    for (const Decision &d : planner.run_rescue()) lay(d);
 
     // We would be done here if we could allow some pillars to not be
     // connected with any neighbors. But this might leave the support tree
@@ -1098,9 +1028,19 @@ void DefaultSupportTree::interconnect_pillars()
     // lonely pillars. One or even two additional pillar might get inserted
     // depending on the length of the lonely pillar.
 
+    // Last of all, a tall pillar still without a link is braced to the
+    // nearest pillar that gives it one, even past the pair cap - whether or
+    // not props were grown.
+    auto safety_net = [&planner, &lay]() {
+        for (const Decision &d : planner.run_fallback()) lay(d);
+    };
+
     // Propping a lonely pillar is the engine deciding the user needs more
     // supports than they asked for. Where placement is the user's, it is not.
-    if (!m_sm.cfg.auxiliary_pillars) return;
+    if (!m_sm.cfg.auxiliary_pillars) {
+        safety_net();
+        return;
+    }
 
     size_t pillarcount = m_builder.pillarcount();
 
@@ -1167,6 +1107,15 @@ void DefaultSupportTree::interconnect_pillars()
                 canplace[n] = std::isinf(hr.distance()) &&
                               std::sqrt(m_sm.emesh.squared_distance(gndsp)) >
                                   min_dist;
+
+                // A place the prop could stand but not be braced from is no
+                // place for it: the next angle may be both.
+                if (canplace[n]) {
+                    PillarGeom prop = geom_of(Pillar(gndsp, s.z() - gnd, pillar().r_start), true);
+                    prop.id = long(m_builder.pillarcount() + n);
+                    canplace[n] = planner.try_attach(pillar().id, prop).reason ==
+                                  Reason::accepted;
+                }
             }
 
             found = std::all_of(canplace.begin(), canplace.end(),
@@ -1184,60 +1133,67 @@ void DefaultSupportTree::interconnect_pillars()
                 Vec3d s = spts[n];
                 Pillar p(Vec3d{s.x(), s.y(), gnd}, s.z() - gnd, pillar().r_start);
 
-                // The bracing is made against a pillar that does not exist yet:
-                // interconnect() is the test for whether this prop can be placed
-                // at all, and only a prop that passes is added. So the bars it
-                // makes have no id at that end until the pillar has one.
-                const size_t first_cross = m_builder.crossbridgecount();
+                // Whether this prop can be braced to its pillar is asked
+                // before it exists: only a prop that can is added. It is asked
+                // under the id it will get, so the pair is the same one
+                // attach() then builds.
+                PillarGeom prop = geom_of(p, true);
+                prop.id = long(m_builder.pillarcount());
+                if (planner.try_attach(pillar().id, prop).reason != Reason::accepted)
+                    continue;
 
-                if (interconnect(pillar(), p)) {
-                    Pillar &pp = m_builder.pillar(m_builder.add_pillar(p));
+                Pillar &pp = m_builder.pillar(m_builder.add_pillar(p));
+                assert(pp.id == prop.id);
+                planner.add_pillar(geom_of(pp, true));
 
-                    m_builder.own_crossbridges_from(first_cross, pp.id);
+                // An auxiliary pillar carries no head, so this is the only
+                // thing that says which support it belongs to.
+                pp.props_for = pillar().id;
 
-                    // An auxiliary pillar carries no head, so this is the only
-                    // thing that says which support it belongs to.
-                    pp.props_for = pillar().id;
+                const Decision braced = planner.attach(pillar().id, pp.id);
+                assert(braced.reason == Reason::accepted);
+                lay(braced);
 
-                    add_pillar_base(pp.id);
+                add_pillar_base(pp.id);
 
-                    m_pillar_index.insert(pp.endpoint(), unsigned(pp.id));
+                m_pillar_index.insert(pp.endpoint(), unsigned(pp.id));
 
-                    size_t first_junction = m_builder.junctioncount();
-                    m_builder.add_junction(s, pillar().r_start);
-                    m_builder.own_junctions_from(first_junction, pp.id);
-                    double t = bridge_mesh_distance(pillarsp, dirv(pillarsp, s),
-                                                    pillar().r_start);
-                    if (distance(pillarsp, s) < t)
+                size_t first_junction = m_builder.junctioncount();
+                m_builder.add_junction(s, pillar().r_start);
+                m_builder.own_junctions_from(first_junction, pp.id);
+                double t = bridge_mesh_distance(pillarsp, dirv(pillarsp, s),
+                                                pillar().r_start);
+                if (distance(pillarsp, s) < t) {
+                    const Bridge prop_bar =
                         m_builder.add_bridge_between(pp.id, pillarsp, s,
-                                                     pillar().r_start, pillar().id);
-
-                    if (pillar().endpoint().z() > ground_level(m_sm) + pillar().r_start) {
-                        first_junction = m_builder.junctioncount();
-                        m_builder.add_junction(pillar().endpoint(), pillar().r_start);
-                        m_builder.own_junctions_from(first_junction, pillar().id);
-                    }
-
-                    newpills.emplace_back(pp.id);
-                    m_builder.increment_links(pillar());
-                    m_builder.increment_links(pp);
+                                                     pillar().r_start, BridgeKind::prop,
+                                                     pillar().id);
+                    // Later bracing has to keep clear of it like of any bar.
+                    planner.add_obstacle_bar({{prop_bar.startp, prop_bar.endp, prop_bar.r},
+                                              prop_bar.owner_a, prop_bar.owner_b});
                 }
+
+                if (pillar().endpoint().z() > ground_level(m_sm) + pillar().r_start) {
+                    first_junction = m_builder.junctioncount();
+                    m_builder.add_junction(pillar().endpoint(), pillar().r_start);
+                    m_builder.own_junctions_from(first_junction, pillar().id);
+                }
+
+                newpills.emplace_back(pp.id);
             }
 
         if(!newpills.empty()) {
             for(auto it = newpills.begin(), nx = std::next(it);
-                 nx != newpills.end(); ++it, ++nx) {
-                const Pillar& itpll = m_builder.pillar(*it);
-                const Pillar& nxpll = m_builder.pillar(*nx);
-                if(interconnect(itpll, nxpll)) {
-                    m_builder.increment_links(itpll);
-                    m_builder.increment_links(nxpll);
-                }
-            }
+                 nx != newpills.end(); ++it, ++nx)
+                lay(planner.attach(*it, *nx));
 
-            m_pillar_index.foreach(cascadefn);
+            // Only the new props are run again: a frozen pillar never asks,
+            // and the pillars that were here already have had their turn.
+            for (const Decision &d : planner.run_greedy_for(newpills)) lay(d);
         }
     }
+
+    safety_net();
 }
 
 }} // namespace Slic3r::sla

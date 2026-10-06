@@ -18,6 +18,7 @@
 #include <memory>
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 
 #include "admesh/stl.h"
 
@@ -167,6 +168,10 @@ struct PriorPillar
     double r_end    = 0.;
     unsigned links   = 0;
     unsigned bridges = 0;
+    // How many pillars it is braced to, whether or not the bracing counts
+    // towards `links` (a much shorter neighbour does not). It is what stops a
+    // pillar from taking on more bracing; `links` stays the structural count.
+    unsigned pairs   = 0;
 };
 
 using PriorPillars = std::vector<PriorPillar>;
@@ -184,6 +189,7 @@ struct PriorAttachment
     long     prior_id = -1; // the caller's handle for the pillar attached to
     unsigned links    = 0;  // its link count after this generation
     unsigned bridges  = 0;  // its bridge count after this generation
+    unsigned pairs    = 0;  // its pair count after this generation
 };
 
 using PriorAttachments = std::vector<PriorAttachment>;
@@ -235,6 +241,7 @@ struct TreePillar
     double   height  = 0.;
     double   r_start = 0., r_end = 0.;
     unsigned links   = 0, bridges = 0;
+    unsigned pairs   = 0; // see PriorPillar::pairs
     // The pillar this one props up, for an auxiliary one. It holds no head, so
     // this is the only thing tying it to a support. -1 for an ordinary pillar.
     int      props   = -1;
@@ -261,6 +268,19 @@ struct TreePedestal
     int    pillar   = -1; // the pillar it was put under
 };
 
+// What a bar is for. Set by the builder function that creates the bar, at the
+// moment it is created, and never worked out afterwards from where the bar
+// lies: two bars of different kinds can look exactly alike.
+//
+//   truss - the zig-zag bracing between two pillars
+//   head  - a pin's junction reaching a pillar
+//   prop  - a pillar reaching the auxiliary pillar grown to prop it up
+//   route - a step of a path routed around the model
+//
+// `unset` is only the starting value; a bar that leaves the builder with it
+// has no kind, and the exported tree says so by leaving the kind out.
+enum class BridgeKind : uint8_t { unset = 0, truss, head, prop, route };
+
 // One BAR of bracing. The builder has always held them one per record; only the
 // merged mesh loses the boundary between them.
 struct TreeBridge
@@ -277,6 +297,7 @@ struct TreeBridge
     // is not a pillar of this run: a head's own junction, or a frozen pillar
     // (which `reaches` names instead).
     int    a = -1, b = -1;
+    BridgeKind kind = BridgeKind::unset;
 };
 
 struct SupportTreeElements
