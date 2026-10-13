@@ -13,6 +13,7 @@
 #include <cmath>
 #include <functional>
 #include <iterator>
+#include <map>
 #include <set>
 #include <string>
 #include <cassert>
@@ -1007,23 +1008,50 @@ void DefaultSupportTree::interconnect_pillars()
 
     std::set<unsigned long> pairs;
 
-    // A function to connect one pillar with its neighbors. THe number of
-    // neighbors is given in the configuration. This function if called
-    // for every pillar in the pillar index. A pair of pillar will not
+    // How many bars the cascade has hung on each pillar so far.
+    //
+    // Kept apart from Pillar::links, which counts only the links that COUNT
+    // towards propping - a bar to a much shorter pillar does not, see
+    // min_height_ratio below - and which is read further down to decide which
+    // pillars still need propping up. Reusing it here would conflate "is this
+    // pillar connected" with "is this pillar held".
+    std::map<unsigned long, unsigned> braced;
+    auto braces_on = [&braced](unsigned long id) {
+        auto it = braced.find(id);
+        return it == braced.end() ? 0u : it->second;
+    };
+
+    // A pillar reaches out to ONE neighbour, and carries at most this many bars
+    // in all.
+    //
+    // The engine used to keep going until a pillar's counted links reached
+    // pillar_cascade_neighbors, and a bar to a much shorter pillar never
+    // counted - so a tall pillar braced to its short neighbour, counted
+    // nothing, and went on to brace something further off, running that bar
+    // straight through the short pillar it had just tied itself to. On a thin
+    // roof that left three bars along one line: A to B, B to C, and A to C
+    // across them both. Reaching out once leaves the chain A-B-C and no bar
+    // across it.
+    //
+    // Two rather than one so nothing is left standing alone: a pillar still
+    // accepts a second bar from a neighbour reaching out to it, and a pillar
+    // with no link at all is one the engine props up with a support of its own
+    // that the user never asked for.
+    const unsigned max_braces = 2;
+
+    // A function to connect one pillar with its neighbors. This function is
+    // called for every pillar in the pillar index. A pair of pillar will not
     // be connected multiple times this is ensured by the 'pairs' set which
     // remembers the processed pillar pairs
     auto cascadefn =
-        [this, d, &pairs, min_height_ratio, H1] (const PointIndexEl& el)
+        [this, d, &pairs, &braced, &braces_on, max_braces, min_height_ratio, H1] (const PointIndexEl& el)
     {
         Vec3d qp = el.first;    // endpoint of the pillar
 
         const Pillar& pillar = m_builder.pillar(el.second); // actual pillar
 
-        // Get the max number of neighbors a pillar should connect to
-        unsigned neighbors = m_sm.cfg.pillar_cascade_neighbors;
-
         // connections are already enough for the pillar
-        if(pillar.links >= neighbors) return;
+        if(braces_on(el.second) >= max_braces) return;
 
         double max_d = d * pillar.r_start / m_sm.cfg.head_back_radius_mm;
         // Query all remaining points within reach
@@ -1052,11 +1080,13 @@ void DefaultSupportTree::interconnect_pillars()
             const Pillar& neighborpillar = m_builder.pillar(re.second);
 
             // this neighbor is occupied, skip
-            if (neighborpillar.links >= neighbors) continue;
+            if (braces_on(re.second) >= max_braces) continue;
             if (neighborpillar.r_start < pillar.r_start) continue;
 
             if(interconnect(pillar, neighborpillar)) {
                 pairs.insert(hashval);
+                ++braced[a];
+                ++braced[b];
                 // Bracing to a pillar carried in from an earlier generation is
                 // the whole point of additive support: report it, and report
                 // what it did to that pillar's link count.
@@ -1073,10 +1103,12 @@ void DefaultSupportTree::interconnect_pillars()
                     pillar.height / neighborpillar.height > min_height_ratio)
                     m_builder.increment_links(neighborpillar);
 
+                // One bar is this pillar's share. Whether it counted towards
+                // propping says nothing about whether the pillar is connected,
+                // and carrying on is what put a bar across a pillar already
+                // standing between the two.
+                break;
             }
-
-            // connections are enough for one pillar
-            if(pillar.links >= neighbors) break;
         }
     };
 
