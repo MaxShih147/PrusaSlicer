@@ -1,10 +1,16 @@
 #include "SampleConfigFactory.hpp"
 
+#include <libslic3r/EngineErrorCodes.hpp>
+
 using namespace Slic3r::sla;
 
-bool SampleConfigFactory::verify(SampleConfig &cfg) {
+namespace {
+// One pass over the constraints. Returns true when nothing had to be changed.
+// It moves values toward the constraints: clamping to a bound, swapping a
+// min/max pair that is out of order, or halving a min that equals its max.
+// Such changes are expected once density scales the distances, not an error.
+bool verify_once(SampleConfig &cfg) {
     auto verify_max = [](coord_t &c, coord_t max) {
-        assert(c <= max);
         if (c > max) {
             c = max;
             return false;
@@ -12,7 +18,6 @@ bool SampleConfigFactory::verify(SampleConfig &cfg) {
         return true;
     };
     auto verify_min = [](coord_t &c, coord_t min) {
-        assert(c >= min);
         if (c < min) {
             c = min;
             return false;
@@ -21,7 +26,6 @@ bool SampleConfigFactory::verify(SampleConfig &cfg) {
     };
     auto verify_min_max = [](coord_t &min, coord_t &max) {
         // min must be smaller than max
-        assert(min < max);
         if (min > max) {
             std::swap(min, max);
             return false;
@@ -48,8 +52,26 @@ bool SampleConfigFactory::verify(SampleConfig &cfg) {
         2 * cfg.head_radius + 2 * cfg.minimal_distance_from_outline);
     res &= verify_max(cfg.thin_max_width,
         2 * cfg.thin_max_distance + 2 * cfg.head_radius);
-    if (!res) while (!verify(cfg));
     return res;
+}
+
+// Passes allowed after the first one. Valid configurations settle in a few
+// passes; this only stops contradictory ones (e.g. thin_max_distance below
+// minimal_distance_from_outline) from looping forever.
+constexpr int max_extra_verify_passes = 20;
+} // namespace
+
+bool SampleConfigFactory::verify(SampleConfig &cfg) {
+    if (verify_once(cfg))
+        return true;
+    // Repeat until a pass changes nothing. Such a pass leaves the config as it
+    // is, so the result does not depend on how many passes it took.
+    for (int i = 0; i < max_extra_verify_passes; ++i)
+        if (verify_once(cfg))
+            return false;
+    throw Slic3r::CodedRuntimeError(Slic3r::make_engine_error(
+        Slic3r::EngineErrorCode::SUPPORT_POINT_SAMPLING_FAILED,
+        "SampleConfig convergence failed: cyclic geometric constraint"));
 }
 
 SampleConfig SampleConfigFactory::create(float support_head_diameter_in_mm) {
@@ -94,7 +116,10 @@ SampleConfig SampleConfigFactory::create(float support_head_diameter_in_mm) {
     result.count_iteration = 30; // speed VS precission
     result.max_align_distance = result.max_length_for_two_support_points / 2;
 
-    verify(result);
+    // Defaults must be consistent on their own. Keep the call outside assert()
+    // so a release build still runs it.
+    [[maybe_unused]] const bool clean = verify(result);
+    assert(clean);
     return result;
 }
 
@@ -131,6 +156,22 @@ SampleConfig SampleConfigFactory::apply_density(const SampleConfig &current, flo
     result.thick_outline_max_distance = static_cast<coord_t>(
         current.thick_outline_max_distance / density
     ); // linear
+
+    // verify() has no solution once thin_max_distance drops below
+    // minimal_distance_from_outline (thin_max_width can't be both >= 2r+2m and
+    // <= 2t+2r), so hold it there. minimal_move also floors heads under 0.2 mm,
+    // where m is too small to keep the point count sane. The thick spacings
+    // keep shrinking, floored so they never reach zero. The floors apply only
+    // in this branch, so a density that keeps thin_max_distance >= m_thresh
+    // gets exactly the three scaled values above.
+    const coord_t m_thresh = std::max(current.minimal_distance_from_outline, current.minimal_move);
+    if (result.thin_max_distance < m_thresh) {
+        result.thin_max_distance = m_thresh;
+        result.thick_inner_max_distance = std::max(result.thick_inner_max_distance,
+            std::max(2 * current.head_radius, current.minimal_move));
+        result.thick_outline_max_distance = std::max(result.thick_outline_max_distance,
+            current.minimal_move);
+    }
     // result.head_radius                       .. no change
     // result.minimal_distance_from_outline     .. no change
     // result.maximal_distance_from_outline     .. no change

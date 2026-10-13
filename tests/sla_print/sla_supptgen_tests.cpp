@@ -1,6 +1,14 @@
 #include <catch2/catch_test_macros.hpp>
 #include <test_utils.hpp>
 
+#include <climits>
+#include <cmath>
+#include <cstdint>
+#include <limits>
+#include <stdexcept>
+#include <utility>
+#include <vector>
+
 #include <libslic3r/ExPolygon.hpp>
 #include <libslic3r/BoundingBox.hpp>
 #include <libslic3r/SLA/SpatIndex.hpp>
@@ -12,6 +20,7 @@
 #include <libslic3r/SLA/SupportIslands/VoronoiGraphUtils.hpp>
 #include <libslic3r/SLA/SupportIslands/UniformSupportIsland.hpp>
 #include <libslic3r/SLA/SupportIslands/PolygonUtils.hpp>
+#include <libslic3r/EngineErrorCodes.hpp>
 #include "nanosvg/nanosvg.h"    // load SVG file
 #include "sla_test_utils.hpp"
 
@@ -655,4 +664,399 @@ TEST_CASE("SPE-2714 3DBenchy - Sample island with config", "[SupportIsland]") {
     ExPolygon island = load_svg(dir + "SPE-2714.svg"); // Bad field creation
     SupportIslandPoints points = test_island_sampling(island, cfg);
     CHECK(points.size() > 22); // Before fix it not finished
+}
+
+namespace {
+// Thrown by legacy_verify() when its recursion gets too deep, so a grid point
+// that strays into a non-converging input fails the test case instead of
+// overflowing the test process's stack.
+struct LegacyVerifyTooDeep : std::runtime_error
+{
+    LegacyVerifyTooDeep() : std::runtime_error("legacy_verify recursion deeper than 50") {}
+};
+
+// SampleConfigFactory::verify() as of a114d13bd: the reference the bit-for-bit
+// checks compare against. Two changes: the three asserts are removed (they
+// fire whenever a check clamps, i.e. above ~205% density), and the recursion
+// carries a depth guard.
+bool legacy_verify(SampleConfig &cfg, int depth = 0) {
+    if (depth > 50)
+        throw LegacyVerifyTooDeep();
+    auto verify_max = [](coord_t &c, coord_t max) {
+        if (c > max) {
+            c = max;
+            return false;
+        }
+        return true;
+    };
+    auto verify_min = [](coord_t &c, coord_t min) {
+        if (c < min) {
+            c = min;
+            return false;
+        }
+        return true;
+    };
+    auto verify_min_max = [](coord_t &min, coord_t &max) {
+        // min must be smaller than max
+        if (min > max) {
+            std::swap(min, max);
+            return false;
+        } else if (min == max) {
+            min /= 2; // cut in half
+            return false;
+        }
+        return true;
+    };
+    bool res = true;
+    res &= verify_min_max(cfg.max_length_for_one_support_point, cfg.max_length_for_two_support_points);
+    res &= verify_min_max(cfg.thick_min_width, cfg.thin_max_width); // check histeresis
+    res &= verify_max(cfg.max_length_for_one_support_point,
+        2 * cfg.thin_max_distance +
+        2 * cfg.head_radius +
+        2 * cfg.minimal_distance_from_outline);
+    res &= verify_min(cfg.max_length_for_one_support_point,
+        2 * cfg.head_radius + 2 * cfg.minimal_distance_from_outline);
+    res &= verify_max(cfg.max_length_for_two_support_points,
+        2 * cfg.thin_max_distance +
+        2 * 2 * cfg.head_radius +
+        2 * cfg.minimal_distance_from_outline);
+    res &= verify_min(cfg.thin_max_width,
+        2 * cfg.head_radius + 2 * cfg.minimal_distance_from_outline);
+    res &= verify_max(cfg.thin_max_width,
+        2 * cfg.thin_max_distance + 2 * cfg.head_radius);
+    if (!res) while (!legacy_verify(cfg, depth + 1));
+    return res;
+}
+
+// SampleConfigFactory::create() as of a114d13bd without its closing verify():
+// the raw defaults, before anything has clamped them. The leading assert is
+// dropped along with the asserts in legacy_verify().
+SampleConfig legacy_create_unverified(float support_head_diameter_in_mm) {
+    SampleConfig result;
+    result.head_radius = static_cast<coord_t>(scale_(support_head_diameter_in_mm/2));
+
+    double head_area = M_PI * sqr(support_head_diameter_in_mm / 2); // Pi r^2
+    result.max_length_for_one_support_point = static_cast<coord_t>(scale_(head_area * 2.9 + 1.3));
+    result.max_length_for_two_support_points =
+        static_cast<coord_t>(result.max_length_for_one_support_point * 3.9);
+    result.thin_max_width = static_cast<coord_t>(result.max_length_for_one_support_point * 2.5);
+    result.thick_min_width = static_cast<coord_t>(result.max_length_for_one_support_point * 2.15);
+    result.thin_max_distance = static_cast<coord_t>(result.max_length_for_two_support_points * 0.8);
+    result.thick_inner_max_distance = result.max_length_for_two_support_points; // 6.5mm
+    result.thick_outline_max_distance = static_cast<coord_t>(result.max_length_for_two_support_points * 0.75); // 4.875mm
+    result.minimal_distance_from_outline = result.head_radius;           // 0.2mm
+    result.maximal_distance_from_outline = result.thin_max_distance / 3; // 1.73mm
+    result.min_part_length = result.thin_max_distance;                   // 5.2mm
+    result.minimal_move = scale_(0.1); // 0.1 mm is enough
+    result.count_iteration = 30; // speed VS precission
+    result.max_align_distance = result.max_length_for_two_support_points / 2;
+    return result;
+}
+
+// SampleConfigFactory::create() as of a114d13bd, calling legacy_verify().
+SampleConfig legacy_create(float support_head_diameter_in_mm) {
+    SampleConfig result = legacy_create_unverified(support_head_diameter_in_mm);
+    legacy_verify(result);
+    return result;
+}
+
+// SampleConfigFactory::apply_density() as of a114d13bd, calling legacy_verify().
+SampleConfig legacy_apply_density(const SampleConfig &current, float density) {
+    if (is_approx(density, 1.f))
+        return current;
+    if (density < .1f)
+        density = .1f; // minimal 10%
+
+    SampleConfig result = current;                                                        // copy
+    result.thin_max_distance = static_cast<coord_t>(current.thin_max_distance / density); // linear
+    result.thick_inner_max_distance = static_cast<coord_t>( // controll radius - quadratic
+        std::sqrt(sqr((double) current.thick_inner_max_distance) / density)
+    );
+    result.thick_outline_max_distance = static_cast<coord_t>(
+        current.thick_outline_max_distance / density
+    ); // linear
+    legacy_verify(result);
+    return result;
+}
+
+// SampleConfigFactory::apply_min_distance() as of a114d13bd, calling legacy_verify().
+SampleConfig legacy_apply_min_distance(const SampleConfig &current, float min_distance_mm) {
+    if (min_distance_mm <= 0.f)
+        return current;
+
+    const coord_t floor_distance = static_cast<coord_t>(scale_(min_distance_mm));
+    SampleConfig result = current; // copy
+    result.thin_max_distance = std::max(result.thin_max_distance, floor_distance);
+    result.thick_inner_max_distance = std::max(result.thick_inner_max_distance, floor_distance);
+    result.thick_outline_max_distance = std::max(result.thick_outline_max_distance, floor_distance);
+    legacy_verify(result);
+    return result;
+}
+
+// Density as SLAPrintSteps.cpp derives it from support_points_density_relative.
+float density_from_percent(int percent) { return float(percent / 100.f); }
+
+// thin_max_distance as legacy_apply_density() scales it, before verify().
+// Below minimal_distance_from_outline the legacy code never converges.
+coord_t legacy_scaled_thin_max_distance(const SampleConfig &cfg, float density) {
+    if (is_approx(density, 1.f))
+        return cfg.thin_max_distance;
+    if (density < .1f)
+        density = .1f;
+    return static_cast<coord_t>(cfg.thin_max_distance / density);
+}
+
+// The chain SLAPrintSteps.cpp runs for each object.
+SampleConfig derive_island_config(float head_diameter, int percent, float min_distance_mm) {
+    return SampleConfigFactory::apply_min_distance(
+        SampleConfigFactory::apply_density(
+            SampleConfigFactory::create(head_diameter), density_from_percent(percent)),
+        min_distance_mm);
+}
+
+void check_same_scalars(const SampleConfig &expected, const SampleConfig &actual) {
+    CHECK(actual.thin_max_distance == expected.thin_max_distance);
+    CHECK(actual.thick_inner_max_distance == expected.thick_inner_max_distance);
+    CHECK(actual.thick_outline_max_distance == expected.thick_outline_max_distance);
+    CHECK(actual.head_radius == expected.head_radius);
+    CHECK(actual.minimal_distance_from_outline == expected.minimal_distance_from_outline);
+    CHECK(actual.maximal_distance_from_outline == expected.maximal_distance_from_outline);
+    CHECK(actual.max_length_for_one_support_point == expected.max_length_for_one_support_point);
+    CHECK(actual.max_length_for_two_support_points == expected.max_length_for_two_support_points);
+    CHECK(actual.max_length_ratio_for_two_support_points == expected.max_length_ratio_for_two_support_points);
+    CHECK(actual.thin_max_width == expected.thin_max_width);
+    CHECK(actual.thick_min_width == expected.thick_min_width);
+    CHECK(actual.min_part_length == expected.min_part_length);
+    CHECK(actual.minimal_move == expected.minimal_move);
+    CHECK(actual.count_iteration == expected.count_iteration);
+    CHECK(actual.max_align_distance == expected.max_align_distance);
+    CHECK(actual.simplification_tolerance == expected.simplification_tolerance);
+}
+
+// The seven conditions verify() settles on, checked directly so a test does
+// not rely on verify() to judge its own output. Computed in 64 bits so the
+// check itself cannot overflow.
+void check_constraints_hold(const SampleConfig &cfg) {
+    const int64_t t = cfg.thin_max_distance;
+    const int64_t r = cfg.head_radius;
+    const int64_t m = cfg.minimal_distance_from_outline;
+    CHECK(cfg.max_length_for_one_support_point < cfg.max_length_for_two_support_points);
+    CHECK(cfg.thick_min_width < cfg.thin_max_width);
+    CHECK(cfg.max_length_for_one_support_point <= 2 * t + 2 * r + 2 * m);
+    CHECK(cfg.max_length_for_one_support_point >= 2 * r + 2 * m);
+    CHECK(cfg.max_length_for_two_support_points <= 2 * t + 4 * r + 2 * m);
+    CHECK(cfg.thin_max_width >= 2 * r + 2 * m);
+    CHECK(cfg.thin_max_width <= 2 * t + 2 * r);
+}
+
+// Head diameters [mm] for the bit-for-bit grid; all at least 0.2 mm, where
+// unsaturated results must match the legacy code. At 0.2 mm head_radius equals
+// minimal_move, the edge where m_thresh stops being minimal_distance_from_outline.
+const float grid_heads[] = {.2f, .3f, .4f, .5f, .6f, .8f, 1.f, 1.5f};
+
+// Every whole percent from 10% up to the last one the legacy code survives,
+// comparing the whole legacy chain (create included) with the current one.
+void check_grid_matches_legacy(float min_distance_mm) {
+    for (float head : grid_heads) {
+        CAPTURE(head);
+        const SampleConfig legacy_base = legacy_create(head);
+        const SampleConfig base        = SampleConfigFactory::create(head);
+        check_same_scalars(legacy_base, base);
+        int last_percent = 0;
+        for (int percent = 10;; ++percent) {
+            const float density = density_from_percent(percent);
+            if (legacy_scaled_thin_max_distance(legacy_base, density) < legacy_base.minimal_distance_from_outline)
+                break;
+            CAPTURE(percent);
+            SampleConfig expected = legacy_apply_density(legacy_base, density);
+            SampleConfig actual   = SampleConfigFactory::apply_density(base, density);
+            if (min_distance_mm > 0.f) {
+                expected = legacy_apply_min_distance(expected, min_distance_mm);
+                actual   = SampleConfigFactory::apply_min_distance(actual, min_distance_mm);
+            }
+            check_same_scalars(expected, actual);
+            last_percent = percent;
+        }
+        // Every head size in the grid survives past 2000%, so a lower stop means
+        // the grid broke off early and compared far less than it claims.
+        CHECK(last_percent > 2000);
+    }
+}
+} // namespace
+
+TEST_CASE("SampleConfig: density gives the legacy result bit for bit", "[SupportIsland][SampleConfig]") {
+    check_grid_matches_legacy(0.f);
+}
+
+TEST_CASE("SampleConfig: density with min distance gives the legacy result bit for bit", "[SupportIsland][SampleConfig]") {
+    check_grid_matches_legacy(1.5f);
+}
+
+TEST_CASE("SampleConfig: legacy_verify fails instead of overflowing the stack", "[SupportIsland][SampleConfig]") {
+    SampleConfig cfg = SampleConfigFactory::create(.6f);
+    cfg.thin_max_distance = cfg.minimal_distance_from_outline / 2; // no solution
+    CHECK_THROWS_AS(legacy_verify(cfg), LegacyVerifyTooDeep);
+}
+
+TEST_CASE("SampleConfig: thin spacing saturates past the crash threshold", "[SupportIsland][SampleConfig]") {
+    // 2205% is the first whole percent that overflowed the stack with a 0.6 mm head.
+    const coord_t min_distance = static_cast<coord_t>(scale_(1.5f));
+    coord_t previous_inner = std::numeric_limits<coord_t>::max();
+    for (int percent : {2205, 5000, 10000}) {
+        CAPTURE(percent);
+        SampleConfig cfg;
+        REQUIRE_NOTHROW(cfg = derive_island_config(.6f, percent, 0.f));
+        CHECK(cfg.thin_max_distance == cfg.minimal_distance_from_outline);
+        CHECK(cfg.thick_inner_max_distance < previous_inner);
+        check_constraints_hold(cfg);
+        previous_inner = cfg.thick_inner_max_distance;
+
+        // A min distance above the saturated spacing lifts all three to it.
+        SampleConfig raised;
+        REQUIRE_NOTHROW(raised = derive_island_config(.6f, percent, 1.5f));
+        CHECK(raised.thin_max_distance == min_distance);
+        CHECK(raised.thick_inner_max_distance >= min_distance);
+        CHECK(raised.thick_outline_max_distance >= min_distance);
+        check_constraints_hold(raised);
+    }
+}
+
+TEST_CASE("SampleConfig: thick spacings keep the legacy formulas past saturation", "[SupportIsland][SampleConfig]") {
+    const SampleConfig base = SampleConfigFactory::create(.6f);
+    for (const auto &[percent, inner_mm] : std::vector<std::pair<int, double>>{{3100, 1.48}, {4200, 1.27}}) {
+        CAPTURE(percent);
+        const float density = density_from_percent(percent);
+        const SampleConfig cfg = SampleConfigFactory::apply_density(base, density);
+        REQUIRE(cfg.thin_max_distance == cfg.minimal_distance_from_outline); // saturated
+        // Square-root scaling, as the unsaturated path uses - not linear.
+        CHECK(cfg.thick_inner_max_distance == static_cast<coord_t>(
+            std::sqrt(sqr((double) base.thick_inner_max_distance) / density)));
+        CHECK(std::abs(unscale<double>(cfg.thick_inner_max_distance) - inner_mm) <= .01);
+        // Still above its floor here, so the linear formula shows through.
+        CHECK(cfg.thick_outline_max_distance == static_cast<coord_t>(
+            base.thick_outline_max_distance / density));
+    }
+}
+
+TEST_CASE("SampleConfig: extreme densities return with every spacing floored", "[SupportIsland][SampleConfig]") {
+    for (float head : {0.f, .1f, .6f}) {
+        for (int percent : {5000, 10000, INT_MAX}) {
+            CAPTURE(head, percent);
+            SampleConfig cfg;
+            REQUIRE_NOTHROW(cfg = derive_island_config(head, percent, 0.f));
+            CHECK(cfg.thin_max_distance >= std::max(cfg.minimal_distance_from_outline, cfg.minimal_move));
+            CHECK(cfg.thick_outline_max_distance >= cfg.minimal_move);
+            CHECK(cfg.thick_inner_max_distance >= std::max(2 * cfg.head_radius, cfg.minimal_move));
+            check_constraints_hold(cfg);
+        }
+    }
+
+    const SampleConfig head_06 = derive_island_config(.6f, INT_MAX, 0.f);
+    CHECK(head_06.thick_outline_max_distance == head_06.minimal_move);
+    CHECK(head_06.thick_inner_max_distance == 2 * head_06.head_radius);
+
+    const SampleConfig head_0 = derive_island_config(0.f, INT_MAX, 0.f);
+    CHECK(head_0.minimal_distance_from_outline == 0);
+    CHECK(head_0.thin_max_distance >= head_0.minimal_move);
+    CHECK(head_0.thick_outline_max_distance >= head_0.minimal_move);
+    CHECK(head_0.thick_inner_max_distance >= head_0.minimal_move);
+
+    REQUIRE_NOTHROW(derive_island_config(0.f, 100, 0.f));
+}
+
+TEST_CASE("SampleConfig: floors only apply once thin spacing saturates", "[SupportIsland][SampleConfig]") {
+    SECTION("0.2 mm head at 4100%: outline already under minimal_move, thin not saturated") {
+        const SampleConfig legacy_base = legacy_create(.2f);
+        const SampleConfig base        = SampleConfigFactory::create(.2f);
+        const float density = density_from_percent(4100);
+        REQUIRE(legacy_scaled_thin_max_distance(legacy_base, density) >=
+                std::max(legacy_base.minimal_distance_from_outline, legacy_base.minimal_move));
+        REQUIRE(static_cast<coord_t>(legacy_base.thick_outline_max_distance / density) < legacy_base.minimal_move);
+        const SampleConfig cfg = SampleConfigFactory::apply_density(base, density);
+        check_same_scalars(legacy_apply_density(legacy_base, density), cfg);
+        CHECK(cfg.thick_outline_max_distance < cfg.minimal_move);
+    }
+    SECTION("0.1 mm head: unchanged above minimal_move, saturated at it below") {
+        const SampleConfig legacy_base = legacy_create(.1f);
+        const SampleConfig base        = SampleConfigFactory::create(.1f);
+
+        const float unsaturated = density_from_percent(4000);
+        REQUIRE(legacy_scaled_thin_max_distance(legacy_base, unsaturated) >= legacy_base.minimal_move);
+        check_same_scalars(legacy_apply_density(legacy_base, unsaturated),
+                           SampleConfigFactory::apply_density(base, unsaturated));
+
+        // The legacy code still converges here (thin >= minimal_distance_from_outline),
+        // but the result is held at minimal_move by design.
+        const float saturated = density_from_percent(6000);
+        const coord_t thin = legacy_scaled_thin_max_distance(legacy_base, saturated);
+        REQUIRE(thin >= legacy_base.minimal_distance_from_outline);
+        REQUIRE(thin < legacy_base.minimal_move);
+        const SampleConfig cfg = SampleConfigFactory::apply_density(base, saturated);
+        CHECK(cfg.thin_max_distance == cfg.minimal_move);
+        CHECK(cfg.thick_outline_max_distance >= cfg.minimal_move);
+    }
+}
+
+TEST_CASE("SampleConfig: verify() reports a contradictory config with the engine error code", "[SupportIsland][SampleConfig]") {
+    SampleConfig cfg = SampleConfigFactory::create(.6f);
+    cfg.thin_max_distance = cfg.minimal_distance_from_outline / 2; // thin_max_width has no valid value
+    bool thrown = false;
+    try {
+        SampleConfigFactory::verify(cfg);
+    } catch (const Slic3r::RuntimeError &e) {
+        thrown = true;
+        const auto *carrier = dynamic_cast<const EngineErrorCarrier *>(&e);
+        REQUIRE(carrier != nullptr);
+        REQUIRE(carrier->engine_error().code.has_value());
+        CHECK(*carrier->engine_error().code == EngineErrorCode::SUPPORT_POINT_SAMPLING_FAILED);
+    }
+    CHECK(thrown);
+}
+
+TEST_CASE("SampleConfig: create() defaults pass verify() on the first pass", "[SupportIsland][SampleConfig]") {
+    // Every head size the tests pass to create(), so a default that starts
+    // needing a clamp fails here rather than tripping assert(clean) elsewhere.
+    for (float head : {0.f, .1f, .2f, .3f, .4f, .5f, .6f, .8f, 1.f, 1.5f}) {
+        CAPTURE(head);
+        // The raw defaults, before any verify(): true means nothing needed a clamp.
+        SampleConfig raw = legacy_create_unverified(head);
+        CHECK(SampleConfigFactory::verify(raw));
+        check_same_scalars(raw, SampleConfigFactory::create(head));
+    }
+}
+
+TEST_CASE("SampleConfig: a density that makes verify() clamp does not trip an assert", "[SupportIsland][SampleConfig]") {
+    // At 300% verify() has to lower max_length_for_two_support_points. An
+    // assert on that path only fires in Debug; Release and RelWithDebInfo
+    // (the builds this runs in) still check that the clamp happens and nothing
+    // throws.
+    const SampleConfig base = SampleConfigFactory::create(.6f);
+    SampleConfig cfg;
+    REQUIRE_NOTHROW(cfg = SampleConfigFactory::apply_density(base, 3.f));
+    CHECK(cfg.max_length_for_two_support_points < base.max_length_for_two_support_points);
+}
+
+TEST_CASE("SampleConfig: no head size or density makes the factory throw", "[SupportIsland][SampleConfig]") {
+    // Everything below 10% clamps to the same density, so 0% stands for it.
+    std::vector<int> percents{0};
+    for (int percent = 10; percent <= 10000; ++percent)
+        percents.push_back(percent);
+    for (int percent = 10000 + 997; percent < 1000000; percent += 997)
+        percents.push_back(percent);
+    percents.push_back(INT_MAX);
+
+    for (float head : {0.f, .1f, .2f, .3f, .4f, .5f, .6f, .8f, 1.f, 1.5f}) {
+        const SampleConfig base = SampleConfigFactory::create(head);
+        for (int percent : percents) {
+            CAPTURE(head, percent);
+            SampleConfig scaled;
+            REQUIRE_NOTHROW(scaled = SampleConfigFactory::apply_density(base, density_from_percent(percent)));
+            // 0.15 mm can land between a saturated thin spacing and the thick
+            // ones, so only some spacings get raised; 1.5 mm raises them all.
+            for (float min_distance : {.15f, 1.5f}) {
+                CAPTURE(min_distance);
+                REQUIRE_NOTHROW(SampleConfigFactory::apply_min_distance(scaled, min_distance));
+            }
+        }
+    }
 }
