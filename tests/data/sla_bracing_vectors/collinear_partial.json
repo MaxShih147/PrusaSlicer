@@ -1,0 +1,25 @@
+{
+  "id": "collinear_partial",
+  "description": "C-D half overlaps existing A-B: pillar B stands on C-D, so obstacle_pillar decides before cross_truss.",
+  "cfg": {"safety_clearance":0.2,"min_shared_angle_deg":20,"pair_cap":3,"max_link_distance":10,"min_pillar_distance":1,"rescue_height":15,"bridge_slope_deg":45,"ground_z":0,"base_height":1,"base_radius":2,"connection_mode":"dynamic"},
+  "pillars": [
+    {"id":0,"endpoint":[0,0,0.0],"height":14,"r":0.5,"links":1,"pairs":1,"frozen":false},
+    {"id":1,"endpoint":[6,0,0.0],"height":14,"r":0.5,"links":1,"pairs":1,"frozen":false},
+    {"id":2,"endpoint":[3,0,0.0],"height":14,"r":0.5,"links":0,"pairs":0,"frozen":false},
+    {"id":3,"endpoint":[9,0,0.0],"height":14,"r":0.5,"links":0,"pairs":0,"frozen":false}
+  ],
+  "bars": [
+    {"startp":[0,0,14],"endp":[6,0,8],"r":0.5,"kind":"truss","a":0,"b":1}
+  ],
+  "expect": {
+    "accepted": [
+      {"phase":"greedy","pair":[1,3],"bars_built":4}
+    ],
+    "rejected": [
+      {"phase":"greedy","pair":[0,2],"reason":"shared_angle"},
+      {"phase":"greedy","pair":[1,2],"reason":"shared_angle"},
+      {"phase":"greedy","pair":[2,3],"reason":"obstacle_pillar"},
+      {"phase":"greedy","pair":[0,3],"reason":"obstacle_pillar"}
+    ]
+  }
+}

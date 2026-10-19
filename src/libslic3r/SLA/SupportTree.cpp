@@ -100,6 +100,7 @@ indexed_triangle_set create_support_tree(const SupportableMesh &sm,
                 pp.r_end    = p.r_end;
                 pp.links    = p.links;
                 pp.bridges  = p.bridges;
+                pp.pairs    = p.pairs;
                 out_pillars->push_back(pp);
             }
         }
@@ -149,7 +150,7 @@ indexed_triangle_set create_support_tree(const SupportableMesh &sm,
                 pillar_slot[p.id] = int(out_elements->pillars.size());
                 out_elements->pillars.push_back(
                     TreePillar{p.endpoint(), p.height, p.r_start, p.r_end,
-                               p.links, p.bridges, -1,
+                               p.links, p.bridges, p.pairs, -1,
                                p.starts_from_head ? head_at(p.start_junction_id) : -1});
             }
 
@@ -198,9 +199,12 @@ indexed_triangle_set create_support_tree(const SupportableMesh &sm,
                 if (builder->bridge_reaches_frozen(b))
                     reaches = prior_caller_id(sm, *builder,
                                               builder->bridge_frozen_target(b));
+                // Every builder function names the kind of bar it makes; a
+                // bar without one means a creation site was missed.
+                assert(b.kind != BridgeKind::unset);
                 out_elements->bridges.push_back(
                     TreeBridge{b.startp, b.endp, b.r, end_r, reaches,
-                               slot(b.owner_a), slot(b.owner_b)});
+                               slot(b.owner_a), slot(b.owner_b), b.kind});
             };
 
             for (const Bridge &b : builder->bridges())      add_bridge(b, b.r);

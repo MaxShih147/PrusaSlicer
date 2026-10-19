@@ -1,0 +1,19 @@
+{
+  "id": "head_bar_all_blocked",
+  "description": "Bars at z 11 (route) and z 5 (head) meet all four bars: z_clear_fail.",
+  "cfg": {"safety_clearance":0.2,"min_shared_angle_deg":20,"pair_cap":3,"max_link_distance":10,"min_pillar_distance":1,"rescue_height":15,"bridge_slope_deg":45,"ground_z":0,"base_height":1,"base_radius":2,"connection_mode":"dynamic"},
+  "pillars": [
+    {"id":0,"endpoint":[0,0,0.0],"height":14,"r":0.5,"links":0,"pairs":0,"frozen":false},
+    {"id":1,"endpoint":[6,0,0.0],"height":14,"r":0.5,"links":0,"pairs":0,"frozen":false}
+  ],
+  "bars": [
+    {"startp":[3,-3,11],"endp":[3,3,11],"r":0.5,"kind":"route","a":-1,"b":-1},
+    {"startp":[3,-3,5],"endp":[3,3,5],"r":0.5,"kind":"head","a":-1,"b":-1}
+  ],
+  "expect": {
+    "accepted": [],
+    "rejected": [
+      {"phase":"greedy","pair":[0,1],"reason":"z_clear_fail"}
+    ]
+  }
+}

@@ -120,11 +120,21 @@ std::pair<bool, long> create_ground_pillar(
     // below: passing it also attaches the pillar directly to that head. A
     // caller that reaches the ground through an intermediate bridge must leave
     // head_id unset while still naming the point the sizes come from.
-    long                   size_point_id = SupportTreeNode::ID_UNSET)
+    long                   size_point_id = SupportTreeNode::ID_UNSET,
+    // Set to whether a bar was laid between pinhead_junctionpt and the top of
+    // the pillar, that is whether the pillar starts somewhere else.
+    bool                  *laid_bar = nullptr)
 {
     Vec3d  jp           = pinhead_junctionpt, endp = jp, dir = sourcedir;
     long   pillar_id    = SupportTreeNode::ID_UNSET;
     bool   can_add_base = false, non_head = false;
+
+    // The bar laid last ends where the pillar starts. It is laid before the
+    // pillar exists, so the pillar is named on it afterwards: bracing to that
+    // pillar meets the bar at the pillar's top rather than passing it.
+    long top_bridge     = SupportTreeNode::ID_UNSET;
+    long top_diffbridge = SupportTreeNode::ID_UNSET;
+    if (laid_bar) *laid_bar = false;
 
     // This pillar's own sizes, resolved from the support point it grew from.
     // Both ids are ID_UNSET for pillars with no originating point, and the
@@ -174,8 +184,9 @@ std::pair<bool, long> create_ground_pillar(
             search_widening_path(policy, sm, jp, dir, radius, pt_back_r);
 
         if (diffbr && diffbr->endp.z() > jp_gnd) {
-            auto &br = builder.add_diffbridge(*diffbr);
+            const DiffBridge br = builder.add_diffbridge(*diffbr);
             if (head_id >= 0) builder.head(head_id).bridge_id = br.id;
+            top_diffbridge = br.id;
             endp = diffbr->endp;
             radius = diffbr->end_r;
             end_radius = diffbr->end_r;
@@ -234,8 +245,10 @@ std::pair<bool, long> create_ground_pillar(
         if (dlast < gap_dist) return {false, pillar_id};
 
         if (t > 0.) { // Need to make additional bridge
-            const Bridge& br = builder.add_bridge(endp, nexp, radius);
+            const Bridge br = builder.add_bridge(endp, nexp, radius, BridgeKind::route);
             if (head_id >= 0) builder.head(head_id).bridge_id = br.id;
+            top_bridge     = br.id;
+            top_diffbridge = SupportTreeNode::ID_UNSET;
 
             builder.add_junction(nexp, radius);
             endp = nexp;
@@ -251,6 +264,12 @@ std::pair<bool, long> create_ground_pillar(
 
     if (can_add_base)
         builder.add_pillar_base(pillar_id, sm.cfg.base_height_mm, pt_base_r);
+
+    if (top_bridge >= 0)
+        builder.own_bridge(top_bridge, pillar_id);
+    else if (top_diffbridge >= 0)
+        builder.own_diffbridge(top_diffbridge, pillar_id);
+    if (laid_bar) *laid_bar = top_bridge >= 0 || top_diffbridge >= 0;
 
     return {true, pillar_id};
 }
@@ -290,11 +309,15 @@ std::pair<bool, long> connect_to_ground(Ex                     policy,
     Vec3d endp = hjp + d * dir;
     // head_id goes in as the sizing point only: this route always inserts a
     // bridge below, so the pillar must not be attached to the head directly.
+    bool laid_bar = false;
     auto ret = create_ground_pillar(policy, builder, sm, endp, dir, r, end_r,
-                                    SupportTreeNode::ID_UNSET, head_id);
+                                    SupportTreeNode::ID_UNSET, head_id, &laid_bar);
 
     if (ret.second >= 0) {
-        builder.add_bridge(hjp, endp, r);
+        // This bar ends on the pillar's top unless create_ground_pillar laid
+        // another one below it.
+        builder.add_bridge(hjp, endp, r, BridgeKind::route,
+                           laid_bar ? SupportTreeNode::ID_UNSET : ret.second);
         builder.add_junction(endp, r);
     }
 

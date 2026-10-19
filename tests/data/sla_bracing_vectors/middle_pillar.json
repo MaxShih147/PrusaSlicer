@@ -1,0 +1,20 @@
+{
+  "id": "middle_pillar",
+  "description": "B, 0.3 mm off the line A-C and not full, stands in the way of A-C.",
+  "cfg": {"safety_clearance":0.2,"min_shared_angle_deg":20,"pair_cap":3,"max_link_distance":10,"min_pillar_distance":1,"rescue_height":15,"bridge_slope_deg":45,"ground_z":0,"base_height":1,"base_radius":2,"connection_mode":"dynamic"},
+  "pillars": [
+    {"id":0,"endpoint":[0,0,0.0],"height":14,"r":0.5,"links":0,"pairs":0,"frozen":false},
+    {"id":1,"endpoint":[4,0.3,0.0],"height":14,"r":0.5,"links":0,"pairs":0,"frozen":false},
+    {"id":2,"endpoint":[8,0,0.0],"height":14,"r":0.5,"links":0,"pairs":0,"frozen":false}
+  ],
+  "bars": [],
+  "expect": {
+    "accepted": [
+      {"phase":"greedy","pair":[0,1],"bars_built":6},
+      {"phase":"greedy","pair":[1,2],"bars_built":6}
+    ],
+    "rejected": [
+      {"phase":"greedy","pair":[0,2],"reason":"obstacle_pillar"}
+    ]
+  }
+}

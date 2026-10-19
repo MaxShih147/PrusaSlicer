@@ -1,0 +1,35 @@
+{
+  "id": "rescue_success",
+  "description": "P-Q crosses existing X-Y in plan view, but every bar clears in 3D (gap 3/sqrt3): rescued.",
+  "cfg": {"safety_clearance":0.2,"min_shared_angle_deg":20,"pair_cap":3,"max_link_distance":10,"min_pillar_distance":1,"rescue_height":15,"bridge_slope_deg":45,"ground_z":0,"base_height":1,"base_radius":2,"connection_mode":"dynamic"},
+  "pillars": [
+    {"id":0,"endpoint":[0,0,0.0],"height":30,"r":0.5,"links":0,"pairs":0,"frozen":false},
+    {"id":1,"endpoint":[6,0,0.0],"height":30,"r":0.5,"links":0,"pairs":0,"frozen":false},
+    {"id":2,"endpoint":[3,-4,0.0],"height":30,"r":0.5,"links":3,"pairs":3,"frozen":true},
+    {"id":3,"endpoint":[3,4,0.0],"height":30,"r":0.5,"links":3,"pairs":3,"frozen":true}
+  ],
+  "bars": [
+    {"startp":[3,-4,28],"endp":[3,4,20],"r":0.5,"kind":"truss","a":2,"b":3},
+    {"startp":[3,4,22],"endp":[3,-4,14],"r":0.5,"kind":"truss","a":2,"b":3}
+  ],
+  "expect": {
+    "accepted": [
+      {"phase":"rescue","pair":[0,1],"bars_built":8}
+    ],
+    "rejected": [
+      {"phase":"greedy","pair":[0,2],"reason":"pair_cap"},
+      {"phase":"greedy","pair":[0,3],"reason":"pair_cap"},
+      {"phase":"greedy","pair":[1,2],"reason":"pair_cap"},
+      {"phase":"greedy","pair":[1,3],"reason":"pair_cap"},
+      {"phase":"greedy","pair":[0,1],"reason":"cross_truss"},
+      {"phase":"rescue","pair":[0,2],"reason":"pair_cap"},
+      {"phase":"rescue","pair":[0,3],"reason":"pair_cap"},
+      {"phase":"rescue","pair":[1,2],"reason":"pair_cap"},
+      {"phase":"rescue","pair":[1,3],"reason":"pair_cap"}
+    ],
+    "pillars_after": [
+      {"id":0,"links":1,"pairs":1},
+      {"id":1,"links":1,"pairs":1}
+    ]
+  }
+}
