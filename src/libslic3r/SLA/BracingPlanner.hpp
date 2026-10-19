@@ -21,6 +21,7 @@
 #include <vector>
 
 #include <libslic3r/Point.hpp>
+#include <libslic3r/SLA/BridgeClearance.hpp>
 #include <libslic3r/SLA/SpatIndex.hpp>
 #include <libslic3r/SLA/SupportTreeStrategies.hpp>
 
@@ -28,7 +29,8 @@ namespace Slic3r { namespace sla { namespace bracing {
 
 // Fixed by the spec, not configurable: they are physical limits of the print
 // (resin trapped between bars, light bleeding across a gap), not preferences.
-inline constexpr double   SAFETY_CLEARANCE_MM = 0.2;
+// The clearance itself is defined once, in BridgeClearance.hpp.
+inline constexpr double   SAFETY_CLEARANCE_MM = clearance::SAFETY_CLEARANCE;
 inline constexpr double   MIN_SHARED_ANGLE_DEG = 20.;
 // cos(20 deg), written out rather than computed so the C++ engine and the
 // JavaScript port compare against the very same number.
@@ -65,7 +67,7 @@ struct TrussParams
 
 struct PlannerConfig
 {
-    double   safety_clearance    = SAFETY_CLEARANCE_MM;
+    double   safety_clearance    = clearance::SAFETY_CLEARANCE;
     double   cos_min_shared_ang  = COS_MIN_SHARED_ANGLE;
     unsigned pair_cap            = PAIR_CAP;
     double   rescue_height       = RESCUE_HEIGHT_MM;
@@ -228,6 +230,10 @@ double seg_seg_closest2d(const Vec2d &a, const Vec2d &b, const Vec2d &c,
                          const Vec2d &d, double &s, double &t);
 // Ericson, Real-Time Collision Detection, 5.1.9.
 double seg_seg_dist3d(const Vec3d &p1, const Vec3d &q1, const Vec3d &p2, const Vec3d &q2);
+// The same, also giving the parameters of the closest points on [p1,q1] and
+// [p2,q2]. seg_seg_dist3d() is this, so the two never disagree.
+double seg_seg_closest3d(const Vec3d &p1, const Vec3d &q1, const Vec3d &p2,
+                         const Vec3d &q2, double &s, double &t);
 // Height of bar 1 minus height of bar 2 where they come closest in plan view.
 // Diagnostics only: the 3D distance, not this, decides.
 double plan_closest_dz(const Segment3 &bar1, const Segment3 &bar2);

@@ -91,9 +91,15 @@ double seg_seg_dist2d(const Vec2d &a, const Vec2d &b, const Vec2d &c, const Vec2
 
 double seg_seg_dist3d(const Vec3d &p1, const Vec3d &q1, const Vec3d &p2, const Vec3d &q2)
 {
+    double s, t;
+    return seg_seg_closest3d(p1, q1, p2, q2, s, t);
+}
+
+double seg_seg_closest3d(const Vec3d &p1, const Vec3d &q1, const Vec3d &p2,
+                         const Vec3d &q2, double &s, double &t)
+{
     const Vec3d  d1 = q1 - p1, d2 = q2 - p2, r = p1 - p2;
     const double a = d1.dot(d1), e = d2.dot(d2), f = d2.dot(r);
-    double s = 0., t = 0.;
 
     if (a <= EPS_LEN && e <= EPS_LEN) {
         s = t = 0.;

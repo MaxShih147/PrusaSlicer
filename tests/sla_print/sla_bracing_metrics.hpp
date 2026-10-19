@@ -16,6 +16,7 @@
 #include <string>
 #include <vector>
 
+#include "libslic3r/SLA/BridgeClearance.hpp"
 #include "libslic3r/SLA/SupportTreeBuilder.hpp"
 
 namespace Slic3r { namespace sla {
@@ -23,7 +24,7 @@ namespace Slic3r { namespace sla {
 struct BracingMetrics
 {
     // Clearance and angle limits the counts below are judged against.
-    static constexpr double SAFETY_CLEARANCE_MM = 0.2;
+    static constexpr double SAFETY_CLEARANCE_MM = clearance::SAFETY_CLEARANCE;
     static constexpr double MIN_SHARED_ANGLE_DEG = 20.;
     static constexpr double TALL_PILLAR_MM = 15.;
 

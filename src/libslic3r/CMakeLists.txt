@@ -453,6 +453,8 @@ set(SLIC3R_SOURCES
     SLA/DefaultSupportTree.cpp
     SLA/BracingPlanner.hpp
     SLA/BracingPlanner.cpp
+    SLA/BridgeClearance.hpp
+    SLA/BridgeClearance.cpp
     SLA/BranchingTreeSLA.hpp
     SLA/BranchingTreeSLA.cpp
     SLA/ZCorrection.hpp
