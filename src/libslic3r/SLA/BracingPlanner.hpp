@@ -14,6 +14,7 @@
 // port has one unit to mirror (openspec change sla-bracing-planar-topology,
 // design.md decisions 1 to 7).
 
+#include <algorithm>
 #include <cstdint>
 #include <functional>
 #include <unordered_map>
@@ -50,7 +51,8 @@ enum class Reason : uint8_t {
     z_clear_fail,    // every bar that fits is too close to another bar in 3D
     mesh_hit,        // every bar that fits hits the model
     no_room,         // the pillars leave no room for a single bar
-    out_of_range     // try_attach() only: farther than max_link_distance
+    out_of_range,    // try_attach() only: farther than max_link_distance
+    duplicate_pair   // attach() only: the pair is braced already
 };
 
 const char *reason_name(Reason r);
@@ -85,6 +87,9 @@ struct PillarGeom
     double   foot_z = 0.;      // endpt.z
     double   height = 0.;      // the top is foot_z + height, as Pillar::startpoint()
     double   r = 0.;           // r_start
+    // max(r_start, r_end), for the joint radius R of a bar ending on it; 0
+    // (or anything below r) when the pillar is not wider anywhere than r.
+    double   r_joint = 0.;
     unsigned links = 0, pairs = 0;
     bool     frozen = false;
     // false: only in the way of others, never braced itself (a head's own
@@ -92,6 +97,7 @@ struct PillarGeom
     bool     braceable = true;
 
     double top_z() const { return foot_z + height; }
+    double joint_r() const { return std::max(r, r_joint); }
 };
 
 struct Segment3
@@ -104,7 +110,9 @@ struct Segment3
 struct ObstacleBar
 {
     Segment3 seg;
-    long     owner_a = -1, owner_b = -1; // pillars it joins, for the exemption
+    // Pillars it joins. Where it ends on a pillar of the group being judged,
+    // the joint rule of BridgeClearance clips both bars around that pillar.
+    long     owner_a = -1, owner_b = -1;
 };
 
 struct CandidateEdge
@@ -156,7 +164,7 @@ public:
     // Bracing to a prop is not held back by the pair cap.
     Decision try_attach(long main_id, const PillarGeom &prop) const;
     // Brace two known pillars now, if the rules allow it (auxiliary pillars;
-    // no pair cap either).
+    // no pair cap either). A pair braced already is refused, duplicate_pair.
     Decision attach(long a, long b);
     // The candidates of the given (new) pillars only, shortest first.
     std::vector<Decision> run_greedy_for(const std::vector<long> &new_ids);

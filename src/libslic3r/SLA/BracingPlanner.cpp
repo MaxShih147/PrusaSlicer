@@ -22,6 +22,7 @@ const char *reason_name(Reason r)
     case Reason::mesh_hit:        return "mesh_hit";
     case Reason::no_room:         return "no_room";
     case Reason::out_of_range:    return "out_of_range";
+    case Reason::duplicate_pair:  return "duplicate_pair";
     }
     return "?";
 }
@@ -503,11 +504,33 @@ BracingPlanner::Evaluation BracingPlanner::evaluate(const PillarGeom &pa,
     std::vector<Segment3> bars = geom::truss_bars(pa, pb, m_cfg.truss);
     if (bars.empty()) { ev.reason = Reason::no_room; return ev; }
 
-    auto too_near = [c](const Segment3 &bar, const Segment3 &other) {
+    // The pillars of this group - its ends, or a member of their clusters -
+    // that an obstacle bar ends on, each by its own axis and radius. The ends
+    // are taken as handed in: a prop asked about is not added yet.
+    auto joints_of = [&](const ObstacleBar &o) {
+        std::vector<clearance::JointAxis> out;
+        for (long id : {o.owner_a, o.owner_b}) {
+            if (id < 0 || !at_ends(id) || (id == o.owner_b && o.owner_b == o.owner_a)) continue;
+            const PillarGeom &p = id == pa.id ? pa : id == pb.id ? pb : pillar(id);
+            out.push_back({p.xy, p.joint_r()});
+        }
+        return out;
+    };
+
+    // `owners`: the obstacle bar `other` is, if any. Where it ends on a pillar
+    // of this group, the two are clipped around that pillar first
+    // (sla-head-bridge-clearance, the joint radius R).
+    auto too_near = [c, &joints_of](const Segment3 &bar, const Segment3 &other,
+                                    const ObstacleBar *owners) {
         const double lim = bar.r + other.r + c;
         // Plan view first: never misses a contact, and is cheap.
-        return geom::seg_seg_dist2d(plan(bar.a), plan(bar.b), plan(other.a), plan(other.b)) < lim &&
-               geom::seg_seg_dist3d(bar.a, bar.b, other.a, other.b) < lim;
+        if (!(geom::seg_seg_dist2d(plan(bar.a), plan(bar.b), plan(other.a), plan(other.b)) < lim))
+            return false;
+        const std::vector<clearance::JointAxis> joints =
+            owners ? joints_of(*owners) : std::vector<clearance::JointAxis>{};
+        if (joints.empty()) return geom::seg_seg_dist3d(bar.a, bar.b, other.a, other.b) < lim;
+        return clearance::joint_clipped_dist({bar.a, bar.b, bar.r}, {other.a, other.b, other.r},
+                                             joints) < lim;
     };
 
     bool any_z = false;
@@ -517,9 +540,9 @@ BracingPlanner::Evaluation BracingPlanner::evaluate(const PillarGeom &pa,
 
         for (const BoxIndexEl &el : m_bar_idx.query(qb, BoxIndex::qtIntersects)) {
             const ObstacleBar &o = m_obstacles[el.second];
-            // A bar ending on one of this group's pillars meets it there.
-            if (at_ends(o.owner_a) || at_ends(o.owner_b)) continue;
-            if (too_near(bar, o.seg)) { z_fail = true; break; }
+            // A bar ending on one of this group's pillars meets it there, and
+            // only there: elsewhere it keeps its distance like any other.
+            if (too_near(bar, o.seg, &o)) { z_fail = true; break; }
         }
 
         if (!z_fail && in_3d) {
@@ -527,7 +550,7 @@ BracingPlanner::Evaluation BracingPlanner::evaluate(const PillarGeom &pa,
                 const BuiltTruss &t = m_built[el.second];
                 if (at_ends(t.a) || at_ends(t.b)) continue;
                 for (const Segment3 &tb : t.bars)
-                    if (too_near(bar, tb)) { z_fail = true; break; }
+                    if (too_near(bar, tb, nullptr)) { z_fail = true; break; }
                 if (z_fail) break;
             }
         }
@@ -543,6 +566,9 @@ BracingPlanner::Evaluation BracingPlanner::evaluate(const PillarGeom &pa,
 
 int BracingPlanner::accept(const CandidateEdge &e, std::vector<Segment3> &&bars, Mode mode)
 {
+    // One group per pair, whichever way it is reached.
+    assert(!built_pair(e.a, e.b));
+
     PillarGeom &pa = pillar_mut(e.a);
     PillarGeom &pb = pillar_mut(e.b);
 
@@ -644,6 +670,11 @@ Decision BracingPlanner::attach(long a, long b)
     d.edge.b = std::max(a, b);
     const PillarGeom &pa = pillar(d.edge.a), &pb = pillar(d.edge.b);
     d.edge.dist = (pa.xy - pb.xy).norm();
+
+    if (built_pair(a, b)) {
+        d.reason = Reason::duplicate_pair;
+        return d;
+    }
 
     if (d.edge.dist > m_cfg.max_link_distance) {
         d.reason = Reason::out_of_range;

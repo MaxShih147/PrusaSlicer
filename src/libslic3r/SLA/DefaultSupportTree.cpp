@@ -1247,6 +1247,7 @@ void DefaultSupportTree::interconnect_pillars()
         g.foot_z    = p.endpt.z();
         g.height    = p.height;
         g.r         = p.r_start;
+        g.r_joint   = std::max(p.r_start, p.r_end);
         g.links     = p.links;
         g.pairs     = p.pairs;
         g.frozen    = p.frozen;
@@ -1319,6 +1320,26 @@ void DefaultSupportTree::interconnect_pillars()
 
     size_t pillarcount = m_builder.pillarcount();
 
+    // An auxiliary pillar and its bar keep clear of the bars and heads
+    // committed before them, like every new pillar (openspec change
+    // sla-head-bridge-clearance, reverse C). It is not degraded: a place that
+    // is not clear is no place for it, like one it could not be braced from.
+    const clearance::PillarAxisFn axis_of = [this](long id) { return pillar_axis(id); };
+    auto clear_of_tree = [this, &axis_of](const std::vector<clearance::Prim> &prims) {
+        return m_clearance.violations(prims, clearance::SAFETY_CLEARANCE, axis_of).empty();
+    };
+    // Two props of one pillar, both still to be placed: the only pillar they
+    // can share is that one, which is built.
+    auto clear_of_each_other = [&axis_of](const std::vector<clearance::Prim> &x,
+                                          const std::vector<clearance::Prim> &y) {
+        clearance::Contact ct;
+        for (const clearance::Prim &px : x)
+            for (const clearance::Prim &py : y)
+                if (clearance::pair_contact(px, py, clearance::SAFETY_CLEARANCE, axis_of, ct))
+                    return false;
+        return true;
+    };
+
     // Again, go through all pillars, this time in the whole support tree
     // not just the index.
     for(size_t pid = 0; pid < pillarcount; pid++) {
@@ -1357,10 +1378,33 @@ void DefaultSupportTree::interconnect_pillars()
         // A vector of bool for placement feasbility
         std::vector<bool>  canplace(needpillars, false);
         std::vector<Vec3d> spts(needpillars); // vector of starting points
+        // Whether the model leaves room for the bar to each prop (asked once
+        // per place), and what each prop would add, at the angle being tried.
+        std::vector<bool>  with_bar(needpillars, false);
+        std::vector<std::vector<clearance::Prim>> cand_prims(needpillars);
 
         double gnd      = ground_level(m_sm);
         double min_dist = m_sm.cfg.pillar_base_safety_distance_mm +
                           m_sm.cfg.base_radius_mm + EPSILON;
+
+        // A prop standing at s, under the id it will get, and the bar it gets
+        // from this pillar's top when the model leaves room for one.
+        auto prop_prims = [&](const Vec3d &s, long prop_id, bool bar_too) {
+            std::vector<clearance::Prim> out(1);
+            out[0].cap = clearance::pillar_capsule(Vec3d{s.x(), s.y(), gnd}, s.z() - gnd,
+                                                   pillar().r_start, pillar().r_start);
+            out[0].kind     = clearance::PrimKind::pillar;
+            out[0].pillar_a = prop_id;
+            if (bar_too) {
+                clearance::Prim bar;
+                bar.cap      = clearance::bar_capsule(pillarsp, s, pillar().r_start);
+                bar.kind     = clearance::PrimKind::prop_bar;
+                bar.pillar_a = pillar().id;
+                bar.pillar_b = prop_id;
+                out.push_back(bar);
+            }
+            return out;
+        };
 
         while(!found && alpha < 2*PI) {
             for (unsigned n = 0;
@@ -1382,6 +1426,20 @@ void DefaultSupportTree::interconnect_pillars()
                 canplace[n] = std::isinf(hr.distance()) &&
                               std::sqrt(m_sm.emesh.squared_distance(gndsp)) >
                                   min_dist;
+
+                // Nor is a place where the prop or its bar would come too
+                // close to what is built, or to the props before it at this
+                // angle.
+                if (canplace[n]) {
+                    with_bar[n] = distance(pillarsp, s) <
+                                  bridge_mesh_distance(pillarsp, dirv(pillarsp, s),
+                                                       pillar().r_start);
+                    cand_prims[n] = prop_prims(s, long(m_builder.pillarcount() + n),
+                                               with_bar[n]);
+                    canplace[n] = clear_of_tree(cand_prims[n]);
+                    for (unsigned k = 0; canplace[n] && k < n; ++k)
+                        canplace[n] = clear_of_each_other(cand_prims[n], cand_prims[k]);
+                }
 
                 // A place the prop could stand but not be braced from is no
                 // place for it: the next angle may be both.
@@ -1412,9 +1470,12 @@ void DefaultSupportTree::interconnect_pillars()
                 // before it exists: only a prop that can is added. It is asked
                 // under the id it will get, so the pair is the same one
                 // attach() then builds.
+                // So is its clearance: a prop placed before it is in the way
+                // now.
                 PillarGeom prop = geom_of(p, true);
                 prop.id = long(m_builder.pillarcount());
-                if (planner.try_attach(pillar().id, prop).reason != Reason::accepted)
+                if (!clear_of_tree(prop_prims(s, prop.id, with_bar[n])) ||
+                    planner.try_attach(pillar().id, prop).reason != Reason::accepted)
                     continue;
 
                 Pillar &pp = m_builder.pillar(m_builder.add_pillar(p));
@@ -1431,21 +1492,34 @@ void DefaultSupportTree::interconnect_pillars()
 
                 add_pillar_base(pp.id);
 
+                clearance::Prim prop_prim;
+                prop_prim.cap      = clearance::pillar_capsule(pp.endpt, pp.height, pp.r_start,
+                                                               pp.r_end);
+                prop_prim.kind     = clearance::PrimKind::pillar;
+                prop_prim.pillar_a = pp.id;
+                m_clearance.insert(prop_prim);
+
                 m_pillar_index.insert(pp.endpoint(), unsigned(pp.id));
 
                 size_t first_junction = m_builder.junctioncount();
                 m_builder.add_junction(s, pillar().r_start);
                 m_builder.own_junctions_from(first_junction, pp.id);
-                double t = bridge_mesh_distance(pillarsp, dirv(pillarsp, s),
-                                                pillar().r_start);
-                if (distance(pillarsp, s) < t) {
+                if (with_bar[n]) {
                     const Bridge prop_bar =
                         m_builder.add_bridge_between(pp.id, pillarsp, s,
                                                      pillar().r_start, BridgeKind::prop,
                                                      pillar().id);
-                    // Later bracing has to keep clear of it like of any bar.
+                    // Later bracing has to keep clear of it like of any bar,
+                    // and later props too.
                     planner.add_obstacle_bar({{prop_bar.startp, prop_bar.endp, prop_bar.r},
                                               prop_bar.owner_a, prop_bar.owner_b});
+                    clearance::Prim bar;
+                    bar.cap      = clearance::bar_capsule(prop_bar.startp, prop_bar.endp,
+                                                          prop_bar.r);
+                    bar.kind     = clearance::PrimKind::prop_bar;
+                    bar.pillar_a = prop_bar.owner_a;
+                    bar.pillar_b = prop_bar.owner_b;
+                    m_clearance.insert(bar);
                 }
 
                 if (pillar().endpoint().z() > ground_level(m_sm) + pillar().r_start) {

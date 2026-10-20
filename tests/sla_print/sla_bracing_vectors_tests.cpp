@@ -6,7 +6,9 @@
 // is run through the BracingPlanner - greedy, rescue, safety net, no props -
 // with the model never in the way, and its accepted groups (in build order,
 // with the bars each got) and refusals (in the order tried, with the reason)
-// must match "expect" exactly.
+// must match "expect" exactly. A vector with "attach": [[a, b], ...] then
+// calls attach(a, b) for each, in order, as phase "attach" (openspec change
+// sla-head-bridge-clearance: duplicate_pair).
 //
 // MANIFEST.sha256 lists every vector's SHA-256 ("<sha256>  <file>", LF). The
 // files are LF too: a CRLF checkout changes every hash, and is refused with a
@@ -250,6 +252,12 @@ nlohmann::json run_vector(const nlohmann::json &v, const Variant &var = {})
     record(planner.run_greedy(), "greedy");
     record(planner.run_rescue(), "rescue");
     record(planner.run_fallback(), "fallback");
+    if (v.contains("attach")) {
+        std::vector<Decision> ds;
+        for (const nlohmann::json &op : v.at("attach"))
+            ds.push_back(planner.attach(op.at(0).get<long>(), op.at(1).get<long>()));
+        record(ds, "attach");
+    }
 
     nlohmann::json after = nlohmann::json::array();
     for (const nlohmann::json &pj : v.at("pillars")) {

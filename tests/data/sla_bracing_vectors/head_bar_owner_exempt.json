@@ -1,13 +1,13 @@
 {
   "id": "head_bar_owner_exempt",
-  "description": "The same bar at z 11, but it ends on pillar A: exempt.",
+  "description": "A head bar ending on pillar A's axis at z 9 comes 0.58 from a bracing bar, 0.47 from that axis: inside R (1.7), exempt.",
   "cfg": {"safety_clearance":0.2,"min_shared_angle_deg":20,"pair_cap":3,"max_link_distance":10,"min_pillar_distance":1,"rescue_height":15,"bridge_slope_deg":45,"ground_z":0,"base_height":1,"base_radius":2,"connection_mode":"dynamic"},
   "pillars": [
     {"id":0,"endpoint":[0,0,0.0],"height":14,"r":0.5,"links":0,"pairs":0,"frozen":false},
     {"id":1,"endpoint":[6,0,0.0],"height":14,"r":0.5,"links":0,"pairs":0,"frozen":false}
   ],
   "bars": [
-    {"startp":[3,-3,11],"endp":[3,3,11],"r":0.5,"kind":"head","a":-1,"b":0}
+    {"startp":[3,-3,9],"endp":[0,0,9],"r":0.5,"kind":"head","a":-1,"b":0}
   ],
   "expect": {
     "accepted": [

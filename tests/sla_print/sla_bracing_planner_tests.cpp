@@ -9,7 +9,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "libslic3r/SLA/BracingPlanner.hpp"
@@ -610,9 +612,13 @@ TEST_CASE("a bar too near another bar in 3D is left out", "[bracing_planner]")
         REQUIRE(pq_with_bar_over_first(LIMIT - DELTA).run_greedy().front().bars_built == 3);
         REQUIRE(pq_with_bar_over_first(LIMIT + DELTA).run_greedy().front().bars_built == 4);
     }
-    SECTION("a bar ending on one of the pair's pillars is exempt") {
-        REQUIRE(pq_with_bar_over_first(0.3, -1, 0).run_greedy().front().bars_built == 4);
-        REQUIRE(pq_with_bar_over_first(0.3, 1, -1).run_greedy().front().bars_built == 4);
+    SECTION("a bar ending on one of the pair's pillars is not exempt away from it") {
+        // At x = 2 the contact is 2 mm from either axis, outside R = 1.7
+        // (sla-head-bridge-clearance): ending on the pillar exempts nothing
+        // there. Within R, see "a bar is exempt only within R of the pillar
+        // it shares".
+        REQUIRE(pq_with_bar_over_first(0.3, -1, 0).run_greedy().front().bars_built == 3);
+        REQUIRE(pq_with_bar_over_first(0.3, 1, -1).run_greedy().front().bars_built == 3);
         REQUIRE(pq_with_bar_over_first(0.3, 7, 8).run_greedy().front().bars_built == 3);
     }
     SECTION("every bar blocked: z_clear_fail, nothing counted") {
@@ -934,6 +940,165 @@ TEST_CASE("safety net: still not through a pillar", "[bracing_planner]")
     REQUIRE(find(fb, 0, 1)->reason == Reason::obstacle_pillar);
     REQUIRE(find(fb, 0, 2)->reason == Reason::pair_cap);
     REQUIRE(pl.pillar(0).links == 0);
+}
+
+// ─── sla-head-bridge-clearance: the joint rule, one group per pair ───────────
+
+namespace {
+
+// P(0,0)-Q(4,0), 20 mm, as above: the bars meet P's axis at z 20, 12, 12 and
+// 4. `extra` is one more pillar, in P's cluster or not; the bar is judged
+// against the group with the owners given.
+std::vector<Decision> pq_with(const ObstacleBar &bar, const PillarGeom *extra = nullptr)
+{
+    BracingPlanner pl(config(), nullptr);
+    pl.add_pillar(mk(0, 0, 0));
+    pl.add_pillar(mk(1, 4, 0));
+    if (extra) pl.add_pillar(*extra);
+    pl.add_obstacle_bar(bar);
+    return pl.run_greedy();
+}
+
+// The decision on pair (a, b), which must be among `ds`.
+Decision decision(const std::vector<Decision> &ds, long a, long b)
+{
+    const Decision *d = find(ds, a, b);
+    REQUIRE(d != nullptr);
+    return *d;
+}
+
+// A head's own short pillar hugging P: in P's cluster, never braced.
+PillarGeom member(double x, double y, double r)
+{
+    PillarGeom m = mk(2, x, y, 5., r, 10.);
+    m.braceable = false;
+    return m;
+}
+
+} // namespace
+
+TEST_CASE("a bar is exempt only within R of the pillar it shares", "[bracing_planner]")
+{
+    // A head bar ending on P's axis at z 13 comes 0.58 from the bar reaching
+    // P's axis at z 12, 0.67 from that axis: within R = 1.7.
+    const Segment3 head = seg({2, -2, 13}, {0, 0, 13});
+
+    SECTION("ending on P: accepted, every bar") {
+        const Decision d = decision(pq_with({head, -1, 0}), 0, 1);
+        REQUIRE(d.reason == Reason::accepted);
+        REQUIRE(d.bars_built == 4);
+    }
+    SECTION("ending on no pillar of the group: judged whole") {
+        REQUIRE(decision(pq_with({head, -1, -1}), 0, 1).bars_built == 2);
+        REQUIRE(decision(pq_with({head, -1, 7}), 0, 1).bars_built == 2);
+    }
+    SECTION("named as ending on Q: clipped at Q only, where it is not") {
+        REQUIRE(decision(pq_with({head, 1, -1}), 0, 1).bars_built == 2);
+    }
+    SECTION("ending on P, but in the way of every bar away from it: z_clear_fail") {
+        // Bars of the pair 2.8 mm from P's axis, outside R (the spec's
+        // scenario, here with two pillars 8 mm tall: two crossing bars).
+        BracingPlanner pl(config(), nullptr);
+        pl.add_pillar(mk(0, 0, 0, 8.));
+        pl.add_pillar(mk(1, 6, 0, 8.));
+        pl.add_obstacle_bar({seg({3, 0.6, 5}, {0, 0, 5}), -1, 0});
+        const Decision d = pl.run_greedy().front();
+        REQUIRE(d.reason == Reason::z_clear_fail);
+        REQUIRE(d.bars_built == 0);
+    }
+}
+
+TEST_CASE("a bar ending on a cluster member is clipped by that member", "[bracing_planner]")
+{
+    SECTION("by its own radius") {
+        // M, r 1, hugs P 1.5 away. A bar ending on M's axis lies wholly within
+        // R_M = 1 + 0.5 + 0.5 + 0.2 = 2.2 of it: exempt. With P's radius, 0.5,
+        // R would be 1.7 and a bar of the pair would be left out.
+        const PillarGeom m = member(0, -1.5, 1.);
+        const ObstacleBar bar{seg({2, -1, 13}, {0, -1.5, 13}), -1, 2};
+        const Decision d = decision(pq_with(bar, &m), 0, 1);
+        REQUIRE(d.reason == Reason::accepted);
+        REQUIRE(d.bars_built == 4);
+        // The same bar, ending on no pillar.
+        REQUIRE(decision(pq_with({bar.seg, -1, -1}, &m), 0, 1).bars_built == 3);
+    }
+    SECTION("by its own axis") {
+        // M, r 1, hugs P 1.5 behind it. The bar ending on M's axis comes 0.88
+        // from a bar of the pair 2.27 from M's axis, outside R_M = 2.2; P's
+        // axis would have clipped it away.
+        const PillarGeom m = member(-1.5, 0, 1.);
+        const ObstacleBar bar{seg({1, -1, 11}, {-1.5, 0, 11}), -1, 2};
+        const Decision d = decision(pq_with(bar, &m), 0, 1);
+        REQUIRE(d.reason == Reason::accepted);
+        REQUIRE(d.bars_built == 3);
+    }
+    SECTION("by the larger of its radii") {
+        // M, r 0.75, hugs P 1.4 away. With r_joint 1 (r_end above r_start)
+        // R_M is 2.2 and holds the whole bar; by r alone it is 1.95, and a bar
+        // of the pair is left out.
+        PillarGeom m = member(0, -1.4, 0.75);
+        const ObstacleBar bar{seg({2, -0.5, 13}, {0, -1.4, 13}), -1, 2};
+        REQUIRE(decision(pq_with(bar, &m), 0, 1).bars_built == 3);
+        m.r_joint = 1.;
+        REQUIRE(decision(pq_with(bar, &m), 0, 1).bars_built == 4);
+    }
+}
+
+TEST_CASE("attach refuses a pair braced already", "[bracing_planner]")
+{
+    BracingPlanner pl(config(), nullptr);
+    PillarGeom p = mk(0, 0, 0, 30.);
+    p.pairs = 3;
+    pl.add_pillar(p);
+    pl.run_greedy();
+    pl.add_pillar(mk(1, 4, 0, 26.));
+
+    const Decision first = pl.attach(0, 1);
+    REQUIRE(first.reason == Reason::accepted);
+    const size_t groups = pl.built().size();
+
+    for (const auto &[a, b] : std::vector<std::pair<long, long>>{{0, 1}, {1, 0}}) {
+        const Decision again = pl.attach(a, b);
+        REQUIRE(again.reason == Reason::duplicate_pair);
+        REQUIRE(std::string(reason_name(again.reason)) == "duplicate_pair");
+        REQUIRE(again.edge.a == 0);
+        REQUIRE(again.edge.b == 1);
+        REQUIRE(again.bars_built == 0);
+        REQUIRE(again.truss == -1);
+    }
+    REQUIRE(pl.built().size() == groups);
+    REQUIRE(pl.pillar(0).pairs == 4);
+    REQUIRE(pl.pillar(1).pairs == 1);
+}
+
+TEST_CASE("attach refuses a pair the greedy pass braced", "[bracing_planner]")
+{
+    BracingPlanner pl(config(), nullptr);
+    pl.add_pillar(mk(0, 0, 0));
+    pl.add_pillar(mk(1, 4, 0));
+    REQUIRE(pl.run_greedy().front().reason == Reason::accepted);
+    REQUIRE(pl.attach(1, 0).reason == Reason::duplicate_pair);
+    REQUIRE(pl.built().size() == 1);
+}
+
+TEST_CASE("run_greedy_for never offers a pair braced already", "[bracing_planner]")
+{
+    // A prop braced to its pillar by attach(), then run again with a second
+    // prop: neither pair with the pillar comes up twice.
+    BracingPlanner pl(config(), nullptr);
+    pl.add_pillar(mk(0, 0, 0, 30.));
+    pl.run_greedy();
+    pl.add_pillar(mk(1, 4, 0, 26.));
+    pl.add_pillar(mk(2, 0, 4, 26.));
+    REQUIRE(pl.attach(0, 1).reason == Reason::accepted);
+    REQUIRE(pl.attach(0, 2).reason == Reason::accepted);
+    REQUIRE(pl.attach(1, 2).reason == Reason::accepted);
+
+    REQUIRE(pl.run_greedy_for({1, 2}).empty());
+
+    std::set<std::pair<long, long>> pairs;
+    for (const BuiltTruss &t : pl.built()) REQUIRE(pairs.insert({t.a, t.b}).second);
+    REQUIRE(pairs.size() == 3);
 }
 
 // ─── the engine stage (tasks 4.5 and 4.6) ────────────────────────────────────
