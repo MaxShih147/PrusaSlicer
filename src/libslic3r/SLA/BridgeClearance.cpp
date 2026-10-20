@@ -299,6 +299,12 @@ size_t ClearanceIndex::insert(const Prim &p)
     return idx;
 }
 
+void ClearanceIndex::set_carrier(size_t i, long pillar_id)
+{
+    assert(i < m_impl->prims.size() && m_impl->prims[i].kind == PrimKind::pinhead);
+    m_impl->prims[i].pillar_a = pillar_id;
+}
+
 const std::vector<Prim> &ClearanceIndex::prims() const { return m_impl->prims; }
 
 size_t ClearanceIndex::size() const { return m_impl->prims.size(); }

@@ -1,18 +1,27 @@
 // Head routing in two phases (openspec change sla-head-bridge-clearance, task
 // 3.11): routes are planned as builder calls and replayed on commit; steps 3(b)
 // and 4 plan every head at once and commit them one by one in head id order.
+// Task 4.8: which route is committed keeps the clearance where it can, and
+// every contact it cannot keep apart is recorded.
 //
 // The engine cases run the default tree on a small model built here, a two
 // tier table: supports under the top beside the ledge reach the ground (step
 // 3), those over the ledge only reach the model (step 4), and the ledge's own
 // underside reaches the ground again. Heads come in three sizes, mixed, so a
-// thick head often has a thin pillar nearest to it.
+// thick head often has a thin pillar nearest to it. A dense version of it puts
+// the supports closer than the thick heads can keep apart.
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/catch_approx.hpp>
 #include <test_utils.hpp>
 
+#include <iomanip>
+#include <map>
 #include <memory>
 #include <set>
+#include <sstream>
+#include <string>
+#include <utility>
 
 #include <oneapi/tbb/global_control.h>
 
@@ -79,14 +88,54 @@ SupportPoints mixed_points()
     return pts;
 }
 
+// The same sizes, 1.3 mm apart and one size per row along y: two thick heads
+// side by side need 0.75 + 0.75 = 1.5 mm not to touch, so routes have to be
+// kept close. Over the ledge and beside it, clear of the post, and under the
+// ledge.
+SupportPoints dense_points()
+{
+    static const float radii[] = {0.25f, 0.4f, 0.75f};
+
+    SupportPoints pts;
+    auto add = [&pts](float x, float y, float z, int row) {
+        SupportPoint sp;
+        sp.pos                 = Vec3f{x, y, z};
+        sp.head_front_radius   = 0.2f;
+        sp.head_back_radius_mm = radii[row % 3];
+        pts.push_back(sp);
+    };
+
+    for (int i = 0; i < 11; ++i)
+        for (int j = 0; j < 11; ++j) {
+            const float x = -4.f + 1.3f * float(i), y = -6.5f + 1.3f * float(j);
+            if (x > 1.5f && x < 6.5f && y > -2.5f && y < 2.5f)
+                continue; // where the post meets the top
+            add(x, y, 12.f, i);
+        }
+
+    for (int i = 0; i < 9; ++i)
+        for (int j = 0; j < 9; ++j)
+            add(-1.5f + 1.3f * float(i), -5.5f + 1.3f * float(j), 0.f, i);
+
+    return pts;
+}
+
 struct Fixture
 {
     TriangleMesh    mesh = make_two_tier();
     SupportableMesh sm{mesh.its, mixed_points(), SupportTreeConfig{}};
 };
 
-// The default tree, on one thread when `one_thread`, else on as many as there are.
-std::unique_ptr<SupportTreeBuilder> build(const SupportableMesh &sm, bool one_thread)
+struct DenseFixture
+{
+    TriangleMesh    mesh = make_two_tier();
+    SupportableMesh sm{mesh.its, dense_points(), SupportTreeConfig{}};
+};
+
+// The default tree, on one thread when `one_thread`, else on as many as there
+// are; what the clearance rules left goes to `report` when given.
+std::unique_ptr<SupportTreeBuilder> build(const SupportableMesh &sm, bool one_thread,
+                                          ClearanceReport *report = nullptr)
 {
     std::unique_ptr<tbb::global_control> limit;
     if (one_thread)
@@ -94,7 +143,7 @@ std::unique_ptr<SupportTreeBuilder> build(const SupportableMesh &sm, bool one_th
             tbb::global_control::max_allowed_parallelism, 1);
 
     auto builder = std::make_unique<SupportTreeBuilder>();
-    DefaultSupportTree::execute(*builder, sm);
+    DefaultSupportTree::execute(*builder, sm, nullptr, report);
     return builder;
 }
 
@@ -128,6 +177,193 @@ void require_exercised(const SupportTreeBuilder &b)
         head_bars += br.kind == BridgeKind::head;
     REQUIRE(head_bars > 0);
     REQUIRE(b.pillars().size() > 0);
+}
+
+// ─── what the finished tree still has too close (task 4.8) ───────────────────
+//
+// The elements are read back from the builder and tied to the head whose path
+// they are the way analyze_tree.py of the change's evidence does it, not
+// taken from the engine's own index: a head bar by its head's own short pillar
+// or by leaving the junction, a route by chaining from the junction, a pillar
+// by its head, or by the route that comes down on it. Anchors are not read
+// back, as the export leaves them out too.
+
+using clearance::Prim;
+using clearance::PrimKind;
+
+struct Audit
+{
+    size_t contacts   = 0; // A, C and reverse C closer than the clearance
+    size_t native     = 0; // ... of which a pillar against support point spacing
+    size_t recorded   = 0; // ... of which an L1, L2 or centre pillar record names
+    std::vector<std::string> unrecorded;
+};
+
+Audit audit(const SupportTreeBuilder &b, const ClearanceReport &report)
+{
+    using namespace clearance;
+
+    std::map<long, const Head *> heads; // the valid ones, by id
+    for (const Head &h : b.heads())
+        if (h.is_valid())
+            heads[h.id] = &h;
+
+    // Head and route bars, with the head whose path each is.
+    struct Bar { Vec3d s, e; double r; PrimKind kind; long a, b, path; };
+    std::vector<Bar> bars;
+    for (const Bridge &br : b.bridges())
+        if (br.kind == BridgeKind::head || br.kind == BridgeKind::route)
+            bars.push_back({br.startp, br.endp, br.r,
+                            br.kind == BridgeKind::head ? PrimKind::head_bar : PrimKind::route_bar,
+                            br.owner_a, br.owner_b, -1});
+    for (const DiffBridge &br : b.diffbridges())
+        bars.push_back({br.startp, br.endp, std::max(br.r, br.end_r), PrimKind::route_bar,
+                        br.owner_a, br.owner_b, -1});
+
+    for (Bar &bar : bars) {
+        if (bar.kind == PrimKind::head_bar && bar.a >= 0 && b.pillar(bar.a).starts_from_head)
+            bar.path = b.pillar(bar.a).start_junction_id;
+        else
+            for (const auto &[id, h] : heads)
+                if (same(h->junction_point(), bar.s))
+                    bar.path = id;
+    }
+    for (bool more = true; more;) { // routes chain on from where they reached
+        more = false;
+        for (Bar &bar : bars)
+            if (bar.path < 0)
+                for (const Bar &prev : bars)
+                    if (prev.path >= 0 && same(prev.e, bar.s)) {
+                        bar.path = prev.path;
+                        more     = true;
+                        break;
+                    }
+    }
+    for (const Bar &bar : bars)
+        REQUIRE(bar.path >= 0);
+
+    auto pillar_path = [&](const Pillar &p) -> long {
+        if (p.starts_from_head)
+            return p.start_junction_id;
+        for (const auto &[id, h] : heads)
+            if (h->pillar_id == p.id)
+                return id;
+        for (const Bar &bar : bars) // a head bar reaching it is another head's
+            if (bar.kind == PrimKind::route_bar && bar.b == p.id)
+                return bar.path;
+        return -1;
+    };
+
+    std::vector<Prim> prims;
+    std::map<long, Prim> pinheads;
+    for (const auto &[id, h] : heads) {
+        long carrier = h->pillar_id;
+        for (const Bar &bar : bars)
+            if (carrier < 0 && bar.path == id && same(bar.s, h->junction_point()))
+                carrier = bar.b;
+        Prim p;
+        p.cap      = pinhead_capsule(h->pos, h->junction_point(), h->r_back_mm);
+        p.kind     = PrimKind::pinhead;
+        p.head_id  = id;
+        p.pillar_a = carrier;
+        prims.push_back(p);
+        pinheads[id] = p;
+    }
+    for (const Pillar &pl : b.pillars()) {
+        if (pl.props_for >= 0)
+            continue; // auxiliary pillars: the bracing's (task group 5)
+        Prim p;
+        p.cap      = pillar_capsule(pl.endpt, pl.height, pl.r_start, pl.r_end);
+        p.kind     = PrimKind::pillar;
+        p.head_id  = pillar_path(pl);
+        p.pillar_a = pl.id;
+        prims.push_back(p);
+    }
+    for (const Bar &bar : bars) {
+        Prim p;
+        p.cap      = bar_capsule(bar.s, bar.e, bar.r);
+        p.kind     = bar.kind;
+        p.head_id  = bar.path;
+        p.pillar_a = bar.a;
+        p.pillar_b = bar.b;
+        prims.push_back(p);
+    }
+
+    // The pairs of paths the records name: a degraded route and what it
+    // kept too close, a centre pillar's head and what it came too close to.
+    std::set<std::pair<long, long>> named;
+    auto name = [&named](long x, long y) { named.insert({std::min(x, y), std::max(x, y)}); };
+    for (const RouteRecord &rec : report.routes)
+        for (const Contact &ct : rec.contacts)
+            name(rec.head, ct.with_head);
+    for (const CentroidRecord &rec : report.centroid)
+        name(pillar_path(b.pillar(rec.pillar)), rec.contact.with_head);
+
+    auto axis_of = [&b](long id) {
+        const Pillar &p = b.pillar(id);
+        return JointAxis{Vec2d{p.endpt.x(), p.endpt.y()}, std::max(p.r_start, p.r_end)};
+    };
+
+    Audit out;
+    for (size_t i = 0; i < prims.size(); ++i)
+        for (size_t j = i + 1; j < prims.size(); ++j) {
+            const Prim &x = prims[i], &y = prims[j];
+            Contact     ct;
+            if (!pair_contact(x, y, SAFETY_CLEARANCE, axis_of, ct))
+                continue;
+            ++out.contacts;
+
+            // A pillar against a head natively that close to the pillar's
+            // own head: support point spacing, out of scope.
+            const Prim *pl = x.kind == PrimKind::pillar ? &x : y.kind == PrimKind::pillar ? &y : nullptr;
+            const Prim *ph = x.kind == PrimKind::pinhead ? &x : y.kind == PrimKind::pinhead ? &y : nullptr;
+            if (pl && ph && pinheads.count(pl->head_id)) {
+                const Prim &grower = pinheads[pl->head_id];
+                if (capsule_dist(grower.cap, ph->cap) <
+                    grower.cap.r + ph->cap.r + SAFETY_CLEARANCE) {
+                    ++out.native;
+                    continue;
+                }
+            }
+
+            if (named.count({std::min(x.head_id, y.head_id), std::max(x.head_id, y.head_id)})) {
+                ++out.recorded;
+                continue;
+            }
+
+            std::ostringstream os;
+            os << std::fixed << std::setprecision(3) << kind_name(x.kind) << " of head "
+               << x.head_id << " x " << kind_name(y.kind) << " of head " << y.head_id
+               << ": dist " << ct.dist << " < " << ct.required << " at (" << ct.p_old.x()
+               << "," << ct.p_old.y() << "," << ct.p_old.z() << ")";
+            out.unrecorded.push_back(os.str());
+        }
+
+    return out;
+}
+
+// The records, as text, for comparing two runs.
+std::string report_text(const ClearanceReport &rep)
+{
+    std::ostringstream os;
+    os << std::setprecision(17) << rep.l1 << ' ' << rep.l2 << ' ' << rep.none << ' '
+       << rep.native << '\n';
+    auto contact = [&os](const clearance::Contact &ct) {
+        os << ' ' << ct.p_new.transpose() << ' ' << ct.dist << ' ' << ct.required << ' '
+           << int(ct.with) << ' ' << ct.with_head << ' ' << ct.with_pillar;
+    };
+    for (const RouteRecord &r : rep.routes) {
+        os << r.head << ' ' << route_kind_name(r.kind) << ' ' << route_level_name(r.level);
+        for (const clearance::Contact &ct : r.contacts)
+            contact(ct);
+        os << '\n';
+    }
+    for (const CentroidRecord &r : rep.centroid) {
+        os << "centre " << r.pillar;
+        contact(r.contact);
+        os << '\n';
+    }
+    return os.str();
 }
 
 } // namespace
@@ -216,21 +452,36 @@ TEST_CASE("a route with no way down makes nothing", "[head_routing]")
 
 TEST_CASE("head routing does not depend on the thread count", "[head_routing]")
 {
-    Fixture f;
+    // The tree and what the clearance rules recorded, which the dense
+    // fixture has plenty of.
+    auto same_every_run = [](const SupportableMesh &sm) {
+        ClearanceReport one_report;
+        const auto      one = build(sm, true, &one_report);
+        require_exercised(*one);
+        const BuilderDigests ref  = builder_digests(*one);
+        const std::string    recs = report_text(one_report);
 
-    const auto one = build(f.sm, true);
-    require_exercised(*one);
-    const BuilderDigests ref = builder_digests(*one);
+        for (int run = 0; run < 3; ++run) {
+            CAPTURE(run);
+            ClearanceReport      report;
+            const BuilderDigests d = builder_digests(*build(sm, false, &report));
+            REQUIRE(d.heads == ref.heads);
+            REQUIRE(d.pillars == ref.pillars);
+            REQUIRE(d.bridges == ref.bridges);
+            REQUIRE(d.diffbridges == ref.diffbridges);
+            REQUIRE(d.crossbridges == ref.crossbridges);
+            REQUIRE(d.mesh == ref.mesh);
+            REQUIRE(report_text(report) == recs);
+        }
+    };
 
-    for (int run = 0; run < 3; ++run) {
-        CAPTURE(run);
-        const BuilderDigests d = builder_digests(*build(f.sm, false));
-        REQUIRE(d.heads == ref.heads);
-        REQUIRE(d.pillars == ref.pillars);
-        REQUIRE(d.bridges == ref.bridges);
-        REQUIRE(d.diffbridges == ref.diffbridges);
-        REQUIRE(d.crossbridges == ref.crossbridges);
-        REQUIRE(d.mesh == ref.mesh);
+    SECTION("mixed sizes") {
+        Fixture f;
+        same_every_run(f.sm);
+    }
+    SECTION("dense") {
+        DenseFixture f;
+        same_every_run(f.sm);
     }
 }
 
@@ -301,4 +552,130 @@ TEST_CASE("no head bridges to a pillar thinner than itself", "[head_routing]")
         REQUIRE(h != nullptr);
         REQUIRE(b->pillar(br.owner_b).r_start >= h->r_back_mm);
     }
+}
+
+TEST_CASE("every contact left too close is recorded", "[head_routing]")
+{
+    // A, C and reverse C in the finished tree, judged at L0's clearance: each
+    // one is a route kept at L1 or L2, or a centre pillar recorded, or a
+    // pillar against support points natively that close.
+    auto all_recorded = [](const SupportableMesh &sm) {
+        ClearanceReport report;
+        const auto      b = build(sm, false, &report);
+        require_exercised(*b);
+
+        const Audit a = audit(*b, report);
+        CAPTURE(a.contacts, a.native, a.recorded, report.l1, report.l2, report.none,
+                report.centroid.size());
+        for (size_t i = 0; i < std::min<size_t>(a.unrecorded.size(), 10); ++i)
+            UNSCOPED_INFO(a.unrecorded[i]);
+        REQUIRE(a.unrecorded.empty());
+
+        // Each record is what its level says.
+        for (const RouteRecord &rec : report.routes) {
+            CAPTURE(rec.head, route_level_name(rec.level));
+            REQUIRE(rec.level != RouteLevel::L0);
+            REQUIRE_FALSE(rec.contacts.empty());
+            for (const clearance::Contact &ct : rec.contacts) {
+                REQUIRE(ct.dist < ct.required);
+                if (rec.level == RouteLevel::L1)
+                    REQUIRE(ct.dist >= ct.required - clearance::SAFETY_CLEARANCE);
+            }
+        }
+        size_t l1 = 0, l2 = 0;
+        for (const RouteRecord &rec : report.routes)
+            (rec.level == RouteLevel::L1 ? l1 : l2) += 1;
+        REQUIRE(l1 == report.l1);
+        REQUIRE(l2 == report.l2);
+
+        return std::make_pair(a, report);
+    };
+
+    SECTION("mixed sizes") {
+        Fixture f;
+        all_recorded(f.sm);
+    }
+
+    SECTION("dense: routes are kept close, and say so") {
+        DenseFixture f;
+        const auto [a, report] = all_recorded(f.sm);
+        REQUIRE(a.recorded > 0);
+        REQUIRE(report.l1 + report.l2 > 0);
+    }
+}
+
+namespace {
+
+// A top whose middle is 3 mm higher than its sides, 2.2 mm wide: one head
+// under the middle, two under the sides 1.15 mm out from it. Their heads point
+// straight down, as given, so nothing searches for another angle.
+struct SteppedFixture
+{
+    TriangleMesh mesh = [] {
+        TriangleMesh left = make_cube(4.9, 6., 6.);
+        left.translate(-6.f, -3.f, 17.f);
+        TriangleMesh right = make_cube(4.9, 6., 6.);
+        right.translate(1.1f, -3.f, 17.f);
+        TriangleMesh middle = make_cube(2.2, 6., 3.);
+        middle.translate(-1.1f, -3.f, 20.f);
+        left.merge(right);
+        left.merge(middle);
+        return left;
+    }();
+
+    static SupportPoints points()
+    {
+        SupportPoints pts;
+        for (const Vec3f &pos : {Vec3f{0.f, 0.f, 20.f}, Vec3f{1.15f, 0.f, 17.f},
+                                 Vec3f{-1.15f, 0.f, 17.f}}) {
+            SupportPoint sp;
+            sp.pos                 = pos;
+            sp.head_front_radius   = 0.2f;
+            sp.head_back_radius_mm = 0.5f;
+            sp.head_dir            = Vec3f{0.f, 0.f, -1.f};
+            pts.push_back(sp);
+        }
+        return pts;
+    }
+
+    SupportableMesh sm{mesh.its, points(), SupportTreeConfig{}};
+};
+
+} // namespace
+
+TEST_CASE("a centre pillar close to a head stays, recorded", "[head_routing]")
+{
+    // The middle head is the cluster's centre; its pillar runs down 1.15 mm
+    // from the axes of the side heads, short of 0.5 + 0.5 + 0.2. The heads
+    // themselves are 1.97 mm apart, so it is not support point spacing.
+    SteppedFixture  f;
+    ClearanceReport report;
+    const auto      b = build(f.sm, false, &report);
+
+    const Head &centre = b->head(0u);
+    REQUIRE(centre.is_valid());
+    REQUIRE(centre.pillar_id >= 0);
+
+    // Where it would be with no clearance rule at all: straight down from
+    // the head, grown from it.
+    const Pillar &p = b->pillar(centre.pillar_id);
+    REQUIRE(p.starts_from_head);
+    REQUIRE(p.start_junction_id == 0);
+    REQUIRE(p.endpt.x() == centre.junction_point().x());
+    REQUIRE(p.endpt.y() == centre.junction_point().y());
+    REQUIRE(p.startpoint().z() == Catch::Approx(centre.junction_point().z()));
+
+    std::set<long> touched;
+    for (const CentroidRecord &rec : report.centroid) {
+        REQUIRE(rec.pillar == p.id);
+        REQUIRE(rec.contact.with == clearance::PrimKind::pinhead);
+        REQUIRE(rec.contact.dist == Catch::Approx(1.15).margin(1e-6));
+        REQUIRE(rec.contact.required == Catch::Approx(1.2));
+        touched.insert(rec.contact.with_head);
+    }
+    REQUIRE(touched == std::set<long>{1, 2});
+    REQUIRE(report.native == 0);
+
+    // Recorded, so nothing in the tree is left unrecorded.
+    REQUIRE(audit(*b, report).unrecorded.empty());
 }

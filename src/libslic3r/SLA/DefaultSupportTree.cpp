@@ -60,7 +60,8 @@ DefaultSupportTree::DefaultSupportTree(SupportTreeBuilder &   builder,
 
 bool DefaultSupportTree::execute(SupportTreeBuilder    &builder,
                                 const SupportableMesh &sm,
-                                PriorAttachments      *out_attached)
+                                PriorAttachments      *out_attached,
+                                ClearanceReport       *out_clearance)
 {
     if(sm.pts.empty()) return false;
 
@@ -180,12 +181,16 @@ bool DefaultSupportTree::execute(SupportTreeBuilder    &builder,
     // counter, so one line covers the whole tree. Skipped on abort: the run was
     // cancelled, the numbers are partial, and the user is not waiting on a
     // diagnostic for work they just stopped.
-    if (pc != ABORT)
+    if (pc != ABORT) {
         report_penetration_failsafes(alg.m_penetration_stats,
                                      "Default support tree");
+        report_route_clearance(alg.m_clearance_report, "Default support tree");
+    }
 
     if (out_attached)
         *out_attached = alg.prior_attachments();
+    if (out_clearance)
+        *out_clearance = std::move(alg.m_clearance_report);
 
     return pc == ABORT;
 }
@@ -248,8 +253,7 @@ bool DefaultSupportTree::can_bridge_to(const SupportTreeBuilder &builder,
                                        const Pillar             &pillar,
                                        const Head               &head) const
 {
-    return builder.bridgecount(pillar) < m_sm.cfg.max_bridges_on_pillar &&
-           pillar.r_start >= head.r_back_mm;
+    return sla::can_bridge_to(builder, pillar, head, m_sm.cfg.max_bridges_on_pillar);
 }
 
 std::optional<RoutePlan> DefaultSupportTree::plan_to_pillar(const SupportTreeBuilder &builder,
@@ -372,15 +376,54 @@ std::optional<RoutePlan> DefaultSupportTree::plan_ground_pillar(const Junction &
     return pillar_route(RoutePlan::Kind::own_pillar, std::move(*planned));
 }
 
-long DefaultSupportTree::create_ground_pillar(const Junction &hjp,
-                                              const Vec3d &sourcedir,
-                                              long         head_id)
+long DefaultSupportTree::create_center_pillar(const Head &head)
 {
-    const std::optional<RoutePlan> plan = plan_ground_pillar(hjp, sourcedir, head_id);
-    return plan ? commit(*plan) : SupportTreeNode::ID_UNSET;
+    std::optional<RoutePlan> plan = plan_ground_pillar(head.junction(), head.dir, head.id);
+    if (!plan)
+        return SupportTreeNode::ID_UNSET;
+
+    // Judged before it goes in, against the heads and what the centres before
+    // it made; where it is built does not depend on the outcome.
+    plan->prims = route_prims(plan->recipe, head);
+    const auto pinhead = m_pinhead_prims.find(head.id);
+    assert(pinhead != m_pinhead_prims.end());
+    const std::vector<clearance::Contact> contacts =
+        centroid_contacts(plan->prims, m_clearance.prims()[pinhead->second], m_clearance,
+                          [this](long id) { return pillar_axis(id); },
+                          m_clearance_report.native);
+
+    const long pillar_id = commit(*plan, head.id);
+
+    for (const clearance::Contact &ct : contacts) {
+        m_clearance_report.centroid.push_back({pillar_id, ct});
+        log_centroid_record(m_clearance_report.centroid.back());
+    }
+
+    return pillar_id;
 }
 
-long DefaultSupportTree::commit(const RoutePlan &plan)
+RouteList DefaultSupportTree::route_list(const HeadRoutes &routes)
+{
+    RouteList list;
+    list.reserve(routes.to_pillar.size() + routes.fallback.size());
+    for (const RoutePlan &p : routes.to_pillar)
+        list.push_back(&p);
+    if (routes.fallback_shown)
+        for (const RoutePlan &p : routes.fallback)
+            list.push_back(&p);
+    return list;
+}
+
+clearance::JointAxis DefaultSupportTree::pillar_axis(long pillar_id) const
+{
+    // Only pillars that are built: the ids of a plan not yet committed are
+    // its own, and nothing committed shares them.
+    assert(!BuildRecipe::is_local(pillar_id));
+    const Pillar &p = m_builder.pillar(pillar_id);
+    return {Vec2d{p.endpt.x(), p.endpt.y()}, std::max(p.r_start, p.r_end)};
+}
+
+long DefaultSupportTree::commit(const RoutePlan &plan, long head_id)
 {
     const RecipeIds ids = replay(m_builder, plan.recipe);
 
@@ -390,6 +433,21 @@ long DefaultSupportTree::commit(const RoutePlan &plan)
         pillar_id = ids.pillar(plan.new_pillar);
         m_pillar_index.insert(m_builder.pillar(pillar_id).endpt, unsigned(pillar_id));
     }
+
+    // What the route made goes into the clearance index, under the builder's
+    // ids, and the head learns which pillar carries it: the one it sits on,
+    // else the one its bar reaches (as the support-tree export names it).
+    std::vector<clearance::Prim> prims = plan.prims;
+    to_builder_ids(prims, ids);
+    for (const clearance::Prim &p : prims)
+        m_clearance.insert(p);
+
+    const long sits_on = std::as_const(m_builder).head(unsigned(head_id)).pillar_id;
+    const long carrier = sits_on >= 0 ? sits_on :
+                         plan.kind == RoutePlan::Kind::to_pillar ? plan.target_pillar :
+                                                                   pillar_id;
+    if (const auto it = m_pinhead_prims.find(head_id); it != m_pinhead_prims.end())
+        m_clearance.set_carrier(it->second, carrier);
 
     if (plan.kind == RoutePlan::Kind::to_pillar)
         note_prior_attachment(plan.target_pillar);
@@ -681,6 +739,18 @@ void DefaultSupportTree::classify()
 
     m_pillar_clusters = cluster(ground_head_indices, pointfn, predicate,
                                 m_sm.cfg.max_bridges_on_pillar);
+
+    // Every head that is left is in the way of every route from here on,
+    // routed or not. Which pillar carries it is named once it is routed.
+    for (const Head &head : m_builder.heads()) {
+        if (!head.is_valid())
+            continue;
+        clearance::Prim p;
+        p.cap     = clearance::pinhead_capsule(head.pos, head.junction_point(), head.r_back_mm);
+        p.kind    = clearance::PrimKind::pinhead;
+        p.head_id = head.id;
+        m_pinhead_prims[head.id] = m_clearance.insert(p);
+    }
 }
 
 void DefaultSupportTree::routing_to_ground()
@@ -714,12 +784,12 @@ void DefaultSupportTree::routing_to_ground()
         assert(lcid >= 0);
         unsigned hid = cl[size_t(lcid)]; // Head ID
 
-        Head &h = m_builder.head(hid);
+        const Head &h = std::as_const(m_builder).head(hid);
 
         // The centre pillar is kept as it is made. It used to be looked up
         // later as the pillar nearest the centre head, which is some other
         // pillar whenever this one could not be made.
-        const long center = create_ground_pillar(h.junction(), h.dir, h.id);
+        const long center = create_center_pillar(h);
         if (center < 0) {
             BOOST_LOG_TRIVIAL(warning)
                 << "Pillar cannot be created for support point id: " << hid;
@@ -885,8 +955,7 @@ void DefaultSupportTree::plan_near_pillars(const RouteView        &view,
     // turns the others down on the same test. A pillar's foot is under its top.
     const double reach = bridge_reach(head);
 
-    struct Near { double d2; long id; };
-    std::vector<Near> near;
+    std::vector<NearPillar> near;
     near.reserve(view.feet.size());
     const size_t pillarcount = view.builder.pillarcount();
     for (const PointIndexEl &el : view.feet) {
@@ -896,14 +965,9 @@ void DefaultSupportTree::plan_near_pillars(const RouteView        &view,
             near.push_back({(el.first - qp).squaredNorm(), id});
     }
 
-    // A total order: the same pillars come in the same order, however the
-    // index lists them.
-    auto nearer = [](const Near &a, const Near &b) {
-        return a.d2 < b.d2 || (a.d2 == b.d2 && a.id < b.id);
-    };
-
-    // Sorted a growing slice at a time: most heads find their pillars among
-    // the first few.
+    // Sorted by nearer(), a total order: the same pillars come in the same
+    // order, however the index lists them. A growing slice at a time: most
+    // heads find their pillars among the first few.
     size_t next = 0;
     for (size_t slice = 16; out.size() < limit && next < near.size(); slice *= 2) {
         const size_t upto = std::min(near.size(), next + slice);
@@ -929,15 +993,26 @@ void DefaultSupportTree::plan_routes(RouteStep        step,
         if (std::optional<RoutePlan> p = plan_to_pillar(view.builder, head, center))
             routes.to_pillar.emplace_back(std::move(*p));
     plan_near_pillars(view, head, center, ROUTE_PILLAR_CANDIDATES, routes.to_pillar);
+    for (RoutePlan &p : routes.to_pillar)
+        p.prims = route_prims(p.recipe, head);
 
     // The fallbacks cost the most, and the old flow only got to them with no
     // pillar in reach.
-    if (routes.fallback_planned || (!recompute && !routes.to_pillar.empty()))
+    if (!recompute && !routes.to_pillar.empty())
         return;
+    routes.fallback_shown = true;
+    if (!routes.fallback_planned)
+        plan_fallbacks(step, head, routes);
+}
+
+void DefaultSupportTree::plan_fallbacks(RouteStep step, const Head &head, HeadRoutes &routes) const
+{
     routes.fallback_planned = true;
 
-    auto add = [&routes](std::optional<RoutePlan> &&p) {
-        if (p) routes.fallback.emplace_back(std::move(*p));
+    auto add = [&routes, &head](std::optional<RoutePlan> &&p) {
+        if (!p) return;
+        p->prims = route_prims(p->recipe, head);
+        routes.fallback.emplace_back(std::move(*p));
     };
 
     if (step == RouteStep::ground) {
@@ -963,55 +1038,79 @@ DefaultSupportTree::RouteCounts DefaultSupportTree::route_heads(RouteStep       
     // a thread waiting for the parallel mesh tests inside a detour search then
     // takes no other head's planning meanwhile, whose own search would draw
     // from the same per thread random state (see sla::plan_ground_detour()).
+    //
+    // A head whose every pillar candidate is too close already to what is
+    // built when the step starts is too close at commit too, but for the
+    // rare joint a head's carrier clips away later: what is built only grows.
+    // It is bound to plan again on one thread, so its fallbacks -
+    // the dear part, a detour search among them - are planned here, in
+    // parallel. They stay hidden until that recompute shows them, so which
+    // route is chosen does not change.
+    const clearance::PillarAxisFn axis_of = [this](long id) { return pillar_axis(id); };
     std::vector<HeadRoutes> routes(jobs.size());
     {
         const RouteView view = route_view();
+        auto too_close = [this, &axis_of](const RoutePlan &p) {
+            return !m_clearance.violations(p.prims, clearance::SAFETY_CLEARANCE, axis_of).empty();
+        };
         execution::for_each(
             suptree_ex_policy, size_t(0), jobs.size(),
-            [this, step, &view, &jobs, &routes](size_t i) {
+            [this, step, &view, &jobs, &routes, &too_close](size_t i) {
                 m_thr();
                 tbb::this_task_arena::isolate([&] {
-                    plan_routes(step, view, view.builder.head(jobs[i].head), jobs[i].center,
-                                false, routes[i]);
+                    const Head &head = view.builder.head(jobs[i].head);
+                    HeadRoutes &r    = routes[i];
+                    plan_routes(step, view, head, jobs[i].center, false, r);
+                    if (!r.fallback_planned &&
+                        std::all_of(r.to_pillar.begin(), r.to_pillar.end(), too_close))
+                        plan_fallbacks(step, head, r);
                 });
             },
             execution::max_concurrency(suptree_ex_policy));
     }
 
-    // The first candidate the rules allow on the builder as it is now.
-    auto first_allowed = [this](const HeadRoutes &r, const Head &head) -> const RoutePlan * {
-        for (const std::vector<RoutePlan> *list : {&r.to_pillar, &r.fallback})
-            for (const RoutePlan &p : *list)
-                if (p.kind != RoutePlan::Kind::to_pillar ||
-                    can_bridge_to(m_builder, m_builder.pillar(p.target_pillar), head))
-                    return &p;
-        return nullptr;
-    };
-
     // Phase two: one head after the other, smallest id first, each committing
-    // one route whole. A head with no candidate left plans once more, against
-    // what is there now - the pillars the heads before it made included - and
-    // with the fallbacks phase one did not get to.
+    // one route whole, the one select_route() picks on what is built now. A
+    // head none of whose candidates keeps the clearance plans once more,
+    // against what is there now - the pillars the heads before it made
+    // included - and with its fallbacks shown, planned now unless phase one
+    // planned them already.
     RouteCounts counts;
     for (size_t i = 0; i < jobs.size(); ++i) {
         m_thr();
 
         const Head &head = std::as_const(m_builder).head(jobs[i].head);
 
-        const RoutePlan *chosen = first_allowed(routes[i], head);
-        if (!chosen) {
-            ++counts.recomputed;
+        // The rules no level relaxes (design.md decision 8). The bridge cap
+        // is asked here, on the counts the routes before this one left.
+        auto hard_ok = [this, &head](const RoutePlan &p) {
+            return hard_rules_ok(m_builder, p, head, m_sm.cfg.max_bridges_on_pillar);
+        };
+        auto recompute = [&, i] {
             plan_routes(step, route_view(), head, jobs[i].center, true, routes[i]);
-            chosen = first_allowed(routes[i], head);
-        }
+            return route_list(routes[i]);
+        };
 
-        if (chosen) {
-            commit(*chosen);
+        const RouteChoice choice = select_route(route_list(routes[i]), m_clearance, axis_of,
+                                                hard_ok, recompute);
+        counts.recomputed += choice.recomputed;
+
+        if (choice.plan) {
+            commit(*choice.plan, head.id);
             ++counts.routed;
+
+            if (choice.level != RouteLevel::L0) {
+                ++(choice.level == RouteLevel::L1 ? m_clearance_report.l1 :
+                                                    m_clearance_report.l2);
+                m_clearance_report.routes.push_back(
+                    {head.id, choice.plan->kind, choice.level, choice.contacts});
+                log_route_record(m_clearance_report.routes.back());
+            }
             continue;
         }
 
         ++counts.unrouted;
+        ++m_clearance_report.none;
 
         // A ground facing head with no route is left as it was, a model
         // facing one is dropped: both as they always were.
@@ -1055,6 +1154,14 @@ void DefaultSupportTree::adopt_prior_pillars()
                                                pp.r_start, pp.r_end,
                                                pp.links, pp.bridges, pp.pairs);
         m_pillar_index.insert(m_builder.pillar(pid).endpoint(), unsigned(pid));
+
+        // Only the pillar: the bars it came with are not handed in.
+        clearance::Prim p;
+        p.cap      = clearance::pillar_capsule(pp.endpoint, pp.height, pp.r_start, pp.r_end);
+        p.kind     = clearance::PrimKind::pillar;
+        p.pillar_a = pid;
+        m_clearance.insert(p);
+
         m_prior_pillar_ids.push_back(pid);
         m_prior_caller_ids[pid] = pp.id;
     }

@@ -159,6 +159,10 @@ public:
 
     // Returns the element's index in prims().
     size_t insert(const Prim &p);
+    // Names the pillar carrying the pinhead at prims()[i]. Pinheads go in when
+    // the heads are made; which pillar carries one is known once its head is
+    // routed. Only the id changes, never the capsule.
+    void set_carrier(size_t i, long pillar_id);
     const std::vector<Prim> &prims() const;
     size_t size() const;
 

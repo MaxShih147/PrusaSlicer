@@ -120,6 +120,16 @@ class DefaultSupportTree {
     // counter inside is atomic.
     PenetrationClampStats m_penetration_stats;
 
+    // What is built, for the clearance rules of the routes (design.md decision
+    // 3): the prior pillars, the heads once classified, then every route as it
+    // is committed. Insert only, and from one thread: routes are committed in
+    // phase two.
+    clearance::ClearanceIndex m_clearance;
+    // Where each head's pinhead is in m_clearance, by head id.
+    std::map<long, size_t> m_pinhead_prims;
+    // The routes and centre pillars the clearance rules could not keep apart.
+    ClearanceReport m_clearance_report;
+
     inline AABBMesh::hit_result ray_mesh_intersect(const Vec3d& s,
                                                       const Vec3d& dir)
     {
@@ -205,9 +215,7 @@ class DefaultSupportTree {
     };
     RouteView route_view();
 
-    // The rules no route may break (design.md decision 8), on the pillar's
-    // state in `builder`: room for one more bridge, and no head on a pillar
-    // thinner than its back. The one place the bridge cap is compared.
+    // sla::can_bridge_to() with this tree's bridge cap.
     bool can_bridge_to(const SupportTreeBuilder &builder, const Pillar &pillar,
                        const Head &head) const;
 
@@ -250,22 +258,35 @@ class DefaultSupportTree {
 
     // A head's candidates in the order they are tried: to_pillar, then the
     // fallbacks (step 3(b): own pillar; step 4: ground route, model anchor).
+    // Fallbacks may be planned before they are shown (route_heads()); only
+    // shown ones are candidates.
     struct HeadRoutes
     {
         std::vector<RoutePlan> to_pillar, fallback;
-        bool fallback_planned = false;
+        bool fallback_planned = false, fallback_shown = false;
     };
 
     // Plans the head's candidates against the view. The pillar of the head's
-    // cluster, `center`, comes first when there is one. Fallbacks are planned
+    // cluster, `center`, comes first when there is one. Fallbacks are shown
     // only if no pillar is in reach, or on a recompute; they read the mesh
     // alone, so once planned they stay valid and are kept.
     void plan_routes(RouteStep step, const RouteView &view, const Head &head, long center,
                      bool recompute, HeadRoutes &routes) const;
 
-    // Makes the plan in the builder and indexes its new pillar. Returns that
+    // Plans the head's fallbacks into `routes`, not shown yet.
+    void plan_fallbacks(RouteStep step, const Head &head, HeadRoutes &routes) const;
+
+    // A head's candidates as select_route() takes them, in the order they are
+    // tried.
+    static RouteList route_list(const HeadRoutes &routes);
+
+    // A pillar's axis for the joint rule of the clearance index.
+    clearance::JointAxis pillar_axis(long pillar_id) const;
+
+    // Makes the plan of `head_id`'s route in the builder, indexes its new
+    // pillar, and puts what it made into the clearance index. Returns that
     // pillar's builder id, or ID_UNSET when the plan adds none to the index.
-    long commit(const RoutePlan &plan);
+    long commit(const RoutePlan &plan, long head_id);
 
     struct RouteJob { unsigned head; long center; };
     struct RouteCounts { size_t routed = 0, recomputed = 0, unrouted = 0; };
@@ -273,16 +294,15 @@ class DefaultSupportTree {
     // The two phases of a routing step, for the heads of `jobs`.
     RouteCounts route_heads(RouteStep step, std::vector<RouteJob> jobs);
 
-    // Plans and commits a ground pillar at once, for the cluster centres of
-    // step 3(a). Returns the pillar's id, or ID_UNSET.
-    long create_ground_pillar(const Junction &jp,
-                              const Vec3d &sourcedir,
-                              long         head_id = SupportTreeNode::ID_UNSET);
+    // Plans and commits the ground pillar of a cluster's centre head, step
+    // 3(a). It is built where it is planned, whatever is near it; what it comes
+    // too close to is recorded. Returns the pillar's id, or ID_UNSET.
+    long create_center_pillar(const Head &head);
 
     // Stays on the global base radius on purpose: pid here is a *pillar* id,
     // not a head id, and the only caller is interconnect_pillars(), which adds
     // auxiliary props that grew from no support point. Per-point base radii
-    // are applied in create_ground_pillar(), where the originating point is
+    // are applied in plan_ground_pillar(), where the originating point is
     // known.
     void add_pillar_base(long pid)
     {
@@ -351,8 +371,11 @@ public:
 
     /// @param out_attached when given, receives the prior pillars this run
     ///        braced to, with the link counts they now carry.
+    /// @param out_clearance when given, receives the routes and centre
+    ///        pillars the clearance rules could not keep apart.
     static bool execute(SupportTreeBuilder & builder, const SupportableMesh &sm,
-                        PriorAttachments *out_attached = nullptr);
+                        PriorAttachments *out_attached = nullptr,
+                        ClearanceReport  *out_clearance = nullptr);
 };
 
 inline void create_default_tree(SupportTreeBuilder &builder, const SupportableMesh &sm)
