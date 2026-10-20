@@ -21,6 +21,7 @@
 #include "libslic3r/Execution/Execution.hpp"
 #include "libslic3r/SLA/BracingPlanner.hpp"
 #include "libslic3r/SLA/Pad.hpp"
+#include "libslic3r/SLA/RoutePlan.hpp"
 #include "libslic3r/SLA/SupportTree.hpp"
 #include "libslic3r/SLA/SupportTreeBuilder.hpp"
 #include "libslic3r/Point.hpp"
@@ -114,9 +115,6 @@ class DefaultSupportTree {
     // A spatial index to easily find strong pillars to connect to.
     PillarIndex m_pillar_index;
 
-    // When bridging heads to pillars... TODO: find a cleaner solution
-    execution::BlockingMutex<ExecutionTBB> m_bridge_mutex;
-
     // How many thin wall penetration measurements found no exit surface. Filled
     // from add_pinheads(), which runs its filter across worker threads, so the
     // counter inside is atomic.
@@ -170,12 +168,12 @@ class DefaultSupportTree {
         const Vec3d& s,
         const Vec3d& dir,
         double r,
-        double safety_d);
+        double safety_d) const;
 
     AABBMesh::hit_result bridge_mesh_intersect(
         const Vec3d& s,
         const Vec3d& dir,
-        double r)
+        double r) const
     {
         return bridge_mesh_intersect(s, dir, r,
                                      r * m_sm.cfg.safety_distance_mm /
@@ -183,7 +181,7 @@ class DefaultSupportTree {
     }
 
     template<class...Args>
-    inline double bridge_mesh_distance(Args&&...args) {
+    inline double bridge_mesh_distance(Args&&...args) const {
         return bridge_mesh_intersect(std::forward<Args>(args)...).distance();
     }
 
@@ -191,25 +189,93 @@ class DefaultSupportTree {
     // two pillars, tagged as truss. Returns the number of bars written.
     unsigned interconnect(const bracing::BuiltTruss &truss);
 
-    // For connecting a head to a nearby pillar.
-    bool connect_to_nearpillar(const Head& head, long nearpillar_id);
+    // ─── routing a head: planned read only, then committed whole ─────────────
+    //
+    // Steps 3(b) and 4 route their heads in two phases (route_heads()). Phase
+    // one plans every head at once against the state the step started from;
+    // phase two commits one route per head, in head id order, on one thread.
+    // The plan_* functions only read; commit() is the only writer.
 
-    // Find route for a head to the ground. Inserts additional bridge from the
-    // head to the pillar if cannot create pillar directly.
-    // The optional dir parameter is the direction of the bridge which is the
-    // direction of the pinhead if omitted.
-    inline bool connect_to_ground(Head& head);
+    // What planning reads: the builder, and the feet of the pillars a head may
+    // bridge to, copied out of the pillar index.
+    struct RouteView
+    {
+        const SupportTreeBuilder &builder;
+        std::vector<PointIndexEl> feet;
+    };
+    RouteView route_view();
 
-    bool connect_to_model_body(Head &head);
+    // The rules no route may break (design.md decision 8), on the pillar's
+    // state in `builder`: room for one more bridge, and no head on a pillar
+    // thinner than its back. The one place the bridge cap is compared.
+    bool can_bridge_to(const SupportTreeBuilder &builder, const Pillar &pillar,
+                       const Head &head) const;
 
-    bool search_pillar_and_connect(const Head& source);
+    // How long a bar from this head may be: max_bridge_length_mm, scaled by
+    // the head's back radius against the global one.
+    double bridge_reach(const Head &head) const
+    {
+        return head.r_back_mm * m_sm.cfg.max_bridge_length_mm / m_sm.cfg.head_back_radius_mm;
+    }
+
+    // A bar from the head to the pillar, with a short pillar of the head's own
+    // under it where the bar cannot leave the junction itself.
+    std::optional<RoutePlan> plan_to_pillar(const SupportTreeBuilder &builder,
+                                            const Head &head, long pillar_id) const;
+
+    // to_pillar plans to the pillars in the view other than `skip`, nearest
+    // foot first (ties by pillar id), until `out` holds `limit` of them.
+    void plan_near_pillars(const RouteView &view, const Head &head, long skip, size_t limit,
+                           std::vector<RoutePlan> &out) const;
 
     // This is a proxy function for pillar creation which will mind the gap
     // between the pad and the model bottom in zero elevation mode.
     // jp is the starting junction point which needs to be routed down.
     // sourcedir is the allowed direction of an optional bridge between the
     // jp junction and the final pillar.
-    bool create_ground_pillar(const Junction &jp,
+    std::optional<RoutePlan> plan_ground_pillar(const Junction &jp, const Vec3d &sourcedir,
+                                                long head_id) const;
+
+    // A route for the head to the ground: a bar to where the way down is
+    // clear, then a pillar. plan_ground_route() tries the bar along the head;
+    // plan_ground_detour() searches a direction out of the cavity, for when
+    // that failed (see sla::plan_ground_detour() on running it in parallel).
+    std::optional<RoutePlan> plan_ground_route(const Head &head) const;
+    std::optional<RoutePlan> plan_ground_detour(const Head &head) const;
+
+    // A pillar from the head down to the model, standing on an anchor.
+    std::optional<RoutePlan> plan_model_anchor(const Head &head) const;
+
+    enum class RouteStep { ground, model }; // step 3(b), step 4
+
+    // A head's candidates in the order they are tried: to_pillar, then the
+    // fallbacks (step 3(b): own pillar; step 4: ground route, model anchor).
+    struct HeadRoutes
+    {
+        std::vector<RoutePlan> to_pillar, fallback;
+        bool fallback_planned = false;
+    };
+
+    // Plans the head's candidates against the view. The pillar of the head's
+    // cluster, `center`, comes first when there is one. Fallbacks are planned
+    // only if no pillar is in reach, or on a recompute; they read the mesh
+    // alone, so once planned they stay valid and are kept.
+    void plan_routes(RouteStep step, const RouteView &view, const Head &head, long center,
+                     bool recompute, HeadRoutes &routes) const;
+
+    // Makes the plan in the builder and indexes its new pillar. Returns that
+    // pillar's builder id, or ID_UNSET when the plan adds none to the index.
+    long commit(const RoutePlan &plan);
+
+    struct RouteJob { unsigned head; long center; };
+    struct RouteCounts { size_t routed = 0, recomputed = 0, unrouted = 0; };
+
+    // The two phases of a routing step, for the heads of `jobs`.
+    RouteCounts route_heads(RouteStep step, std::vector<RouteJob> jobs);
+
+    // Plans and commits a ground pillar at once, for the cluster centres of
+    // step 3(a). Returns the pillar's id, or ID_UNSET.
+    long create_ground_pillar(const Junction &jp,
                               const Vec3d &sourcedir,
                               long         head_id = SupportTreeNode::ID_UNSET);
 

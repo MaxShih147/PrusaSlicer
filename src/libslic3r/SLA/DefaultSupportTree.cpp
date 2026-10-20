@@ -9,6 +9,7 @@
 #include <libslic3r/MeshNormals.hpp>
 #include <libslic3r/Execution/ExecutionTBB.hpp>
 #include <boost/log/trivial.hpp>
+#include <oneapi/tbb/task_arena.h>
 #include <cstdlib>
 #include <cmath>
 #include <functional>
@@ -201,7 +202,7 @@ AABBMesh::hit_result DefaultSupportTree::pinhead_mesh_intersect(
 }
 
 AABBMesh::hit_result DefaultSupportTree::bridge_mesh_intersect(
-    const Vec3d &src, const Vec3d &dir, double r, double sd)
+    const Vec3d &src, const Vec3d &dir, double r, double sd) const
 {
     return sla::beam_mesh_hit(suptree_ex_policy, m_sm.emesh, {src, dir, r}, sd);
 }
@@ -223,19 +224,49 @@ unsigned DefaultSupportTree::interconnect(const bracing::BuiltTruss &truss)
     return unsigned(truss.bars.size());
 }
 
-bool DefaultSupportTree::connect_to_nearpillar(const Head &head,
-                                                  long        nearpillar_id)
-{
-    auto nearpillar = [this, nearpillar_id]() -> const Pillar& {
-        return m_builder.pillar(nearpillar_id);
-    };
+namespace {
 
-    if (m_builder.bridgecount(nearpillar()) > m_sm.cfg.max_bridges_on_pillar)
-        return false;
+RoutePlan pillar_route(RoutePlan::Kind kind, PillarRecipe &&planned)
+{
+    RoutePlan plan;
+    plan.kind       = kind;
+    plan.new_pillar = planned.pillar;
+    plan.recipe     = std::move(planned.recipe);
+    return plan;
+}
+
+} // namespace
+
+DefaultSupportTree::RouteView DefaultSupportTree::route_view()
+{
+    RouteView view{m_builder, {}};
+    m_pillar_index.foreach([&view](const PointIndexEl &el) { view.feet.emplace_back(el); });
+    return view;
+}
+
+bool DefaultSupportTree::can_bridge_to(const SupportTreeBuilder &builder,
+                                       const Pillar             &pillar,
+                                       const Head               &head) const
+{
+    return builder.bridgecount(pillar) < m_sm.cfg.max_bridges_on_pillar &&
+           pillar.r_start >= head.r_back_mm;
+}
+
+std::optional<RoutePlan> DefaultSupportTree::plan_to_pillar(const SupportTreeBuilder &builder,
+                                                            const Head               &head,
+                                                            long nearpillar_id) const
+{
+    // Nothing is written while routes are planned, so the reference holds.
+    const Pillar &nearpillar = builder.pillar(nearpillar_id);
+
+    // First, as they cost nothing. A bridge count only grows, so a pillar
+    // that is full now is full at commit too, where this is asked again.
+    if (!can_bridge_to(builder, nearpillar, head))
+        return {};
 
     Vec3d headjp = head.junction_point();
-    Vec3d nearjp_u = nearpillar().startpoint();
-    Vec3d nearjp_l = nearpillar().endpoint();
+    Vec3d nearjp_u = nearpillar.startpoint();
+    Vec3d nearjp_l = nearpillar.endpoint();
 
     double r = head.r_back_mm;
     double d2d = distance(to_2d(headjp), to_2d(nearjp_u));
@@ -246,7 +277,13 @@ bool DefaultSupportTree::connect_to_nearpillar(const Head &head,
 
     Vec3d bridgestart = headjp;
     Vec3d bridgeend = nearjp_u;
-    double max_len = r * m_sm.cfg.max_bridge_length_mm / m_sm.cfg.head_back_radius_mm;
+    double max_len = bridge_reach(head);
+
+    // No bar from here reaches that pillar: both lengths tested below, d3d
+    // and D, run from the junction to the pillar's axis and are never shorter
+    // than d2d. Most pillars of a model fail here, before any mesh test.
+    if (d2d > max_len) return {};
+
     // This head's own bracing angle. Most heads in a cluster reach the ground
     // through this bridge rather than through their own pillar, so leaving the
     // global value here would make a custom angle do nothing for every head
@@ -268,74 +305,100 @@ bool DefaultSupportTree::connect_to_nearpillar(const Head &head,
             Zdown -= zdiff;
             bridgestart.z() -= zdiff;
             touchjp.z() = Zdown;
-
-            double t = bridge_mesh_distance(headjp, DOWN, r);
-
-               // We can't insert a pillar under the source head to connect
-               // with the nearby pillar's starting junction
-            if(t < zdiff) return false;
         }
 
         if(Zdown <= nearjp_u.z() && Zdown >= nearjp_l.z() && D < max_len)
             bridgeend.z() = Zdown;
         else
-            return false;
+            return {};
     }
 
        // There will be a minimum distance from the ground where the
        // bridge is allowed to connect. This is an empiric value.
     double minz = ground_level(m_sm) + 4 * head.r_back_mm;
-    if(bridgeend.z() < minz) return false;
+    if(bridgeend.z() < minz) return {};
+
+    // The mesh last, as it costs the most. Every test here only turns the
+    // pillar down, so their order does not change which pillars pass.
+
+       // We can't insert a pillar under the source head to connect
+       // with the nearby pillar's starting junction
+    if(zdiff > 0 && bridge_mesh_distance(headjp, DOWN, r) < zdiff) return {};
 
     double t = bridge_mesh_distance(bridgestart, dirv(bridgestart, bridgeend), r);
 
        // Cannot insert the bridge. (further search might not worth the hassle)
-    if(t < distance(bridgestart, bridgeend)) return false;
+    if(t < distance(bridgestart, bridgeend)) return {};
 
-    std::lock_guard lk(m_bridge_mutex);
+    RoutePlan plan;
+    plan.kind          = RoutePlan::Kind::to_pillar;
+    plan.target_pillar = nearpillar_id;
 
-    if (m_builder.bridgecount(nearpillar()) < m_sm.cfg.max_bridges_on_pillar) {
-        // A partial pillar is needed under the starting head.
-        if(zdiff > 0) {
-            // A partial pillar is needed under the starting head. It is this
-            // head's own, and the bar then runs from ITS top across to the near
-            // pillar - so both ends of that bar have an owner, and the head has
-            // a pillar to be grouped with.
-            const long own = m_builder.add_pillar(head.id, headjp.z() - bridgestart.z());
-            const size_t first_junction = m_builder.junctioncount();
-            m_builder.add_junction(bridgestart, r);
-            m_builder.own_junctions_from(first_junction, own);
-            m_builder.add_bridge_between(nearpillar_id, bridgestart, bridgeend, r,
-                                         BridgeKind::head, own);
-        } else {
-            m_builder.add_bridge_to_pillar(head.id, bridgeend, nearpillar_id);
-        }
+    BuildRecipe &recipe = plan.recipe;
+    if(zdiff > 0) {
+        // A partial pillar is needed under the starting head. It is this
+        // head's own, and the bar then runs from ITS top across to the near
+        // pillar - so both ends of that bar have an owner, and the head has
+        // a pillar to be grouped with.
+        const long own = recipe.add_pillar(head.id, headjp.z() - bridgestart.z());
+        const size_t first_junction = recipe.junctioncount();
+        recipe.add_junction(bridgestart, r);
+        recipe.own_junctions_from(first_junction, own);
+        recipe.add_bridge_between(nearpillar_id, bridgestart, bridgeend, r,
+                                  BridgeKind::head, own);
+    } else {
+        recipe.add_bridge_to_pillar(head.id, bridgeend, nearpillar_id);
+    }
 
-        m_builder.increment_bridges(nearpillar());
-        note_prior_attachment(nearpillar_id);
-    } else return false;
+    recipe.increment_bridges(nearpillar_id);
 
-    return true;
+    return plan;
 }
 
-bool DefaultSupportTree::create_ground_pillar(const Junction &hjp,
-                                             const Vec3d &sourcedir,
-                                             long         head_id)
+std::optional<RoutePlan> DefaultSupportTree::plan_ground_pillar(const Junction &hjp,
+                                                                const Vec3d    &sourcedir,
+                                                                long            head_id) const
 {
-    auto [ret, pillar_id] = sla::create_ground_pillar(suptree_ex_policy,
-                                                      m_builder,
-                                                      m_sm,
-                                                      hjp.pos,
-                                                      sourcedir,
-                                                      hjp.r,
-                                                      hjp.r,
-                                                      head_id);
+    std::optional<PillarRecipe> planned = sla::plan_ground_pillar(suptree_ex_policy,
+                                                                  m_sm,
+                                                                  hjp.pos,
+                                                                  sourcedir,
+                                                                  hjp.r,
+                                                                  hjp.r,
+                                                                  head_id);
+    if (!planned)
+        return {};
 
-    if (pillar_id >= 0) // Save the pillar endpoint in the spatial index
-        m_pillar_index.guarded_insert(m_builder.pillar(pillar_id).endpt,
-                                      unsigned(pillar_id));
+    return pillar_route(RoutePlan::Kind::own_pillar, std::move(*planned));
+}
 
-    return ret;
+long DefaultSupportTree::create_ground_pillar(const Junction &hjp,
+                                              const Vec3d &sourcedir,
+                                              long         head_id)
+{
+    const std::optional<RoutePlan> plan = plan_ground_pillar(hjp, sourcedir, head_id);
+    return plan ? commit(*plan) : SupportTreeNode::ID_UNSET;
+}
+
+long DefaultSupportTree::commit(const RoutePlan &plan)
+{
+    const RecipeIds ids = replay(m_builder, plan.recipe);
+
+    long pillar_id = SupportTreeNode::ID_UNSET;
+    if (plan.new_pillar != SupportTreeNode::ID_UNSET) {
+        // Save the pillar endpoint in the spatial index
+        pillar_id = ids.pillar(plan.new_pillar);
+        m_pillar_index.insert(m_builder.pillar(pillar_id).endpt, unsigned(pillar_id));
+    }
+
+    if (plan.kind == RoutePlan::Kind::to_pillar)
+        note_prior_attachment(plan.target_pillar);
+
+    m_penetration_stats.ray_misses += plan.ray_misses;
+    if (plan.negative_anchor_width)
+        BOOST_LOG_TRIVIAL(warning) << "Pinhead width is negative!";
+
+    return pillar_id;
 }
 
 void DefaultSupportTree::add_pinheads()
@@ -622,8 +685,7 @@ void DefaultSupportTree::classify()
 
 void DefaultSupportTree::routing_to_ground()
 {
-    ClusterEl cl_centroids;
-    cl_centroids.reserve(m_pillar_clusters.size());
+    std::vector<RouteJob> jobs;
 
     for (auto &cl : m_pillar_clusters) {
         m_thr();
@@ -652,80 +714,76 @@ void DefaultSupportTree::routing_to_ground()
         assert(lcid >= 0);
         unsigned hid = cl[size_t(lcid)]; // Head ID
 
-        cl_centroids.emplace_back(hid);
-
         Head &h = m_builder.head(hid);
 
-        if (!create_ground_pillar(h.junction(), h.dir, h.id)) {
+        // The centre pillar is kept as it is made. It used to be looked up
+        // later as the pillar nearest the centre head, which is some other
+        // pillar whenever this one could not be made.
+        const long center = create_ground_pillar(h.junction(), h.dir, h.id);
+        if (center < 0) {
             BOOST_LOG_TRIVIAL(warning)
                 << "Pillar cannot be created for support point id: " << hid;
             m_iheads_onmodel.emplace_back(h.id);
-            continue;
         }
+
+        // The other heads of the cluster go to the centre pillar, else to
+        // another pillar nearby, else down on a pillar of their own.
+        for (unsigned c : cl)
+            if (c != hid)
+                jobs.push_back({c, center});
     }
 
-    // now we will go through the clusters ones again and connect the
-    // sidepoints with the cluster centroid (which is a ground pillar)
-    // or a nearby pillar if the centroid is unreachable.
-    size_t ci = 0;
-    for (const std::vector<unsigned> &cl : m_pillar_clusters) {
-        m_thr();
-
-        auto cidx = cl_centroids[ci++];
-
-        auto q = m_pillar_index.query(m_builder.head(cidx).junction_point(), 1);
-        if (!q.empty()) {
-            long centerpillarID = q.front().second;
-            for (auto c : cl) {
-                m_thr();
-                if (c == cidx) continue;
-
-                auto &sidehead = m_builder.head(c);
-
-                if (!connect_to_nearpillar(sidehead, centerpillarID) &&
-                    !search_pillar_and_connect(sidehead)) {
-                    // Vec3d pend = Vec3d{pstart.x(), pstart.y(), gndlvl};
-                    // Could not find a pillar, create one
-                    create_ground_pillar(sidehead.junction(), sidehead.dir, sidehead.id);
-                }
-            }
-        }
-    }
+    const RouteCounts counts = route_heads(RouteStep::ground, std::move(jobs));
+    BOOST_LOG_TRIVIAL(info) << "Routing to ground: " << counts.routed << " heads routed, "
+                            << counts.recomputed << " planned again, " << counts.unrouted
+                            << " without a route";
 }
 
-bool DefaultSupportTree::connect_to_ground(Head &head)
+namespace {
+
+std::optional<RoutePlan> ground_route(const Head &head, std::optional<PillarRecipe> &&planned)
 {
-    auto [ret, pillar_id] = sla::search_ground_route(suptree_ex_policy,
-                                                     m_builder, m_sm,
-                                                     {head.junction_point(),
-                                                      head.r_back_mm},
-                                                     head.r_back_mm,
-                                                     head.dir,
-                                                     head.id);
+    if (!planned)
+        return {};
 
-    if (pillar_id >= 0) {
-        // Save the pillar endpoint in the spatial index
-        m_pillar_index.guarded_insert(m_builder.pillar(pillar_id).endpt,
-                                      unsigned(pillar_id));
-
-        head.pillar_id = pillar_id;
-    }
-
-    return ret;
+    planned->recipe.set_head_pillar(head.id, planned->pillar);
+    return pillar_route(RoutePlan::Kind::ground_route, std::move(*planned));
 }
 
-bool DefaultSupportTree::connect_to_model_body(Head &head)
+} // namespace
+
+std::optional<RoutePlan> DefaultSupportTree::plan_ground_route(const Head &head) const
 {
-    if (head.id <= SupportTreeNode::ID_UNSET) return false;
+    return ground_route(head, sla::plan_connect_to_ground(suptree_ex_policy, m_sm,
+                                                          {head.junction_point(),
+                                                           head.r_back_mm},
+                                                          head.dir,
+                                                          head.r_back_mm,
+                                                          head.id));
+}
+
+std::optional<RoutePlan> DefaultSupportTree::plan_ground_detour(const Head &head) const
+{
+    return ground_route(head, sla::plan_ground_detour(suptree_ex_policy, m_sm,
+                                                      {head.junction_point(),
+                                                       head.r_back_mm},
+                                                      head.r_back_mm,
+                                                      head.dir,
+                                                      head.id));
+}
+
+std::optional<RoutePlan> DefaultSupportTree::plan_model_anchor(const Head &head) const
+{
+    if (head.id <= SupportTreeNode::ID_UNSET) return {};
 
     auto it = m_head_to_ground_scans.find(unsigned(head.id));
-    if (it == m_head_to_ground_scans.end()) return false;
+    if (it == m_head_to_ground_scans.end()) return {};
 
     auto &hit = it->second;
 
     if (!hit.is_hit()) {
         // TODO scan for potential anchor points on model surface
-        return false;
+        return {};
     }
 
     Vec3d hjp = head.junction_point();
@@ -740,7 +798,7 @@ bool DefaultSupportTree::connect_to_model_body(Head &head)
     // "Mini" is relative to the radius this point asked for, not the global one.
     if (head.r_back_mm < resolved_head_back_radius_mm(m_sm, head.id))
         h = std::max(h, 0.);
-    else if (h <= 0.) return false;
+    else if (h <= 0.) return {};
 
     Vec3d endp{hjp.x(), hjp.y(), hjp.z() - hit.distance() + h};
     auto center_hit = m_sm.emesh.query_ray_hit(hjp, DOWN);
@@ -749,8 +807,9 @@ bool DefaultSupportTree::connect_to_model_body(Head &head)
     Vec3d hitp = std::abs(hitdiff) < 2*head.r_back_mm?
                      center_hit.position() : hit.position();
 
-    long pillar_id = m_builder.add_pillar(head.id, hjp.z() - endp.z());
-    Pillar &pill = m_builder.pillar(pillar_id);
+    RoutePlan plan;
+    plan.kind       = RoutePlan::Kind::model_anchor;
+    plan.new_pillar = plan.recipe.add_pillar(head.id, hjp.z() - endp.z());
 
     // Direction of the anchor pin, pointing from the model surface up towards
     // the pillar end. Head stores this vector verbatim and multiplies by it in
@@ -787,62 +846,184 @@ bool DefaultSupportTree::connect_to_model_body(Head &head)
     // Handing add_anchor() a clamped penetration together with a `w` sized for
     // the configured one would leave the anchor's length disagreeing with its
     // bite by exactly the amount that was trimmed.
+    //
+    // A miss is counted with the plan and added on commit: planning writes
+    // nothing shared, and an anchor never committed has nothing to report.
+    PenetrationClampStats stats;
     const double anchor_penetration =
         clamped_head_penetration(m_sm.emesh, hitp, taildir,
                                  resolved_head_penetration_mm(m_sm, head.id),
-                                 &m_penetration_stats);
+                                 &stats);
+    plan.ray_misses = stats.ray_misses.load();
 
     double dist = (hitp - endp).norm() + anchor_penetration;
     double w = dist - 2 * head.r_pin_mm - head.r_back_mm;
 
     if (w < 0.) {
-        BOOST_LOG_TRIVIAL(warning) << "Pinhead width is negative!";
+        plan.negative_anchor_width = true; // "Pinhead width is negative!" on commit
         w = 0.;
     }
 
-    m_builder.add_anchor(head.r_back_mm, head.r_pin_mm, w,
-                         anchor_penetration, taildir, hitp);
+    plan.recipe.add_anchor(head.r_back_mm, head.r_pin_mm, w,
+                           anchor_penetration, taildir, hitp);
 
-    m_pillar_index.guarded_insert(pill.endpoint(), pill.id);
-
-    return true;
+    return plan;
 }
 
-bool DefaultSupportTree::search_pillar_and_connect(const Head &source)
+void DefaultSupportTree::plan_near_pillars(const RouteView        &view,
+                                           const Head             &head,
+                                           long                    skip,
+                                           size_t                  limit,
+                                           std::vector<RoutePlan> &out) const
 {
-    // Hope that a local copy takes less time than the whole search loop.
-    // We also need to remove elements progressively from the copied index.
-    PointIndex spindex = m_pillar_index.guarded_clone();
+    // Pillars by the distance of their feet from the ground under the
+    // junction, as the nearest neighbour search always took it.
+    const Vec3d jp = head.junction_point();
+    const Vec3d qp(jp.x(), jp.y(), ground_level(m_sm));
 
-    long nearest_id = SupportTreeNode::ID_UNSET;
+    // Only the pillars within the head's reach in plan view: plan_to_pillar()
+    // turns the others down on the same test. A pillar's foot is under its top.
+    const double reach = bridge_reach(head);
 
-    Vec3d querypt = source.junction_point();
+    struct Near { double d2; long id; };
+    std::vector<Near> near;
+    near.reserve(view.feet.size());
+    const size_t pillarcount = view.builder.pillarcount();
+    for (const PointIndexEl &el : view.feet) {
+        const long id = long(el.second);
+        if (id != skip && size_t(id) < pillarcount &&
+            !(distance(to_2d(jp), to_2d(el.first)) > reach))
+            near.push_back({(el.first - qp).squaredNorm(), id});
+    }
 
-    while(nearest_id < 0 && !spindex.empty()) { m_thr();
-        // loop until a suitable head is not found
-        // if there is a pillar closer than the cluster center
-        // (this may happen as the clustering is not perfect)
-        // than we will bridge to this closer pillar
+    // A total order: the same pillars come in the same order, however the
+    // index lists them.
+    auto nearer = [](const Near &a, const Near &b) {
+        return a.d2 < b.d2 || (a.d2 == b.d2 && a.id < b.id);
+    };
 
-        Vec3d qp(querypt.x(), querypt.y(), ground_level(m_sm));
-        auto qres = spindex.nearest(qp, 1);
-        if(qres.empty()) break;
+    // Sorted a growing slice at a time: most heads find their pillars among
+    // the first few.
+    size_t next = 0;
+    for (size_t slice = 16; out.size() < limit && next < near.size(); slice *= 2) {
+        const size_t upto = std::min(near.size(), next + slice);
+        std::partial_sort(near.begin() + next, near.begin() + upto, near.end(), nearer);
 
-        auto ne = qres.front();
-        nearest_id = ne.second;
+        for (; next < upto && out.size() < limit; ++next) {
+            m_thr();
+            if (std::optional<RoutePlan> p = plan_to_pillar(view.builder, head, near[next].id))
+                out.emplace_back(std::move(*p));
+        }
+    }
+}
 
-        if(nearest_id >= 0) {
-            if (size_t(nearest_id) < m_builder.pillarcount()) {
-                if(!connect_to_nearpillar(source, nearest_id) ||
-                    m_builder.pillar(nearest_id).r_start < source.r_back_mm) {
-                    nearest_id = SupportTreeNode::ID_UNSET;    // continue searching
-                    spindex.remove(ne);       // without the current pillar
-                }
-            }
+void DefaultSupportTree::plan_routes(RouteStep        step,
+                                     const RouteView &view,
+                                     const Head      &head,
+                                     long             center,
+                                     bool             recompute,
+                                     HeadRoutes      &routes) const
+{
+    routes.to_pillar.clear();
+    if (center >= 0)
+        if (std::optional<RoutePlan> p = plan_to_pillar(view.builder, head, center))
+            routes.to_pillar.emplace_back(std::move(*p));
+    plan_near_pillars(view, head, center, ROUTE_PILLAR_CANDIDATES, routes.to_pillar);
+
+    // The fallbacks cost the most, and the old flow only got to them with no
+    // pillar in reach.
+    if (routes.fallback_planned || (!recompute && !routes.to_pillar.empty()))
+        return;
+    routes.fallback_planned = true;
+
+    auto add = [&routes](std::optional<RoutePlan> &&p) {
+        if (p) routes.fallback.emplace_back(std::move(*p));
+    };
+
+    if (step == RouteStep::ground) {
+        add(plan_ground_pillar(head.junction(), head.dir, head.id));
+    } else {
+        std::optional<RoutePlan> route = plan_ground_route(head);
+        if (!route)
+            route = plan_ground_detour(head);
+        add(std::move(route));
+        // No route to the ground, so connect to the model body as a last resort
+        add(plan_model_anchor(head));
+    }
+}
+
+DefaultSupportTree::RouteCounts DefaultSupportTree::route_heads(RouteStep             step,
+                                                                std::vector<RouteJob> jobs)
+{
+    std::sort(jobs.begin(), jobs.end(),
+              [](const RouteJob &a, const RouteJob &b) { return a.head < b.head; });
+
+    // Phase one: every head at once, against the state the step starts from.
+    // Each writes its own slot and nothing else. Each is planned in isolation:
+    // a thread waiting for the parallel mesh tests inside a detour search then
+    // takes no other head's planning meanwhile, whose own search would draw
+    // from the same per thread random state (see sla::plan_ground_detour()).
+    std::vector<HeadRoutes> routes(jobs.size());
+    {
+        const RouteView view = route_view();
+        execution::for_each(
+            suptree_ex_policy, size_t(0), jobs.size(),
+            [this, step, &view, &jobs, &routes](size_t i) {
+                m_thr();
+                tbb::this_task_arena::isolate([&] {
+                    plan_routes(step, view, view.builder.head(jobs[i].head), jobs[i].center,
+                                false, routes[i]);
+                });
+            },
+            execution::max_concurrency(suptree_ex_policy));
+    }
+
+    // The first candidate the rules allow on the builder as it is now.
+    auto first_allowed = [this](const HeadRoutes &r, const Head &head) -> const RoutePlan * {
+        for (const std::vector<RoutePlan> *list : {&r.to_pillar, &r.fallback})
+            for (const RoutePlan &p : *list)
+                if (p.kind != RoutePlan::Kind::to_pillar ||
+                    can_bridge_to(m_builder, m_builder.pillar(p.target_pillar), head))
+                    return &p;
+        return nullptr;
+    };
+
+    // Phase two: one head after the other, smallest id first, each committing
+    // one route whole. A head with no candidate left plans once more, against
+    // what is there now - the pillars the heads before it made included - and
+    // with the fallbacks phase one did not get to.
+    RouteCounts counts;
+    for (size_t i = 0; i < jobs.size(); ++i) {
+        m_thr();
+
+        const Head &head = std::as_const(m_builder).head(jobs[i].head);
+
+        const RoutePlan *chosen = first_allowed(routes[i], head);
+        if (!chosen) {
+            ++counts.recomputed;
+            plan_routes(step, route_view(), head, jobs[i].center, true, routes[i]);
+            chosen = first_allowed(routes[i], head);
+        }
+
+        if (chosen) {
+            commit(*chosen);
+            ++counts.routed;
+            continue;
+        }
+
+        ++counts.unrouted;
+
+        // A ground facing head with no route is left as it was, a model
+        // facing one is dropped: both as they always were.
+        if (step == RouteStep::model) {
+            BOOST_LOG_TRIVIAL(warning)
+                << "Failed to route model facing support point. ID: " << jobs[i].head;
+
+            m_builder.head(jobs[i].head).invalidate();
         }
     }
 
-    return nearest_id >= 0;
+    return counts;
 }
 
 void DefaultSupportTree::routing_to_model()
@@ -850,31 +1031,18 @@ void DefaultSupportTree::routing_to_model()
     // We need to check if there is an easy way out to the bed surface.
     // If it can be routed there with a bridge shorter than
     // min_bridge_distance.
+    //
+    // Each head: a nearby pillar, else a route to the ground, else an anchor
+    // on the model body.
+    std::vector<RouteJob> jobs;
+    jobs.reserve(m_iheads_onmodel.size());
+    for (unsigned idx : m_iheads_onmodel)
+        jobs.push_back({idx, SupportTreeNode::ID_UNSET});
 
-    execution::for_each(
-        suptree_ex_policy, m_iheads_onmodel.begin(), m_iheads_onmodel.end(),
-        [this](const unsigned idx) {
-            m_thr();
-
-            auto &head = m_builder.head(idx);
-
-            // Search nearby pillar
-            if (search_pillar_and_connect(head)) { return; }
-
-            // Cannot connect to nearby pillar. We will try to search for
-            // a route to the ground.
-            if (connect_to_ground(head)) { return; }
-
-            // No route to the ground, so connect to the model body as a last resort
-            if (connect_to_model_body(head)) { return; }
-
-            // We have failed to route this head.
-            BOOST_LOG_TRIVIAL(warning)
-                << "Failed to route model facing support point. ID: " << idx;
-
-            head.invalidate();
-        },
-        execution::max_concurrency(suptree_ex_policy));
+    const RouteCounts counts = route_heads(RouteStep::model, std::move(jobs));
+    BOOST_LOG_TRIVIAL(info) << "Routing to model: " << counts.routed << " heads routed, "
+                            << counts.recomputed << " planned again, " << counts.unrouted
+                            << " without a route";
 }
 
 void DefaultSupportTree::adopt_prior_pillars()

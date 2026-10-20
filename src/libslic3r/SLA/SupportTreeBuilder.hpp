@@ -553,7 +553,17 @@ public:
         m_meshcache_valid = false;
         return m_heads[m_head_indices[id]];
     }
-    
+
+    // For readers: unlike the one above, it leaves the mesh cache alone, so
+    // routing can plan from many threads while nothing is written.
+    const Head &head(unsigned id) const
+    {
+        std::lock_guard<Mutex> lk(m_mutex);
+        assert(id < m_head_indices.size());
+
+        return m_heads[m_head_indices[id]];
+    }
+
     /// How many junctions exist, for a caller about to add some and then say
     /// which pillar they belong to.
     inline size_t junctioncount() const {

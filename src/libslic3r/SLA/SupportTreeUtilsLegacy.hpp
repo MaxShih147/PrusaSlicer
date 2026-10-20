@@ -5,7 +5,10 @@
 #ifndef SUPPORTTREEUTILSLEGACY_HPP
 #define SUPPORTTREEUTILSLEGACY_HPP
 
+#include <optional>
+
 #include "SupportTreeUtils.hpp"
+#include "RoutePlan.hpp"
 
 // Old functions are gathered here that are used in DefaultSupportTree
 // to maintain functionality that was well tested.
@@ -105,10 +108,12 @@ std::optional<DiffBridge> search_widening_path(Ex                     policy,
 // 'pinhead_junctionpt' is the starting junction point which needs to be
 // routed down. sourcedir is the allowed direction of an optional bridge
 // between the jp junction and the final pillar.
+//
+// Plans the pillar only: reads the mesh, writes nothing, and hands back the
+// builder calls that make it. create_ground_pillar() below makes them.
 template<class Ex>
-std::pair<bool, long> create_ground_pillar(
+std::optional<PillarRecipe> plan_ground_pillar(
     Ex                     policy,
-    SupportTreeBuilder    &builder,
     const SupportableMesh &sm,
     const Vec3d           &pinhead_junctionpt,
     const Vec3d           &sourcedir,
@@ -125,6 +130,9 @@ std::pair<bool, long> create_ground_pillar(
     // the pillar, that is whether the pillar starts somewhere else.
     bool                  *laid_bar = nullptr)
 {
+    PillarRecipe out;
+    BuildRecipe &recipe = out.recipe;
+
     Vec3d  jp           = pinhead_junctionpt, endp = jp, dir = sourcedir;
     long   pillar_id    = SupportTreeNode::ID_UNSET;
     bool   can_add_base = false, non_head = false;
@@ -184,17 +192,17 @@ std::pair<bool, long> create_ground_pillar(
             search_widening_path(policy, sm, jp, dir, radius, pt_back_r);
 
         if (diffbr && diffbr->endp.z() > jp_gnd) {
-            const DiffBridge br = builder.add_diffbridge(*diffbr);
-            if (head_id >= 0) builder.head(head_id).bridge_id = br.id;
+            const DiffBridge br = recipe.add_diffbridge(*diffbr);
+            if (head_id >= 0) recipe.set_head_diffbridge(head_id, br.id);
             top_diffbridge = br.id;
             endp = diffbr->endp;
             radius = diffbr->end_r;
             end_radius = diffbr->end_r;
-            builder.add_junction(endp, radius);
+            recipe.add_junction(endp, radius);
             non_head = true;
             dir = diffbr->get_dir();
             eval_limits();
-        } else return {false, pillar_id};
+        } else return {};
     }
 
     if (sm.cfg.object_elevation_mm < EPSILON)
@@ -241,16 +249,17 @@ std::pair<bool, long> create_ground_pillar(
             }
         }
 
-        // Could not find a path to avoid the pad gap
-        if (dlast < gap_dist) return {false, pillar_id};
+        // Could not find a path to avoid the pad gap. The widening bar planned
+        // above goes with the rest: this used to leave it built, on its own.
+        if (dlast < gap_dist) return {};
 
         if (t > 0.) { // Need to make additional bridge
-            const Bridge br = builder.add_bridge(endp, nexp, radius, BridgeKind::route);
-            if (head_id >= 0) builder.head(head_id).bridge_id = br.id;
+            const Bridge br = recipe.add_bridge(endp, nexp, radius, BridgeKind::route);
+            if (head_id >= 0) recipe.set_head_bridge(head_id, br.id);
             top_bridge     = br.id;
             top_diffbridge = SupportTreeNode::ID_UNSET;
 
-            builder.add_junction(nexp, radius);
+            recipe.add_junction(nexp, radius);
             endp = nexp;
             non_head = true;
         }
@@ -259,33 +268,65 @@ std::pair<bool, long> create_ground_pillar(
     Vec3d gp = to_floor(endp);
     double h = endp.z() - gp.z();
 
-    pillar_id = head_id >= 0 && !non_head ? builder.add_pillar(head_id, h) :
-                                            builder.add_pillar(gp, h, radius, end_radius);
+    pillar_id = head_id >= 0 && !non_head ? recipe.add_pillar(head_id, h) :
+                                            recipe.add_pillar(gp, h, radius, end_radius);
 
     if (can_add_base)
-        builder.add_pillar_base(pillar_id, sm.cfg.base_height_mm, pt_base_r);
+        recipe.add_pillar_base(pillar_id, sm.cfg.base_height_mm, pt_base_r);
 
     if (top_bridge >= 0)
-        builder.own_bridge(top_bridge, pillar_id);
+        recipe.own_bridge(top_bridge, pillar_id);
     else if (top_diffbridge >= 0)
-        builder.own_diffbridge(top_diffbridge, pillar_id);
+        recipe.own_diffbridge(top_diffbridge, pillar_id);
     if (laid_bar) *laid_bar = top_bridge >= 0 || top_diffbridge >= 0;
 
-    return {true, pillar_id};
+    out.pillar = pillar_id;
+    return out;
 }
 
+// Makes a planned route, returning the builder id of its pillar. {false,
+// ID_UNSET} when there was no plan: then nothing is made.
+inline std::pair<bool, long> commit_pillar_recipe(SupportTreeBuilder                &builder,
+                                                  const std::optional<PillarRecipe> &plan)
+{
+    if (!plan)
+        return {false, SupportTreeNode::ID_UNSET};
+    return {true, replay(builder, plan->recipe).pillar(plan->pillar)};
+}
+
+// plan_ground_pillar() and its builder calls made at once.
 template<class Ex>
-std::pair<bool, long> connect_to_ground(Ex                     policy,
-                                        SupportTreeBuilder    &builder,
-                                        const SupportableMesh &sm,
-                                        const Junction        &j,
-                                        const Vec3d           &dir,
-                                        double                 end_r,
-                                        // Carried through so the pillar can
-                                        // resolve its own base radius and
-                                        // bracing angle; ID_UNSET keeps the
-                                        // global configuration.
-                                        long head_id = SupportTreeNode::ID_UNSET)
+std::pair<bool, long> create_ground_pillar(
+    Ex                     policy,
+    SupportTreeBuilder    &builder,
+    const SupportableMesh &sm,
+    const Vec3d           &pinhead_junctionpt,
+    const Vec3d           &sourcedir,
+    double                 radius,
+    double                 end_radius,
+    long                   head_id       = SupportTreeNode::ID_UNSET,
+    long                   size_point_id = SupportTreeNode::ID_UNSET,
+    bool                  *laid_bar      = nullptr)
+{
+    return commit_pillar_recipe(builder,
+                                plan_ground_pillar(policy, sm, pinhead_junctionpt, sourcedir,
+                                                   radius, end_radius, head_id, size_point_id,
+                                                   laid_bar));
+}
+
+// Plans a bar from the junction along `dir` to where the ground can be
+// reached, and the pillar from there. Writes nothing.
+template<class Ex>
+std::optional<PillarRecipe> plan_connect_to_ground(Ex                     policy,
+                                                   const SupportableMesh &sm,
+                                                   const Junction        &j,
+                                                   const Vec3d           &dir,
+                                                   double                 end_r,
+                                                   // Carried through so the pillar can
+                                                   // resolve its own base radius and
+                                                   // bracing angle; ID_UNSET keeps the
+                                                   // global configuration.
+                                                   long head_id = SupportTreeNode::ID_UNSET)
 {
     auto   hjp = j.pos;
     double r   = j.r;
@@ -304,46 +345,64 @@ std::pair<bool, long> connect_to_ground(Ex                     policy,
     }
 
     if(!std::isinf(tdown))
-        return {false, SupportTreeNode::ID_UNSET};
+        return {};
 
     Vec3d endp = hjp + d * dir;
     // head_id goes in as the sizing point only: this route always inserts a
     // bridge below, so the pillar must not be attached to the head directly.
     bool laid_bar = false;
-    auto ret = create_ground_pillar(policy, builder, sm, endp, dir, r, end_r,
-                                    SupportTreeNode::ID_UNSET, head_id, &laid_bar);
+    std::optional<PillarRecipe> ret = plan_ground_pillar(policy, sm, endp, dir, r, end_r,
+                                                         SupportTreeNode::ID_UNSET, head_id,
+                                                         &laid_bar);
 
-    if (ret.second >= 0) {
-        // This bar ends on the pillar's top unless create_ground_pillar laid
+    if (ret) {
+        // This bar ends on the pillar's top unless plan_ground_pillar laid
         // another one below it.
-        builder.add_bridge(hjp, endp, r, BridgeKind::route,
-                           laid_bar ? SupportTreeNode::ID_UNSET : ret.second);
-        builder.add_junction(endp, r);
+        ret->recipe.add_bridge(hjp, endp, r, BridgeKind::route,
+                               laid_bar ? SupportTreeNode::ID_UNSET : ret->pillar);
+        ret->recipe.add_junction(endp, r);
     }
 
     return ret;
 }
 
+// plan_connect_to_ground() and its builder calls made at once.
 template<class Ex>
-std::pair<bool, long> search_ground_route(Ex                     policy,
-                                          SupportTreeBuilder    &builder,
-                                          const SupportableMesh &sm,
-                                          const Junction        &j,
-                                          double                 end_radius,
-                                          const Vec3d &init_dir = DOWN,
-                                          // Sizing point for the resulting
-                                          // pillar; ID_UNSET keeps the global
-                                          // configuration.
-                                          long head_id = SupportTreeNode::ID_UNSET)
+std::pair<bool, long> connect_to_ground(Ex                     policy,
+                                        SupportTreeBuilder    &builder,
+                                        const SupportableMesh &sm,
+                                        const Junction        &j,
+                                        const Vec3d           &dir,
+                                        double                 end_r,
+                                        long head_id = SupportTreeNode::ID_UNSET)
+{
+    return commit_pillar_recipe(builder, plan_connect_to_ground(policy, sm, j, dir, end_r,
+                                                                head_id));
+}
+
+// Plans a route to the ground along the direction out of the cavity that an
+// optimizer finds, for when the straight one along init_dir failed. Writes
+// nothing.
+//
+// The optimizer is a genetic one, made repeatable by seed(0) on NLopt's random
+// state, which is per thread (deps/+NLopt makes sure of it). From parallel
+// code, call it isolated (tbb::this_task_arena::isolate): its mesh tests run
+// in parallel, and a thread waiting for them must not start another search,
+// on the same random state, in between.
+template<class Ex>
+std::optional<PillarRecipe> plan_ground_detour(Ex                     policy,
+                                               const SupportableMesh &sm,
+                                               const Junction        &j,
+                                               double                 end_radius,
+                                               const Vec3d &init_dir = DOWN,
+                                               // Sizing point for the resulting
+                                               // pillar; ID_UNSET keeps the global
+                                               // configuration.
+                                               long head_id = SupportTreeNode::ID_UNSET)
 {
     double downdst = j.pos.z() - ground_level(sm);
 
     const double pt_slope = resolved_bridge_slope(sm, head_id);
-
-    auto res = connect_to_ground(policy, builder, sm, j, init_dir, end_radius,
-                                 head_id);
-    if (res.first)
-        return res;
 
          // Optimize bridge direction:
          // Straight path failed so we will try to search for a suitable
@@ -367,8 +426,7 @@ std::pair<bool, long> search_ground_route(Ex                     policy,
 
     Vec3d bridgedir = spheric_to_dir(oresult.optimum).normalized();
 
-    return connect_to_ground(policy, builder, sm, j, bridgedir, end_radius,
-                             head_id);
+    return plan_connect_to_ground(policy, sm, j, bridgedir, end_radius, head_id);
 }
 
 }} // namespace Slic3r::sla
