@@ -15,6 +15,7 @@
 #include <catch2/catch_approx.hpp>
 #include <test_utils.hpp>
 
+#include <algorithm>
 #include <iomanip>
 #include <map>
 #include <memory>
@@ -27,6 +28,7 @@
 
 #include "libslic3r/Execution/ExecutionSeq.hpp"
 #include "libslic3r/TriangleMesh.hpp"
+#include "libslic3r/SLA/Clustering.hpp"
 #include "libslic3r/SLA/DefaultSupportTree.hpp"
 #include "libslic3r/SLA/RoutePlan.hpp"
 #include "libslic3r/SLA/SupportTree.hpp"
@@ -740,4 +742,151 @@ TEST_CASE("the L2 routes of a tree go out as its warnings", "[head_routing][sla_
     // Neither fixture is promised an L2; say when the comparison was empty.
     if (warned == 0)
         WARN("no L2 route in this fixture: only the absence of warnings was checked");
+}
+
+namespace {
+
+// A roof at z 10 to 12 over x -12 to 4, held up by a wall at x 0 to 4 that
+// stands on the ground. Zero elevation: a pillar's foot is on the ground
+// beside the wall.
+//
+// Five heads under the roof, pointing straight down, so they are placed as
+// given:
+//   0  X at (-5, 0)        lone, grows its own pillar
+//   1  Y at (-5.2, 4.2)    lone, grows its own pillar
+//   2  h1 at (-1.2, -3)    } one cluster, centred on 3. The heads clear the
+//   3  cc at (-0.45, 0)    } wall by more than r + safety distance, so they
+//   4  h2 at (-1.2, 3)     } reach the ground. cc, 0.2 mm thin, is 0.45 mm
+//                            from the wall: closer than the pillar base safety
+//                            distance (0.5 mm), and its pillar searches only
+//                            towards the wall (+x, the azimuth of straight
+//                            down), so it cannot be made.
+// X is the pillar nearest the centre head; Y is nearer to h2 than X is.
+struct FailedCentreFixture
+{
+    TriangleMesh mesh = [] {
+        TriangleMesh wall = make_cube(4., 18., 12.);
+        wall.translate(0.f, -8.f, 0.f);
+        TriangleMesh roof = make_cube(16., 18., 2.);
+        roof.translate(-12.f, -8.f, 10.f);
+        wall.merge(roof);
+        return wall;
+    }();
+
+    static SupportPoints points()
+    {
+        SupportPoints pts;
+        auto add = [&pts](float x, float y, float r_back) {
+            SupportPoint sp;
+            sp.pos                 = Vec3f{x, y, 10.f};
+            sp.head_front_radius   = std::min(0.2f, r_back / 2.f);
+            sp.head_back_radius_mm = r_back;
+            sp.head_dir            = Vec3f{0.f, 0.f, -1.f};
+            pts.push_back(sp);
+        };
+        add(-5.f, 0.f, 0.5f);   // X
+        add(-5.2f, 4.2f, 0.5f); // Y
+        add(-1.2f, -3.f, 0.5f); // h1
+        add(-0.45f, 0.f, 0.2f); // cc
+        add(-1.2f, 3.f, 0.5f);  // h2
+        return pts;
+    }
+
+    static SupportTreeConfig config()
+    {
+        SupportTreeConfig cfg;
+        cfg.object_elevation_mm = 0.;
+        return cfg;
+    }
+
+    SupportableMesh sm{mesh.its, points(), config()};
+
+    FailedCentreFixture()
+    {
+        // The foot of a pillar with no base goes no lower than the ground,
+        // so it stays beside the wall.
+        sm.pad_cfg.wall_thickness_mm = 0.;
+    }
+};
+
+} // namespace
+
+TEST_CASE("a cluster whose centre pillar failed offers no centre pillar",
+          "[head_routing]")
+{
+    // Spec "中心柱建立失敗": the other heads of the cluster MUST NOT take any
+    // pillar as the centre. The old lookup took the pillar nearest the centre
+    // head (X), and put it first; without a centre, h2 goes by distance to Y.
+    FailedCentreFixture f;
+    const auto          b = build(f.sm, false);
+
+    // cc is routed in step 4 instead, and may be lost there: that is not
+    // this rule's, so only the others have to be there.
+    const unsigned X = 0, Y = 1, H1 = 2, CC = 3, H2 = 4;
+    for (unsigned id : {X, Y, H1, H2}) {
+        CAPTURE(id);
+        REQUIRE(b->head(id).is_valid());
+    }
+
+    auto jp2d = [&b](unsigned id) {
+        const Vec3d p = b->head(id).junction_point();
+        return Vec2d{p.x(), p.y()};
+    };
+
+    // The fixture is what it says. h1, cc and h2 make one cluster, as
+    // classify() makes them (bases 2 + 2 mm apart in plan), centred on cc;
+    // X and Y are clusters of their own.
+    const std::vector<unsigned> ground = {X, Y, H1, CC, H2};
+    const ClusteredPoints clusters = cluster(
+        ground, [&b](unsigned id) { return b->head(id).junction_point(); },
+        [&f](const PointIndexEl &e1, const PointIndexEl &e2) {
+            const double bases = resolved_base_radius_mm(f.sm, long(e1.second)) +
+                                 resolved_base_radius_mm(f.sm, long(e2.second));
+            return (to_2d(e1.first) - to_2d(e2.first)).norm() < bases &&
+                   (e1.first - e2.first).norm() < f.sm.cfg.max_bridge_length_mm;
+        },
+        f.sm.cfg.max_bridges_on_pillar);
+    REQUIRE(clusters.size() == 3);
+    const ClusterEl *mine = nullptr;
+    for (const ClusterEl &cl : clusters)
+        if (std::find(cl.begin(), cl.end(), CC) != cl.end())
+            mine = &cl;
+    REQUIRE(mine != nullptr);
+    REQUIRE(std::set<unsigned>(mine->begin(), mine->end()) == std::set<unsigned>{H1, CC, H2});
+    const long centre = cluster_centroid(
+        *mine, [&b](size_t idx) { return b->head(unsigned(idx)).junction_point(); },
+        [](const Vec3d &p, const Vec3d &q) { return (to_2d(p) - to_2d(q)).norm(); });
+    REQUIRE((*mine)[size_t(centre)] == CC);
+
+    // ... and the centre pillar cannot be made: the call create_center_pillar() makes.
+    const Head &cc = b->head(CC);
+    REQUIRE_FALSE(plan_ground_pillar(ex_seq, f.sm, cc.junction_point(), cc.dir, cc.r_back_mm,
+                                     cc.r_back_mm, long(CC))
+                      .has_value());
+
+    // X and Y stand on their own pillars.
+    auto grown_by = [&b](unsigned id) {
+        for (const Pillar &p : b->pillars())
+            if (p.starts_from_head && p.start_junction_id == long(id))
+                return p.id;
+        return long(SupportTreeNode::ID_UNSET);
+    };
+    const long pX = grown_by(X), pY = grown_by(Y);
+    REQUIRE(pX >= 0);
+    REQUIRE(pY >= 0);
+
+    // What tells the two rules apart: X is the pillar nearest the centre
+    // head, Y the one nearest h2.
+    REQUIRE((jp2d(CC) - jp2d(X)).norm() < (jp2d(CC) - jp2d(Y)).norm());
+    REQUIRE((jp2d(H2) - jp2d(Y)).norm() < (jp2d(H2) - jp2d(X)).norm());
+
+    // h2 goes to Y: nothing stood in for the centre pillar ahead of it.
+    std::vector<long> h2_bars;
+    for (const Bridge &br : b->bridges())
+        if (br.kind == BridgeKind::head) {
+            const Head *h = head_of_bar(*b, br);
+            if (h && h->id == long(H2))
+                h2_bars.push_back(br.owner_b);
+        }
+    REQUIRE(h2_bars == std::vector<long>{pY});
 }
