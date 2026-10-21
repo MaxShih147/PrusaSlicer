@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <string>
 
 #include "admesh/stl.h"
 
@@ -300,6 +301,29 @@ struct TreeBridge
     BridgeKind kind = BridgeKind::unset;
 };
 
+// A contact a head's route kept closer than the clearance rules allow
+// (openspec change sla-head-bridge-clearance, "L2 保留須記錄警告").
+struct TreeWarningContact
+{
+    Vec3d       pos = Vec3d::Zero(); // on the route, where it comes closest
+    std::string with;                // what it touches: head_bar, route_bar,
+                                     // prop_bar, pillar or pinhead
+    double      dist = 0.;           // between the two axes
+    double      required = 0.;       // the two radii added up
+};
+
+// Something the generation kept although a rule says it should not be there.
+// The only one there is: "fallback_intersection_retained", a head routed at
+// L2 - every candidate touched something, so the first one the hard rules
+// allow was taken rather than losing the head.
+struct TreeWarning
+{
+    std::string code;
+    int         head = -1; // by position in `heads`
+    std::string route;     // to_pillar, own_pillar, ground_route or model_anchor
+    std::vector<TreeWarningContact> contacts;
+};
+
 struct SupportTreeElements
 {
     std::vector<TreeHead>     heads;
@@ -310,6 +334,8 @@ struct SupportTreeElements
     std::vector<TreeJunction> junctions;
     std::vector<TreePedestal> pedestals;
     std::vector<TreeBridge>   bridges;
+    // In the order the heads were routed; empty when nothing was kept.
+    std::vector<TreeWarning>  warnings;
 };
 
 struct SupportableMesh

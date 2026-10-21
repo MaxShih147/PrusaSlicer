@@ -253,6 +253,7 @@ bool pair_contact(const Prim &cand, const Prim &old, double c, const PillarAxisF
     out.p_old = on_old;
     out.dist = d;
     out.required = required;
+    out.radii = x.r + y.r;
     out.with = old.kind;
     out.with_head = old.head_id;
     // A head bar starts at its head; the pillar it belongs to is at its end.

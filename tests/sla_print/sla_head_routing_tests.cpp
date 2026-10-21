@@ -679,3 +679,65 @@ TEST_CASE("a centre pillar close to a head stays, recorded", "[head_routing]")
     // Recorded, so nothing in the tree is left unrecorded.
     REQUIRE(audit(*b, report).unrecorded.empty());
 }
+
+TEST_CASE("the L2 routes of a tree go out as its warnings", "[head_routing][sla_io]")
+{
+    // What create_support_tree() hands the export (task 6.1) is the L2 records
+    // of the same run, head by head, with each head by its exported position.
+    auto check = [](const SupportableMesh &sm) {
+        ClearanceReport report;
+        const auto      b = build(sm, false, &report);
+        require_exercised(*b);
+
+        JobController       ctl;
+        SupportTreeElements els;
+        create_support_tree(sm, ctl, nullptr, nullptr, nullptr, &els);
+
+        std::vector<const RouteRecord *> l2;
+        for (const RouteRecord &rec : report.routes)
+            if (rec.level == RouteLevel::L2)
+                l2.push_back(&rec);
+        CAPTURE(report.l1, report.l2);
+        REQUIRE(l2.size() == report.l2);
+        REQUIRE(els.warnings.size() == l2.size());
+
+        for (size_t i = 0; i < l2.size(); ++i) {
+            const RouteRecord &rec = *l2[i];
+            const TreeWarning &w   = els.warnings[i];
+            CAPTURE(i, rec.head, w.head);
+            REQUIRE(w.code == FALLBACK_INTERSECTION_RETAINED);
+            REQUIRE(w.route == route_kind_name(rec.kind));
+            REQUIRE(w.head >= 0);
+            REQUIRE(size_t(w.head) < els.heads.size());
+            REQUIRE(same(els.heads[size_t(w.head)].pos, b->head(unsigned(rec.head)).pos));
+
+            REQUIRE(w.contacts.size() == rec.contacts.size());
+            bool touches = false; // L1 failed, so something is closer than the radii
+            for (size_t k = 0; k < w.contacts.size(); ++k) {
+                const TreeWarningContact &c  = w.contacts[k];
+                const clearance::Contact &ct = rec.contacts[k];
+                REQUIRE(same(c.pos, ct.p_new));
+                REQUIRE(c.with == clearance::kind_name(ct.with));
+                REQUIRE(c.dist == ct.dist);
+                REQUIRE(c.required == ct.radii);
+                REQUIRE(c.required == Catch::Approx(ct.required - clearance::SAFETY_CLEARANCE));
+                touches = touches || c.dist < c.required;
+            }
+            REQUIRE(touches);
+        }
+        return els.warnings.size();
+    };
+
+    size_t warned = 0;
+    SECTION("mixed sizes") {
+        Fixture f;
+        warned += check(f.sm);
+    }
+    SECTION("dense") {
+        DenseFixture f;
+        warned += check(f.sm);
+    }
+    // Neither fixture is promised an L2; say when the comparison was empty.
+    if (warned == 0)
+        WARN("no L2 route in this fixture: only the absence of warnings was checked");
+}

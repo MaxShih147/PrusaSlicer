@@ -5,16 +5,22 @@
 // attached_to[].pairs, and still reads a list that has no pairs. The reference
 // models are checked by the hidden "[.bracing_io]" case next to the bracing
 // baseline, which needs the same plan file.
+//
+// support-tree also gains "warnings", written only when a head was routed at
+// L2 (openspec change sla-head-bridge-clearance, task 6.3).
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <iterator>
 #include <map>
 #include <set>
 #include <string>
+#include <utility>
 
 #include <nlohmann/json.hpp>
 
 #include "libslic3r/SLA/PriorPillarIO.hpp"
+#include "libslic3r/SLA/RoutePlan.hpp"
 #include "libslic3r/SLA/SupportTreeIO.hpp"
 #include "libslic3r/TriangleMeshSlicer.hpp"
 
@@ -129,6 +135,7 @@ TEST_CASE("the support tree export names every kind and stays version 2", "[sla_
 
     const nlohmann::json doc = nlohmann::json::parse(support_tree_to_string(els, 5.));
     REQUIRE(doc.at("version") == 2);
+    REQUIRE_FALSE(doc.contains("warnings"));
     REQUIRE(doc.at("pillars").at(0).at("links") == 1);
     REQUIRE(doc.at("pillars").at(0).at("pairs") == 2);
     const auto &bs = doc.at("bridges");
@@ -137,6 +144,140 @@ TEST_CASE("the support tree export names every kind and stays version 2", "[sla_
     REQUIRE(bs.at(1).at("kind") == "head");
     REQUIRE(bs.at(2).at("kind") == "prop");
     REQUIRE(bs.at(3).at("kind") == "route");
+}
+
+namespace {
+
+// A contact as the clearance rules record it: at SAFETY_CLEARANCE.
+clearance::Contact contact_at(const Vec3d &p, double dist, double radii, clearance::PrimKind with)
+{
+    clearance::Contact ct;
+    ct.p_new    = p;
+    ct.p_old    = p + Vec3d{dist, 0., 0.};
+    ct.dist     = dist;
+    ct.radii    = radii;
+    ct.required = radii + clearance::SAFETY_CLEARANCE;
+    ct.with     = with;
+    return ct;
+}
+
+} // namespace
+
+TEST_CASE("the support tree export writes an L2 route as a warning", "[sla_io]")
+{
+    // openspec change sla-head-bridge-clearance, "有保留交錯時的匯出": a head
+    // kept at L2, 0.41 mm from a head bar where the two radii add up to 1.0.
+    ClearanceReport rep;
+    RouteRecord l1;
+    l1.head  = 3;
+    l1.kind  = RoutePlan::Kind::own_pillar;
+    l1.level = RouteLevel::L1;
+    l1.contacts.push_back(contact_at(Vec3d{1., 2., 3.}, 1.1, 1.0, clearance::PrimKind::pillar));
+    rep.routes.push_back(l1);
+
+    RouteRecord l2;
+    l2.head  = 42;
+    l2.kind  = RoutePlan::Kind::to_pillar;
+    l2.level = RouteLevel::L2;
+    l2.contacts.push_back(contact_at(Vec3d{4.5, -1.25, 7.}, 0.41, 1.0, clearance::PrimKind::head_bar));
+    l2.contacts.push_back(contact_at(Vec3d{5., -1., 6.}, 0.9, 0.65, clearance::PrimKind::pinhead));
+    rep.routes.push_back(l2);
+
+    CentroidRecord centre;
+    centre.pillar  = 5;
+    centre.contact = contact_at(Vec3d{0., 0., 1.}, 1.16, 1.0, clearance::PrimKind::pinhead);
+    rep.centroid.push_back(centre);
+    rep.l1 = 1;
+    rep.l2 = 1;
+
+    // Head 42 is the 17th exported head: heads before it were left out.
+    SupportTreeElements els;
+    els.warnings = tree_warnings(rep, [](long id) { return id == 42 ? 17 : int(id); });
+    REQUIRE(els.warnings.size() == 1); // not the L1 route, not the centre pillar
+
+    const nlohmann::json doc = nlohmann::json::parse(support_tree_to_string(els, 5.));
+    REQUIRE(doc.at("version") == 2);
+    REQUIRE(doc.at("warnings").size() == 1);
+
+    const nlohmann::json &w = doc.at("warnings").at(0);
+    REQUIRE(w.at("code") == "fallback_intersection_retained");
+    REQUIRE(w.at("head") == 17);
+    REQUIRE(w.at("route") == "to_pillar");
+    REQUIRE(w.size() == 4);
+
+    const nlohmann::json &cs = w.at("contacts");
+    REQUIRE(cs.size() == 2);
+    REQUIRE(cs.at(0).at("pos") == nlohmann::json::array({4.5, -1.25, 7.}));
+    REQUIRE(cs.at(0).at("with") == "head_bar");
+    REQUIRE(cs.at(0).at("dist").get<double>() == 0.41);
+    REQUIRE(cs.at(0).at("required").get<double>() == 1.0); // the radii, no clearance
+    REQUIRE(cs.at(0).size() == 4);
+    REQUIRE(cs.at(1).at("with") == "pinhead");
+    REQUIRE(cs.at(1).at("dist").get<double>() == 0.9);
+    REQUIRE(cs.at(1).at("required").get<double>() == 0.65);
+}
+
+TEST_CASE("a warning names its route and what it touches as the spec does", "[sla_io]")
+{
+    const std::pair<RoutePlan::Kind, const char *> routes[] = {
+        {RoutePlan::Kind::to_pillar, "to_pillar"},
+        {RoutePlan::Kind::own_pillar, "own_pillar"},
+        {RoutePlan::Kind::ground_route, "ground_route"},
+        {RoutePlan::Kind::model_anchor, "model_anchor"}};
+    const std::pair<clearance::PrimKind, const char *> withs[] = {
+        {clearance::PrimKind::head_bar, "head_bar"},
+        {clearance::PrimKind::route_bar, "route_bar"},
+        {clearance::PrimKind::prop_bar, "prop_bar"},
+        {clearance::PrimKind::pillar, "pillar"},
+        {clearance::PrimKind::pinhead, "pinhead"}};
+
+    ClearanceReport rep;
+    for (size_t i = 0; i < std::size(routes); ++i) {
+        RouteRecord rec;
+        rec.head  = long(i);
+        rec.kind  = routes[i].first;
+        rec.level = RouteLevel::L2;
+        for (size_t k = 0; k < std::size(withs); ++k)
+            rec.contacts.push_back(contact_at(Vec3d{0., 0., 0.}, 0.1, 1.0, withs[k].first));
+        rep.routes.push_back(rec);
+    }
+
+    SupportTreeElements els;
+    els.warnings = tree_warnings(rep, [](long head) { return int(head); });
+    const nlohmann::json doc = nlohmann::json::parse(support_tree_to_string(els, 0.));
+
+    const nlohmann::json &ws = doc.at("warnings");
+    REQUIRE(ws.size() == std::size(routes));
+    for (size_t i = 0; i < std::size(routes); ++i) {
+        CAPTURE(i);
+        REQUIRE(ws.at(i).at("head") == int(i)); // in commit order
+        REQUIRE(ws.at(i).at("route") == routes[i].second);
+        const nlohmann::json &cs = ws.at(i).at("contacts");
+        REQUIRE(cs.size() == std::size(withs));
+        for (size_t k = 0; k < std::size(withs); ++k)
+            REQUIRE(cs.at(k).at("with") == withs[k].second);
+    }
+}
+
+TEST_CASE("a report with no L2 route writes no warnings key", "[sla_io]")
+{
+    // L1 routes and centre pillars are logged, not exported (design.md
+    // decision 10 and Open Questions 4).
+    ClearanceReport rep;
+    RouteRecord l1;
+    l1.head  = 0;
+    l1.level = RouteLevel::L1;
+    l1.contacts.push_back(contact_at(Vec3d{0., 0., 0.}, 1.1, 1.0, clearance::PrimKind::pillar));
+    rep.routes.push_back(l1);
+    rep.l1 = 1;
+
+    SupportTreeElements els;
+    els.warnings = tree_warnings(rep, [](long head) { return int(head); });
+    REQUIRE(els.warnings.empty());
+
+    const nlohmann::json doc = nlohmann::json::parse(support_tree_to_string(els, 0.));
+    REQUIRE(doc.at("version") == 2);
+    REQUIRE_FALSE(doc.contains("warnings"));
 }
 
 TEST_CASE("a generation onto prior pillars exports kinds and pairs", "[sla_io]")
@@ -206,4 +347,26 @@ TEST_CASE("a generation onto prior pillars exports kinds and pairs", "[sla_io]")
         REQUIRE(attached[i].pairs > before);
         REQUIRE(attached[i].pairs >= attached[i].links);
     }
+}
+
+TEST_CASE("an L2 route whose head is not exported is left out", "[sla_io]")
+{
+    // Never written as head -1 (code review of task 6.10, item 6).
+    ClearanceReport rep;
+    for (long head : {4, 9}) {
+        RouteRecord rec;
+        rec.head  = head;
+        rec.level = RouteLevel::L2;
+        rec.contacts.push_back(contact_at(Vec3d{0., 0., 0.}, 0.1, 1.0, clearance::PrimKind::pillar));
+        rep.routes.push_back(rec);
+    }
+
+    SupportTreeElements els;
+    els.warnings = tree_warnings(rep, [](long id) { return id == 9 ? 2 : -1; });
+    REQUIRE(els.warnings.size() == 1);
+    REQUIRE(els.warnings[0].head == 2);
+
+    const nlohmann::json doc = nlohmann::json::parse(support_tree_to_string(els, 0.));
+    REQUIRE(doc.at("warnings").size() == 1);
+    REQUIRE(doc.at("warnings").at(0).at("head") == 2);
 }

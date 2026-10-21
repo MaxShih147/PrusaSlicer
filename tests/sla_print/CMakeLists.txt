@@ -26,7 +26,9 @@ add_executable(${_TEST_NAME}_tests ${_TEST_NAME}_tests_main.cpp
     sla_bracing_vectors_tests.cpp
     sla_bridge_clearance_tests.cpp
     sla_head_routing_tests.cpp
-    sla_head_route_select_tests.cpp)
+    sla_head_route_select_tests.cpp
+    sla_head_bridge_metrics.hpp sla_head_bridge_metrics.cpp
+    sla_head_bridge_metrics_tests.cpp)
 
 # mold linker for successful linking needs also to link TBB library and link it before libslic3r.
 target_link_libraries(${_TEST_NAME}_tests test_common TBB::tbb TBB::tbbmalloc libslic3r)

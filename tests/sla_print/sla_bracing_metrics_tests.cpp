@@ -6,6 +6,9 @@
 // models through the real pipeline and is only started on request, with a plan
 // file named by BRACING_BASELINE_PLAN. So is "[.bracing_io]", which exports the
 // same models in both exchange formats and checks kind and pairs (task 5.3).
+// "[.head_bridge_acceptance]" (openspec change sla-head-bridge-clearance, task
+// 6.6) measures the head routes of the same kind of plan with
+// head_bridge_metrics(), each case on a fixed support point list.
 
 #include <catch2/catch_test_macros.hpp>
 #include <test_utils.hpp>
@@ -29,10 +32,12 @@
 #include "libslic3r/SLAPrint.hpp"
 #include "libslic3r/SLA/DefaultSupportTree.hpp"
 #include "libslic3r/SLA/PriorPillarIO.hpp"
+#include "libslic3r/SLA/SupportPointIO.hpp"
 #include "libslic3r/SLA/SupportTree.hpp"
 #include "libslic3r/SLA/SupportTreeIO.hpp"
 
 #include "sla_bracing_metrics.hpp"
+#include "sla_head_bridge_metrics.hpp"
 
 using namespace Slic3r;
 using namespace Slic3r::sla;
@@ -478,12 +483,32 @@ Model load_case_model(const std::string &stl)
     return FileReader::load_model(stl);
 }
 
-PreparedCase prepare(const std::string &stl, const DynamicPrintConfig &cfg)
+// `points`, when given: a support point list to use instead of generating one,
+// loaded the way the CLI's --import-support-points loads it (fingerprint not
+// checked).
+PreparedCase prepare(const std::string &stl, const DynamicPrintConfig &cfg,
+                     const std::string &points = {})
 {
     Model model = load_case_model(stl);
     for (ModelObject *o : model.objects) o->ensure_on_bed();
     const double w = cfg.opt_float("display_width"), h = cfg.opt_float("display_height");
     model.center_instances_around_point({w / 2., h / 2.});
+
+    if (!points.empty()) {
+        std::ifstream in(points);
+        REQUIRE(in.good());
+        std::ostringstream text;
+        text << in.rdbuf();
+
+        SLAPrintObjectConfig obj_cfg;
+        obj_cfg.apply(cfg, true);
+        SupportPointFile file;
+        std::string      err;
+        REQUIRE(support_points_from_string(text.str(), make_support_cfg(obj_cfg), file, err));
+        REQUIRE(model.objects.size() == 1);
+        model.objects.front()->sla_support_points = file.points;
+        model.objects.front()->sla_points_status  = PointsStatus::UserModified;
+    }
 
     SLAPrint print;
     print.set_status_callback([](const PrintBase::SlicingStatus &) {});
@@ -673,5 +698,64 @@ TEST_CASE("reference models export a kind for every bar", "[.bracing_io]")
         nlohmann::json j = {{"case", id}, {"bridges", tree.at("bridges").size()},
                             {"pillars", tree.at("pillars").size()}, {"kinds", kinds}};
         std::cout << j.dump() << std::endl;
+    }
+}
+
+TEST_CASE("head route metrics over reference models", "[.head_bridge_acceptance]")
+{
+    // Plan: {"out": FILE, "cases": [{"id", "model", "config", "points",
+    // "repeats": [threaded runs, single thread runs]}]}. "points" is a fixed
+    // support point list (evidence/baseline-*/inputs of the change); without
+    // it the points are generated. One JSON line per run.
+    const char *plan_path = std::getenv("HEAD_BRIDGE_PLAN");
+    REQUIRE(plan_path != nullptr);
+
+    std::ifstream plan_in(plan_path);
+    REQUIRE(plan_in.good());
+    const nlohmann::json plan = nlohmann::json::parse(plan_in);
+
+    std::ofstream out(plan.at("out").get<std::string>(), std::ios::app);
+    REQUIRE(out.good());
+
+    const int hw_threads = tbb::this_task_arena::max_concurrency();
+
+    for (const auto &c : plan.at("cases")) {
+        const std::string id = c.at("id").get<std::string>();
+        CAPTURE(id);
+        const DynamicPrintConfig cfg = load_backend_config(c.at("config").get<std::string>());
+        const PreparedCase pc = prepare(c.at("model").get<std::string>(), cfg,
+                                        c.value("points", std::string{}));
+
+        SupportableMesh sm{*pc.mesh, pc.pts, pc.tree_cfg};
+        sm.pad_cfg = pc.pad_cfg;
+        sm.zoffset = pc.zoffset;
+
+        auto run = [&](int k, int threads) {
+            SupportTreeBuilder builder;
+            ClearanceReport    report;
+            DefaultSupportTree::execute(builder, sm, nullptr, &report);
+
+            const HeadBridgeMetrics m = head_bridge_metrics(builder, report);
+            const BuilderDigests    d = builder_digests(builder);
+            nlohmann::json j = {{"case", id}, {"run", k}, {"threads", threads},
+                                {"points", sm.pts.size()},
+                                {"metrics", nlohmann::json::parse(m.to_json())},
+                                {"digest", {{"heads", d.heads}, {"pillars", d.pillars},
+                                            {"bridges", d.bridges},
+                                            {"crossbridges", d.crossbridges},
+                                            {"diffbridges", d.diffbridges}}}};
+            out << j.dump() << '\n';
+            out.flush();
+            std::cout << j.dump() << std::endl;
+        };
+
+        const nlohmann::json repeats =
+            c.contains("repeats") ? c.at("repeats") : nlohmann::json::array({1, 0});
+        for (int k = 0; k < repeats.at(0).get<int>(); ++k)
+            run(k, hw_threads);
+
+        tbb::task_arena single(1);
+        for (int k = 0; k < repeats.at(1).get<int>(); ++k)
+            single.execute([&] { run(k, 1); });
     }
 }

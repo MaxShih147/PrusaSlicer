@@ -481,7 +481,8 @@ void log_route_record(const RouteRecord &rec)
        << " contacts=" << rec.contacts.size() << contact_points(rec.contacts);
 
     if (rec.level == RouteLevel::L2)
-        BOOST_LOG_TRIVIAL(warning) << "WARNING: fallback_intersection_retained " << os.str();
+        BOOST_LOG_TRIVIAL(warning) << "WARNING: " << FALLBACK_INTERSECTION_RETAINED << ' '
+                                   << os.str();
     else
         BOOST_LOG_TRIVIAL(info) << "clearance_relaxed " << os.str();
 }
@@ -501,6 +502,32 @@ void report_route_clearance(const ClearanceReport &report, const char *tree_name
                             << ", L2 " << report.l2 << ", none " << report.none
                             << ", centre pillar contacts recorded " << report.centroid.size()
                             << ", support point spacing " << report.native;
+}
+
+std::vector<TreeWarning> tree_warnings(const ClearanceReport             &report,
+                                       const std::function<int(long)> &head_slot)
+{
+    std::vector<TreeWarning> out;
+    for (const RouteRecord &rec : report.routes) {
+        if (rec.level != RouteLevel::L2)
+            continue;
+
+        TreeWarning w;
+        w.code  = FALLBACK_INTERSECTION_RETAINED;
+        w.head  = head_slot(rec.head);
+        w.route = route_kind_name(rec.kind);
+        // An L2 head is kept, so it is among the exported heads. Should one
+        // not be, its warning is left out rather than exported as head -1.
+        if (w.head < 0) {
+            BOOST_LOG_TRIVIAL(error) << FALLBACK_INTERSECTION_RETAINED << " head=" << rec.head
+                                     << " is not among the exported heads; warning left out";
+            continue;
+        }
+        for (const clearance::Contact &ct : rec.contacts)
+            w.contacts.push_back({ct.p_new, clearance::kind_name(ct.with), ct.dist, ct.radii});
+        out.push_back(std::move(w));
+    }
+    return out;
 }
 
 }} // namespace Slic3r::sla

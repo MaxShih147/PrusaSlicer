@@ -64,6 +64,7 @@ struct Contact
                                                            // (a bar: pillar_b if set, else pillar_a)
     size_t   cand = 0;       // index into the candidates handed to violations()
     size_t   with_index = 0; // index into ClearanceIndex::prims()
+    double   radii = 0.;     // r1 + r2: `required` without the clearance
 };
 
 // A shared pillar as the joint rule needs it: the axis in plan view and the

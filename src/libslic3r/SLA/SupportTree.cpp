@@ -61,9 +61,14 @@ indexed_triangle_set create_support_tree(const SupportableMesh &sm,
         using std::chrono::high_resolution_clock;
         auto start{high_resolution_clock::now()};
 
+        // What the clearance rules of the default tree could not keep apart;
+        // its L2 records go out with the elements as warnings.
+        ClearanceReport route_report;
+
         switch (sm.cfg.tree_type) {
         case SupportTreeType::Default: {
-            DefaultSupportTree::execute(*builder, sm, out_attached);
+            DefaultSupportTree::execute(*builder, sm, out_attached,
+                                        out_elements ? &route_report : nullptr);
             break;
         }
         case SupportTreeType::Branching: {
@@ -210,6 +215,8 @@ indexed_triangle_set create_support_tree(const SupportableMesh &sm,
             for (const Bridge &b : builder->bridges())      add_bridge(b, b.r);
             for (const Bridge &b : builder->crossbridges()) add_bridge(b, b.r);
             for (const DiffBridge &b : builder->diffbridges()) add_bridge(b, b.end_r);
+
+            out_elements->warnings = tree_warnings(route_report, head_at);
         }
 
         // The whole tree, frozen pillars included, for the pad to be grown from.

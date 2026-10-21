@@ -268,6 +268,9 @@ struct ClearanceReport
     size_t native = 0; // centre pillar contacts left out as support point spacing
 };
 
+// What an L2 record is logged and exported as (the `code` of a TreeWarning).
+inline constexpr const char *FALLBACK_INTERSECTION_RETAINED = "fallback_intersection_retained";
+
 // The log line of a record, written when it is made. L1 and centre pillars:
 // info; L2: warning, "WARNING: fallback_intersection_retained ...".
 void log_route_record(const RouteRecord &rec);
@@ -275,6 +278,16 @@ void log_centroid_record(const CentroidRecord &rec);
 
 // One line with the counts of the report, at the end of a tree.
 void report_route_clearance(const ClearanceReport &report, const char *tree_name);
+
+// The L2 records of `report`, in commit order, as the support-tree export
+// carries them (design.md decision 10). `head_slot` turns a head id into its
+// position in the exported heads. A contact's `required` is r1 + r2
+// (Contact::radii): the records list contacts at SAFETY_CLEARANCE, while L2
+// means even touching could not be avoided. L1 records and centre pillars are
+// not exported. A record whose head `head_slot` cannot place (-1) is left out
+// and logged as an error, never exported with head -1.
+std::vector<TreeWarning> tree_warnings(const ClearanceReport             &report,
+                                       const std::function<int(long)> &head_slot);
 
 }} // namespace Slic3r::sla
 

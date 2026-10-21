@@ -31,7 +31,19 @@ namespace Slic3r { namespace sla {
 //    "pedestals":[{"pos":[x,y,z],"height":1.0,"r_bottom":2.0,"r_top":0.5,
 //                  "pillar":3}],
 //    "bridges":[{"startp":[x,y,z],"endp":[x,y,z],"r":0.5,"end_r":0.5,
-//                "kind":"truss","reaches":7000,"a":1,"b":3}]}
+//                "kind":"truss","reaches":7000,"a":1,"b":3}],
+//    "warnings":[{"code":"fallback_intersection_retained","head":17,
+//                 "route":"to_pillar",
+//                 "contacts":[{"pos":[x,y,z],"with":"head_bar",
+//                              "dist":0.41,"required":1.0}]}]}
+//
+// "warnings" IS WRITTEN ONLY WHEN THERE IS ONE, and adding it did not change
+// the version: a reader that does not know it ignores it. Each is a head the
+// clearance rules routed at L2 (openspec change sla-head-bridge-clearance):
+// "head" is its position in "heads", "route" one of to_pillar, own_pillar,
+// ground_route, model_anchor; each contact is where the route comes within
+// "required" (the two radii) of something, "with" naming it: head_bar,
+// route_bar, prop_bar, pillar or pinhead; "dist" is between the two axes.
 //
 // OWNERSHIP is by position in these lists: a head's "pillar" is an index into
 // "pillars". The array subscript is the id, so nothing is spent carrying one.
@@ -177,6 +189,27 @@ inline std::string support_tree_to_string(const SupportTreeElements &els,
                           {"junctions", junctions},
                           {"pedestals", pedestals},
                           {"bridges", bridges}};
+
+    // Only when there is one: a tree with nothing to warn about has no key.
+    if (!els.warnings.empty()) {
+        nlohmann::json warnings = nlohmann::json::array();
+        for (const TreeWarning &w : els.warnings) {
+            nlohmann::json contacts = nlohmann::json::array();
+            for (const TreeWarningContact &c : w.contacts) {
+                nlohmann::json j = {{"pos", vec3(c.pos)},
+                                    {"with", c.with},
+                                    {"dist", c.dist},
+                                    {"required", c.required}};
+                contacts.push_back(std::move(j));
+            }
+            nlohmann::json j = {{"code", w.code},
+                                {"head", w.head},
+                                {"route", w.route},
+                                {"contacts", std::move(contacts)}};
+            warnings.push_back(std::move(j));
+        }
+        doc["warnings"] = std::move(warnings);
+    }
     // Compact: an automatic tree is hundreds of elements downloaded whole, and
     // indentation was about a third of the bytes.
     return doc.dump();
