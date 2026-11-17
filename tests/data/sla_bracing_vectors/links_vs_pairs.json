@@ -1,0 +1,20 @@
+{
+  "id": "links_vs_pairs",
+  "description": "A 30 mm, B 10 mm: both gain a pair, only B gains a link; B gives A no link, so the safety net skips it.",
+  "cfg": {"safety_clearance":0.2,"min_shared_angle_deg":20,"pair_cap":3,"max_link_distance":10,"min_pillar_distance":1,"rescue_height":15,"bridge_slope_deg":45,"ground_z":0,"base_height":1,"base_radius":2,"connection_mode":"dynamic"},
+  "pillars": [
+    {"id":0,"endpoint":[0,0,0.0],"height":30,"r":0.5,"links":0,"pairs":0,"frozen":false},
+    {"id":1,"endpoint":[5,0,0.0],"height":10,"r":0.5,"links":0,"pairs":0,"frozen":false}
+  ],
+  "bars": [],
+  "expect": {
+    "accepted": [
+      {"phase":"greedy","pair":[0,1],"bars_built":3}
+    ],
+    "rejected": [],
+    "pillars_after": [
+      {"id":0,"links":0,"pairs":1},
+      {"id":1,"links":1,"pairs":1}
+    ]
+  }
+}

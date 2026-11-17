@@ -451,6 +451,12 @@ set(SLIC3R_SOURCES
     SLA/ReprojectPointsOnMesh.hpp
     SLA/DefaultSupportTree.hpp
     SLA/DefaultSupportTree.cpp
+    SLA/BracingPlanner.hpp
+    SLA/BracingPlanner.cpp
+    SLA/BridgeClearance.hpp
+    SLA/BridgeClearance.cpp
+    SLA/RoutePlan.hpp
+    SLA/RoutePlan.cpp
     SLA/BranchingTreeSLA.hpp
     SLA/BranchingTreeSLA.cpp
     SLA/ZCorrection.hpp

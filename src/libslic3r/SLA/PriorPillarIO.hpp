@@ -3,6 +3,9 @@
 
 #include <libslic3r/SLA/SupportTree.hpp>
 #include <nlohmann/json.hpp>
+#include <algorithm>
+#include <cstdint>
+#include <limits>
 #include <string>
 
 namespace Slic3r { namespace sla {
@@ -14,10 +17,20 @@ namespace Slic3r { namespace sla {
 // but they are not the same thing, and only the pillar carries what bracing
 // needs (where it stands, how thick it is, how many links it already has).
 //
-// Shape:
-//   {"version":1,"pillars":[
+// Shape (version 1):
+//   {"version":1,"elevation":5.0,
+//    "attached_to":[{"prior_id":7,"links":1,"bridges":0,"pairs":2}],
+//    "pillars":[
 //     {"id":7,"endpoint":[x,y,z],"height":40.2,"r_start":0.5,
-//      "r_end":0.5,"links":0,"bridges":0}]}
+//      "r_end":0.5,"links":0,"bridges":0,"pairs":0}]}
+//
+// "elevation" and "attached_to" are written, never read.
+//
+// `pairs` counts the pillars one is braced to, a much shorter neighbour
+// included; it is what caps further bracing, while `links` stays the
+// structural count. It came later than the rest, so a list without it is
+// still read: its pairs are taken as its links. Every link is a pair, so a
+// list that says fewer pairs than links is lifted to links.
 //
 // `id` is the caller's handle, echoed nowhere by the engine and never
 // interpreted by it - it exists so the caller can be told what a new support
@@ -32,6 +45,23 @@ inline constexpr int prior_pillar_format_version = 1;
  * @param err human readable reason, cleared on success
  * @returns whether the document was accepted
  */
+namespace detail {
+
+// A pillar's pairs, or `links` when there is none to take. The key came after
+// links, so a list from before it has none; and a caller's null (what
+// JSON.stringify makes of NaN), negative number, fraction or string is taken
+// as none too, rather than throwing out of the parser or wrapping round to a
+// pillar that counts as braced to four billion others.
+inline unsigned read_pairs(const nlohmann::json &pj, unsigned links)
+{
+    const auto it = pj.find("pairs");
+    if (it == pj.end() || !it->is_number_unsigned()) return links;
+    const auto v = it->template get<std::uint64_t>();
+    return v > std::numeric_limits<unsigned>::max() ? links : unsigned(v);
+}
+
+} // namespace detail
+
 inline bool prior_pillars_from_string(const std::string &text,
                                       PriorPillars &out,
                                       std::string &err)
@@ -86,6 +116,7 @@ inline bool prior_pillars_from_string(const std::string &text,
         p.r_end   = pj.value("r_end", p.r_start);
         p.links   = unsigned(pj.value("links", 0));
         p.bridges = unsigned(pj.value("bridges", 0));
+        p.pairs   = std::max(detail::read_pairs(pj, p.links), p.links);
         parsed.push_back(p);
     }
 
@@ -112,6 +143,7 @@ inline std::string prior_pillars_to_string(const PriorPillars &pillars,
             {"r_end", p.r_end},
             {"links", p.links},
             {"bridges", p.bridges},
+            {"pairs", p.pairs},
         });
     }
     // How high the object sits above the plate for this configuration. It is a
@@ -120,13 +152,15 @@ inline std::string prior_pillars_to_string(const PriorPillars &pillars,
     // SLAPrintObject::get_elevation() so nobody has to reproduce the rule that
     // an enabled pad adds its wall thickness on top of the object elevation.
     // What this run braced to. The link counts are the ones those pillars carry
-    // NOW, so the caller can update its own copies before the next generation -
-    // stale counts make the engine keep bracing to a pillar that is full.
+    // NOW, pair counts too, so the caller can update its own copies before the
+    // next generation - stale counts make the engine keep bracing to a pillar
+    // that is full.
     nlohmann::json att = nlohmann::json::array();
     for (const PriorAttachment &a : attached) {
         att.push_back({{"prior_id", a.prior_id},
                        {"links", a.links},
-                       {"bridges", a.bridges}});
+                       {"bridges", a.bridges},
+                       {"pairs", a.pairs}});
     }
 
     nlohmann::json doc = {{"version", prior_pillar_format_version},

@@ -3,6 +3,7 @@
 
 #include <libslic3r/SLA/SupportTree.hpp>
 #include <nlohmann/json.hpp>
+#include <cassert>
 #include <string>
 
 namespace Slic3r { namespace sla {
@@ -25,12 +26,24 @@ namespace Slic3r { namespace sla {
 //    "heads":[{"pos":[x,y,z],"dir":[x,y,z],"r_pin":0.2,"r_back":0.5,
 //              "width":1.0,"penetration":0.2,"pillar":3}],
 //    "pillars":[{"endpt":[x,y,z],"height":40.2,"r_start":0.5,"r_end":0.5,
-//                "links":0,"bridges":0,"props":1,"head":4}],
+//                "links":0,"pairs":0,"bridges":0,"props":1,"head":4}],
 //    "junctions":[{"pos":[x,y,z],"r":0.5,"pillar":3}],
 //    "pedestals":[{"pos":[x,y,z],"height":1.0,"r_bottom":2.0,"r_top":0.5,
 //                  "pillar":3}],
 //    "bridges":[{"startp":[x,y,z],"endp":[x,y,z],"r":0.5,"end_r":0.5,
-//                "reaches":7000,"a":1,"b":3}]}
+//                "kind":"truss","reaches":7000,"a":1,"b":3}],
+//    "warnings":[{"code":"fallback_intersection_retained","head":17,
+//                 "route":"to_pillar",
+//                 "contacts":[{"pos":[x,y,z],"with":"head_bar",
+//                              "dist":0.41,"required":1.0}]}]}
+//
+// "warnings" IS WRITTEN ONLY WHEN THERE IS ONE, and adding it did not change
+// the version: a reader that does not know it ignores it. Each is a head the
+// clearance rules routed at L2 (openspec change sla-head-bridge-clearance):
+// "head" is its position in "heads", "route" one of to_pillar, own_pillar,
+// ground_route, model_anchor; each contact is where the route comes within
+// "required" (the two radii) of something, "with" naming it: head_bar,
+// route_bar, prop_bar, pillar or pinhead; "dist" is between the two axes.
 //
 // OWNERSHIP is by position in these lists: a head's "pillar" is an index into
 // "pillars". The array subscript is the id, so nothing is spent carrying one.
@@ -41,9 +54,20 @@ namespace Slic3r { namespace sla {
 // EVERY OWNERSHIP KEY IS OMITTED WHEN IT SAYS NOTHING (-1), and so is "end_r"
 // when it equals "r" and "reaches" when it is -1. A reader fills those in with
 // the documented defaults. On a plate of a few hundred supports this is most of
-// the document: the common bar is a plain {"startp","endp","r"}. The dump is
-// compact for the same reason - an automatic tree is downloaded whole, and
-// indentation was a third of its bytes.
+// the document: the common bar is a plain {"startp","endp","r","kind"}. The
+// dump is compact for the same reason - an automatic tree is downloaded whole,
+// and indentation was a third of its bytes.
+//
+// "kind" IS ALWAYS WRITTEN, one of "truss", "head", "prop", "route": what the
+// bar is for, set where the builder made it. An absent kind is not a default
+// but a legacy bar, which a reader keeps apart by the 3D clearance rule, so it
+// cannot be dropped the way the keys above are. Every builder function names
+// its kind; only a bar that somehow left it unset goes without (and a Debug
+// build stops there).
+//
+// "links" and "pairs" are always written. `links` is the structural count,
+// `pairs` how many pillars it is braced to at all, a much shorter neighbour
+// included; pairs >= links.
 //
 // `pillars` is index-aligned with the prior-pillar list reported alongside, so
 // the caller's handle for pillars[i] is that list's [i].id. One numbering, not
@@ -67,6 +91,19 @@ inline void put_owner(nlohmann::json &j, const char *key, int idx)
 {
     if (idx >= 0)
         j[key] = idx;
+}
+
+/// The exported name of a bar's kind; nullptr for unset, which has none.
+inline const char *kind_name(BridgeKind k)
+{
+    switch (k) {
+    case BridgeKind::truss: return "truss";
+    case BridgeKind::head:  return "head";
+    case BridgeKind::prop:  return "prop";
+    case BridgeKind::route: return "route";
+    case BridgeKind::unset: break;
+    }
+    return nullptr;
 }
 
 } // namespace detail
@@ -101,6 +138,7 @@ inline std::string support_tree_to_string(const SupportTreeElements &els,
                             {"r_start", p.r_start},
                             {"r_end", p.r_end},
                             {"links", p.links},
+                            {"pairs", p.pairs},
                             {"bridges", p.bridges}};
         detail::put_owner(j, "props", p.props);
         detail::put_owner(j, "head", p.head);
@@ -129,6 +167,10 @@ inline std::string support_tree_to_string(const SupportTreeElements &els,
         nlohmann::json j = {{"startp", vec3(b.startp)},
                             {"endp", vec3(b.endp)},
                             {"r", b.r}};
+        // Always, unlike the keys below: an absent kind means a legacy bar.
+        assert(b.kind != BridgeKind::unset);
+        if (const char *kind = detail::kind_name(b.kind))
+            j["kind"] = kind;
         // A bar tapers only when it joins two different radii; most do not, and
         // a reader takes end_r as r when it is absent.
         if (b.end_r != b.r)
@@ -147,6 +189,27 @@ inline std::string support_tree_to_string(const SupportTreeElements &els,
                           {"junctions", junctions},
                           {"pedestals", pedestals},
                           {"bridges", bridges}};
+
+    // Only when there is one: a tree with nothing to warn about has no key.
+    if (!els.warnings.empty()) {
+        nlohmann::json warnings = nlohmann::json::array();
+        for (const TreeWarning &w : els.warnings) {
+            nlohmann::json contacts = nlohmann::json::array();
+            for (const TreeWarningContact &c : w.contacts) {
+                nlohmann::json j = {{"pos", vec3(c.pos)},
+                                    {"with", c.with},
+                                    {"dist", c.dist},
+                                    {"required", c.required}};
+                contacts.push_back(std::move(j));
+            }
+            nlohmann::json j = {{"code", w.code},
+                                {"head", w.head},
+                                {"route", w.route},
+                                {"contacts", std::move(contacts)}};
+            warnings.push_back(std::move(j));
+        }
+        doc["warnings"] = std::move(warnings);
+    }
     // Compact: an automatic tree is hundreds of elements downloaded whole, and
     // indentation was about a third of the bytes.
     return doc.dump();

@@ -9,6 +9,7 @@
 #include <libslic3r/MeshNormals.hpp>
 #include <libslic3r/Execution/ExecutionTBB.hpp>
 #include <boost/log/trivial.hpp>
+#include <oneapi/tbb/task_arena.h>
 #include <cstdlib>
 #include <cmath>
 #include <functional>
@@ -59,7 +60,8 @@ DefaultSupportTree::DefaultSupportTree(SupportTreeBuilder &   builder,
 
 bool DefaultSupportTree::execute(SupportTreeBuilder    &builder,
                                 const SupportableMesh &sm,
-                                PriorAttachments      *out_attached)
+                                PriorAttachments      *out_attached,
+                                ClearanceReport       *out_clearance)
 {
     if(sm.pts.empty()) return false;
 
@@ -179,12 +181,16 @@ bool DefaultSupportTree::execute(SupportTreeBuilder    &builder,
     // counter, so one line covers the whole tree. Skipped on abort: the run was
     // cancelled, the numbers are partial, and the user is not waiting on a
     // diagnostic for work they just stopped.
-    if (pc != ABORT)
+    if (pc != ABORT) {
         report_penetration_failsafes(alg.m_penetration_stats,
                                      "Default support tree");
+        report_route_clearance(alg.m_clearance_report, "Default support tree");
+    }
 
     if (out_attached)
         *out_attached = alg.prior_attachments();
+    if (out_clearance)
+        *out_clearance = std::move(alg.m_clearance_report);
 
     return pc == ABORT;
 }
@@ -201,117 +207,70 @@ AABBMesh::hit_result DefaultSupportTree::pinhead_mesh_intersect(
 }
 
 AABBMesh::hit_result DefaultSupportTree::bridge_mesh_intersect(
-    const Vec3d &src, const Vec3d &dir, double r, double sd)
+    const Vec3d &src, const Vec3d &dir, double r, double sd) const
 {
     return sla::beam_mesh_hit(suptree_ex_policy, m_sm.emesh, {src, dir, r}, sd);
 }
 
-bool DefaultSupportTree::interconnect(const Pillar &pillar,
-                                     const Pillar &nextpillar)
+unsigned DefaultSupportTree::interconnect(const bracing::BuiltTruss &truss)
 {
-    // We need to get the starting point of the zig-zag pattern. We have to
-    // be aware that the two head junctions are at different heights. We
-    // may start from the lowest junction and call it a day but this
-    // strategy would leave unconnected a lot of pillar duos where the
-    // shorter pillar is too short to start a new bridge but the taller
-    // pillar could still be bridged with the shorter one.
-    bool was_connected = false;
+    // The planner has laid the zig-zag out (geom::truss_bars, the layout this
+    // function used to compute) and judged it bar by bar: against the model,
+    // through the callback built in interconnect_pillars(), and against every
+    // other bar. Here the bars that passed are written down, as truss
+    // crossbridges between the two pillars, each as thick as the thinner one.
+    // Groups the rescue or the safety net laid were judged bar by bar in 3D
+    // rather than by the plan rule; the bars say so.
+    const bool relaxed = truss.rescued || truss.fallback;
+    for (const bracing::Segment3 &bar : truss.bars)
+        m_builder.add_crossbridge_between(truss.a, truss.b, bar.a, bar.b, bar.r, relaxed,
+                                          truss.fallback);
 
-    Vec3d supper = pillar.startpoint();
-    Vec3d slower = nextpillar.startpoint();
-    Vec3d eupper = pillar.endpoint();
-    Vec3d elower = nextpillar.endpoint();
-
-    double zmin = ground_level(m_sm) + m_sm.cfg.base_height_mm;
-    eupper.z() = std::max(eupper.z(), zmin);
-    elower.z() = std::max(elower.z(), zmin);
-
-       // The usable length of both pillars should be positive
-    if(slower.z() - elower.z() < 0) return false;
-    if(supper.z() - eupper.z() < 0) return false;
-
-    double pillar_dist = distance(Vec2d{slower.x(), slower.y()},
-                                      Vec2d{supper.x(), supper.y()});
-    double bridge_distance = pillar_dist / std::cos(-m_sm.cfg.bridge_slope);
-    double zstep = pillar_dist * std::tan(-m_sm.cfg.bridge_slope);
-
-    if(pillar_dist < 2 * m_sm.cfg.head_back_radius_mm ||
-        pillar_dist > m_sm.cfg.max_pillar_link_distance_mm) return false;
-
-    if(supper.z() < slower.z()) supper.swap(slower);
-    if(eupper.z() < elower.z()) eupper.swap(elower);
-
-    double startz = 0, endz = 0;
-
-    startz = slower.z() - zstep < supper.z() ? slower.z() - zstep : slower.z();
-    endz = eupper.z() + zstep > elower.z() ? eupper.z() + zstep : eupper.z();
-
-    if(slower.z() - eupper.z() < std::abs(zstep)) {
-        // no space for even one cross
-
-           // Get max available space
-        startz = std::min(supper.z(), slower.z() - zstep);
-        endz = std::max(eupper.z() + zstep, elower.z());
-
-           // Align to center
-        double available_dist = (startz - endz);
-        double rounds = std::floor(available_dist / std::abs(zstep));
-        startz -= 0.5 * (available_dist - rounds * std::abs(zstep));
-    }
-
-    auto pcm = m_sm.cfg.pillar_connection_mode;
-    bool docrosses =
-        pcm == PillarConnectionMode::cross ||
-        (pcm == PillarConnectionMode::dynamic &&
-         pillar_dist > 2*m_sm.cfg.base_radius_mm);
-
-       // 'sj' means starting junction, 'ej' is the end junction of a bridge.
-       // They will be swapped in every iteration thus the zig-zag pattern.
-       // According to a config parameter, a second bridge may be added which
-       // results in a cross connection between the pillars.
-    Vec3d sj = supper, ej = slower; sj.z() = startz; ej.z() = sj.z() + zstep;
-
-       // TODO: This is a workaround to not have a faulty last bridge
-    while(ej.z() >= eupper.z() /*endz*/) {
-        if(bridge_mesh_distance(sj, dirv(sj, ej), pillar.r_start) >= bridge_distance)
-        {
-            m_builder.add_crossbridge_between(pillar.id, nextpillar.id, sj, ej, pillar.r_start);
-            was_connected = true;
-        }
-
-           // double bridging: (crosses)
-        if(docrosses) {
-            Vec3d sjback(ej.x(), ej.y(), sj.z());
-            Vec3d ejback(sj.x(), sj.y(), ej.z());
-            if (sjback.z() <= slower.z() && ejback.z() >= eupper.z() &&
-                bridge_mesh_distance(sjback, dirv(sjback, ejback),
-                                     pillar.r_start) >= bridge_distance) {
-                // need to check collision for the cross stick
-                m_builder.add_crossbridge_between(pillar.id, nextpillar.id, sjback, ejback, pillar.r_start);
-                was_connected = true;
-            }
-        }
-
-        sj.swap(ej);
-        ej.z() = sj.z() + zstep;
-    }
-
-    return was_connected;
+    return unsigned(truss.bars.size());
 }
 
-bool DefaultSupportTree::connect_to_nearpillar(const Head &head,
-                                                  long        nearpillar_id)
-{
-    auto nearpillar = [this, nearpillar_id]() -> const Pillar& {
-        return m_builder.pillar(nearpillar_id);
-    };
+namespace {
 
-    if (m_builder.bridgecount(nearpillar()) > m_sm.cfg.max_bridges_on_pillar)
-        return false;
+RoutePlan pillar_route(RoutePlan::Kind kind, PillarRecipe &&planned)
+{
+    RoutePlan plan;
+    plan.kind       = kind;
+    plan.new_pillar = planned.pillar;
+    plan.recipe     = std::move(planned.recipe);
+    return plan;
+}
+
+} // namespace
+
+DefaultSupportTree::RouteView DefaultSupportTree::route_view()
+{
+    RouteView view{m_builder, {}};
+    m_pillar_index.foreach([&view](const PointIndexEl &el) { view.feet.emplace_back(el); });
+    return view;
+}
+
+bool DefaultSupportTree::can_bridge_to(const SupportTreeBuilder &builder,
+                                       const Pillar             &pillar,
+                                       const Head               &head) const
+{
+    return sla::can_bridge_to(builder, pillar, head, m_sm.cfg.max_bridges_on_pillar);
+}
+
+std::optional<RoutePlan> DefaultSupportTree::plan_to_pillar(const SupportTreeBuilder &builder,
+                                                            const Head               &head,
+                                                            long nearpillar_id) const
+{
+    // Nothing is written while routes are planned, so the reference holds.
+    const Pillar &nearpillar = builder.pillar(nearpillar_id);
+
+    // First, as they cost nothing. A bridge count only grows, so a pillar
+    // that is full now is full at commit too, where this is asked again.
+    if (!can_bridge_to(builder, nearpillar, head))
+        return {};
 
     Vec3d headjp = head.junction_point();
-    Vec3d nearjp_u = nearpillar().startpoint();
-    Vec3d nearjp_l = nearpillar().endpoint();
+    Vec3d nearjp_u = nearpillar.startpoint();
+    Vec3d nearjp_l = nearpillar.endpoint();
 
     double r = head.r_back_mm;
     double d2d = distance(to_2d(headjp), to_2d(nearjp_u));
@@ -322,7 +281,13 @@ bool DefaultSupportTree::connect_to_nearpillar(const Head &head,
 
     Vec3d bridgestart = headjp;
     Vec3d bridgeend = nearjp_u;
-    double max_len = r * m_sm.cfg.max_bridge_length_mm / m_sm.cfg.head_back_radius_mm;
+    double max_len = bridge_reach(head);
+
+    // No bar from here reaches that pillar: both lengths tested below, d3d
+    // and D, run from the junction to the pillar's axis and are never shorter
+    // than d2d. Most pillars of a model fail here, before any mesh test.
+    if (d2d > max_len) return {};
+
     // This head's own bracing angle. Most heads in a cluster reach the ground
     // through this bridge rather than through their own pillar, so leaving the
     // global value here would make a custom angle do nothing for every head
@@ -344,73 +309,154 @@ bool DefaultSupportTree::connect_to_nearpillar(const Head &head,
             Zdown -= zdiff;
             bridgestart.z() -= zdiff;
             touchjp.z() = Zdown;
-
-            double t = bridge_mesh_distance(headjp, DOWN, r);
-
-               // We can't insert a pillar under the source head to connect
-               // with the nearby pillar's starting junction
-            if(t < zdiff) return false;
         }
 
         if(Zdown <= nearjp_u.z() && Zdown >= nearjp_l.z() && D < max_len)
             bridgeend.z() = Zdown;
         else
-            return false;
+            return {};
     }
 
        // There will be a minimum distance from the ground where the
        // bridge is allowed to connect. This is an empiric value.
     double minz = ground_level(m_sm) + 4 * head.r_back_mm;
-    if(bridgeend.z() < minz) return false;
+    if(bridgeend.z() < minz) return {};
+
+    // The mesh last, as it costs the most. Every test here only turns the
+    // pillar down, so their order does not change which pillars pass.
+
+       // We can't insert a pillar under the source head to connect
+       // with the nearby pillar's starting junction
+    if(zdiff > 0 && bridge_mesh_distance(headjp, DOWN, r) < zdiff) return {};
 
     double t = bridge_mesh_distance(bridgestart, dirv(bridgestart, bridgeend), r);
 
        // Cannot insert the bridge. (further search might not worth the hassle)
-    if(t < distance(bridgestart, bridgeend)) return false;
+    if(t < distance(bridgestart, bridgeend)) return {};
 
-    std::lock_guard lk(m_bridge_mutex);
+    RoutePlan plan;
+    plan.kind          = RoutePlan::Kind::to_pillar;
+    plan.target_pillar = nearpillar_id;
 
-    if (m_builder.bridgecount(nearpillar()) < m_sm.cfg.max_bridges_on_pillar) {
-        // A partial pillar is needed under the starting head.
-        if(zdiff > 0) {
-            // A partial pillar is needed under the starting head. It is this
-            // head's own, and the bar then runs from ITS top across to the near
-            // pillar - so both ends of that bar have an owner, and the head has
-            // a pillar to be grouped with.
-            const long own = m_builder.add_pillar(head.id, headjp.z() - bridgestart.z());
-            const size_t first_junction = m_builder.junctioncount();
-            m_builder.add_junction(bridgestart, r);
-            m_builder.own_junctions_from(first_junction, own);
-            m_builder.add_bridge_between(nearpillar_id, bridgestart, bridgeend, r, own);
-        } else {
-            m_builder.add_bridge_to_pillar(head.id, bridgeend, nearpillar_id);
-        }
+    BuildRecipe &recipe = plan.recipe;
+    if(zdiff > 0) {
+        // A partial pillar is needed under the starting head. It is this
+        // head's own, and the bar then runs from ITS top across to the near
+        // pillar - so both ends of that bar have an owner, and the head has
+        // a pillar to be grouped with.
+        const long own = recipe.add_pillar(head.id, headjp.z() - bridgestart.z());
+        const size_t first_junction = recipe.junctioncount();
+        recipe.add_junction(bridgestart, r);
+        recipe.own_junctions_from(first_junction, own);
+        recipe.add_bridge_between(nearpillar_id, bridgestart, bridgeend, r,
+                                  BridgeKind::head, own);
+    } else {
+        recipe.add_bridge_to_pillar(head.id, bridgeend, nearpillar_id);
+    }
 
-        m_builder.increment_bridges(nearpillar());
-        note_prior_attachment(nearpillar_id);
-    } else return false;
+    recipe.increment_bridges(nearpillar_id);
 
-    return true;
+    return plan;
 }
 
-bool DefaultSupportTree::create_ground_pillar(const Junction &hjp,
-                                             const Vec3d &sourcedir,
-                                             long         head_id)
+std::optional<RoutePlan> DefaultSupportTree::plan_ground_pillar(const Junction &hjp,
+                                                                const Vec3d    &sourcedir,
+                                                                long            head_id) const
 {
-    auto [ret, pillar_id] = sla::create_ground_pillar(suptree_ex_policy,
-                                                      m_builder,
-                                                      m_sm,
-                                                      hjp.pos,
-                                                      sourcedir,
-                                                      hjp.r,
-                                                      hjp.r,
-                                                      head_id);
+    std::optional<PillarRecipe> planned = sla::plan_ground_pillar(suptree_ex_policy,
+                                                                  m_sm,
+                                                                  hjp.pos,
+                                                                  sourcedir,
+                                                                  hjp.r,
+                                                                  hjp.r,
+                                                                  head_id);
+    if (!planned)
+        return {};
 
-    if (pillar_id >= 0) // Save the pillar endpoint in the spatial index
-        m_pillar_index.guarded_insert(m_builder.pillar(pillar_id).endpt,
-                                      unsigned(pillar_id));
+    return pillar_route(RoutePlan::Kind::own_pillar, std::move(*planned));
+}
 
-    return ret;
+long DefaultSupportTree::create_center_pillar(const Head &head)
+{
+    std::optional<RoutePlan> plan = plan_ground_pillar(head.junction(), head.dir, head.id);
+    if (!plan)
+        return SupportTreeNode::ID_UNSET;
+
+    // Judged before it goes in, against the heads and what the centres before
+    // it made; where it is built does not depend on the outcome.
+    plan->prims = route_prims(plan->recipe, head);
+    const auto pinhead = m_pinhead_prims.find(head.id);
+    assert(pinhead != m_pinhead_prims.end());
+    const std::vector<clearance::Contact> contacts =
+        centroid_contacts(plan->prims, m_clearance.prims()[pinhead->second], m_clearance,
+                          [this](long id) { return pillar_axis(id); },
+                          m_clearance_report.native);
+
+    const long pillar_id = commit(*plan, head.id);
+
+    for (const clearance::Contact &ct : contacts) {
+        m_clearance_report.centroid.push_back({pillar_id, ct});
+        log_centroid_record(m_clearance_report.centroid.back());
+    }
+
+    return pillar_id;
+}
+
+RouteList DefaultSupportTree::route_list(const HeadRoutes &routes)
+{
+    RouteList list;
+    list.reserve(routes.to_pillar.size() + routes.fallback.size());
+    for (const RoutePlan &p : routes.to_pillar)
+        list.push_back(&p);
+    if (routes.fallback_shown)
+        for (const RoutePlan &p : routes.fallback)
+            list.push_back(&p);
+    return list;
+}
+
+clearance::JointAxis DefaultSupportTree::pillar_axis(long pillar_id) const
+{
+    // Only pillars that are built: the ids of a plan not yet committed are
+    // its own, and nothing committed shares them.
+    assert(!BuildRecipe::is_local(pillar_id));
+    const Pillar &p = m_builder.pillar(pillar_id);
+    return {Vec2d{p.endpt.x(), p.endpt.y()}, std::max(p.r_start, p.r_end)};
+}
+
+long DefaultSupportTree::commit(const RoutePlan &plan, long head_id)
+{
+    const RecipeIds ids = replay(m_builder, plan.recipe);
+
+    long pillar_id = SupportTreeNode::ID_UNSET;
+    if (plan.new_pillar != SupportTreeNode::ID_UNSET) {
+        // Save the pillar endpoint in the spatial index
+        pillar_id = ids.pillar(plan.new_pillar);
+        m_pillar_index.insert(m_builder.pillar(pillar_id).endpt, unsigned(pillar_id));
+    }
+
+    // What the route made goes into the clearance index, under the builder's
+    // ids, and the head learns which pillar carries it: the one it sits on,
+    // else the one its bar reaches (as the support-tree export names it).
+    std::vector<clearance::Prim> prims = plan.prims;
+    to_builder_ids(prims, ids);
+    for (const clearance::Prim &p : prims)
+        m_clearance.insert(p);
+
+    const long sits_on = std::as_const(m_builder).head(unsigned(head_id)).pillar_id;
+    const long carrier = sits_on >= 0 ? sits_on :
+                         plan.kind == RoutePlan::Kind::to_pillar ? plan.target_pillar :
+                                                                   pillar_id;
+    if (const auto it = m_pinhead_prims.find(head_id); it != m_pinhead_prims.end())
+        m_clearance.set_carrier(it->second, carrier);
+
+    if (plan.kind == RoutePlan::Kind::to_pillar)
+        note_prior_attachment(plan.target_pillar);
+
+    m_penetration_stats.ray_misses += plan.ray_misses;
+    if (plan.negative_anchor_width)
+        BOOST_LOG_TRIVIAL(warning) << "Pinhead width is negative!";
+
+    return pillar_id;
 }
 
 void DefaultSupportTree::add_pinheads()
@@ -693,12 +739,23 @@ void DefaultSupportTree::classify()
 
     m_pillar_clusters = cluster(ground_head_indices, pointfn, predicate,
                                 m_sm.cfg.max_bridges_on_pillar);
+
+    // Every head that is left is in the way of every route from here on,
+    // routed or not. Which pillar carries it is named once it is routed.
+    for (const Head &head : m_builder.heads()) {
+        if (!head.is_valid())
+            continue;
+        clearance::Prim p;
+        p.cap     = clearance::pinhead_capsule(head.pos, head.junction_point(), head.r_back_mm);
+        p.kind    = clearance::PrimKind::pinhead;
+        p.head_id = head.id;
+        m_pinhead_prims[head.id] = m_clearance.insert(p);
+    }
 }
 
 void DefaultSupportTree::routing_to_ground()
 {
-    ClusterEl cl_centroids;
-    cl_centroids.reserve(m_pillar_clusters.size());
+    std::vector<RouteJob> jobs;
 
     for (auto &cl : m_pillar_clusters) {
         m_thr();
@@ -727,80 +784,76 @@ void DefaultSupportTree::routing_to_ground()
         assert(lcid >= 0);
         unsigned hid = cl[size_t(lcid)]; // Head ID
 
-        cl_centroids.emplace_back(hid);
+        const Head &h = std::as_const(m_builder).head(hid);
 
-        Head &h = m_builder.head(hid);
-
-        if (!create_ground_pillar(h.junction(), h.dir, h.id)) {
+        // The centre pillar is kept as it is made. It used to be looked up
+        // later as the pillar nearest the centre head, which is some other
+        // pillar whenever this one could not be made.
+        const long center = create_center_pillar(h);
+        if (center < 0) {
             BOOST_LOG_TRIVIAL(warning)
                 << "Pillar cannot be created for support point id: " << hid;
             m_iheads_onmodel.emplace_back(h.id);
-            continue;
         }
+
+        // The other heads of the cluster go to the centre pillar, else to
+        // another pillar nearby, else down on a pillar of their own.
+        for (unsigned c : cl)
+            if (c != hid)
+                jobs.push_back({c, center});
     }
 
-    // now we will go through the clusters ones again and connect the
-    // sidepoints with the cluster centroid (which is a ground pillar)
-    // or a nearby pillar if the centroid is unreachable.
-    size_t ci = 0;
-    for (const std::vector<unsigned> &cl : m_pillar_clusters) {
-        m_thr();
-
-        auto cidx = cl_centroids[ci++];
-
-        auto q = m_pillar_index.query(m_builder.head(cidx).junction_point(), 1);
-        if (!q.empty()) {
-            long centerpillarID = q.front().second;
-            for (auto c : cl) {
-                m_thr();
-                if (c == cidx) continue;
-
-                auto &sidehead = m_builder.head(c);
-
-                if (!connect_to_nearpillar(sidehead, centerpillarID) &&
-                    !search_pillar_and_connect(sidehead)) {
-                    // Vec3d pend = Vec3d{pstart.x(), pstart.y(), gndlvl};
-                    // Could not find a pillar, create one
-                    create_ground_pillar(sidehead.junction(), sidehead.dir, sidehead.id);
-                }
-            }
-        }
-    }
+    const RouteCounts counts = route_heads(RouteStep::ground, std::move(jobs));
+    BOOST_LOG_TRIVIAL(info) << "Routing to ground: " << counts.routed << " heads routed, "
+                            << counts.recomputed << " planned again, " << counts.unrouted
+                            << " without a route";
 }
 
-bool DefaultSupportTree::connect_to_ground(Head &head)
+namespace {
+
+std::optional<RoutePlan> ground_route(const Head &head, std::optional<PillarRecipe> &&planned)
 {
-    auto [ret, pillar_id] = sla::search_ground_route(suptree_ex_policy,
-                                                     m_builder, m_sm,
-                                                     {head.junction_point(),
-                                                      head.r_back_mm},
-                                                     head.r_back_mm,
-                                                     head.dir,
-                                                     head.id);
+    if (!planned)
+        return {};
 
-    if (pillar_id >= 0) {
-        // Save the pillar endpoint in the spatial index
-        m_pillar_index.guarded_insert(m_builder.pillar(pillar_id).endpt,
-                                      unsigned(pillar_id));
-
-        head.pillar_id = pillar_id;
-    }
-
-    return ret;
+    planned->recipe.set_head_pillar(head.id, planned->pillar);
+    return pillar_route(RoutePlan::Kind::ground_route, std::move(*planned));
 }
 
-bool DefaultSupportTree::connect_to_model_body(Head &head)
+} // namespace
+
+std::optional<RoutePlan> DefaultSupportTree::plan_ground_route(const Head &head) const
 {
-    if (head.id <= SupportTreeNode::ID_UNSET) return false;
+    return ground_route(head, sla::plan_connect_to_ground(suptree_ex_policy, m_sm,
+                                                          {head.junction_point(),
+                                                           head.r_back_mm},
+                                                          head.dir,
+                                                          head.r_back_mm,
+                                                          head.id));
+}
+
+std::optional<RoutePlan> DefaultSupportTree::plan_ground_detour(const Head &head) const
+{
+    return ground_route(head, sla::plan_ground_detour(suptree_ex_policy, m_sm,
+                                                      {head.junction_point(),
+                                                       head.r_back_mm},
+                                                      head.r_back_mm,
+                                                      head.dir,
+                                                      head.id));
+}
+
+std::optional<RoutePlan> DefaultSupportTree::plan_model_anchor(const Head &head) const
+{
+    if (head.id <= SupportTreeNode::ID_UNSET) return {};
 
     auto it = m_head_to_ground_scans.find(unsigned(head.id));
-    if (it == m_head_to_ground_scans.end()) return false;
+    if (it == m_head_to_ground_scans.end()) return {};
 
     auto &hit = it->second;
 
     if (!hit.is_hit()) {
         // TODO scan for potential anchor points on model surface
-        return false;
+        return {};
     }
 
     Vec3d hjp = head.junction_point();
@@ -815,7 +868,7 @@ bool DefaultSupportTree::connect_to_model_body(Head &head)
     // "Mini" is relative to the radius this point asked for, not the global one.
     if (head.r_back_mm < resolved_head_back_radius_mm(m_sm, head.id))
         h = std::max(h, 0.);
-    else if (h <= 0.) return false;
+    else if (h <= 0.) return {};
 
     Vec3d endp{hjp.x(), hjp.y(), hjp.z() - hit.distance() + h};
     auto center_hit = m_sm.emesh.query_ray_hit(hjp, DOWN);
@@ -824,8 +877,9 @@ bool DefaultSupportTree::connect_to_model_body(Head &head)
     Vec3d hitp = std::abs(hitdiff) < 2*head.r_back_mm?
                      center_hit.position() : hit.position();
 
-    long pillar_id = m_builder.add_pillar(head.id, hjp.z() - endp.z());
-    Pillar &pill = m_builder.pillar(pillar_id);
+    RoutePlan plan;
+    plan.kind       = RoutePlan::Kind::model_anchor;
+    plan.new_pillar = plan.recipe.add_pillar(head.id, hjp.z() - endp.z());
 
     // Direction of the anchor pin, pointing from the model surface up towards
     // the pillar end. Head stores this vector verbatim and multiplies by it in
@@ -862,62 +916,213 @@ bool DefaultSupportTree::connect_to_model_body(Head &head)
     // Handing add_anchor() a clamped penetration together with a `w` sized for
     // the configured one would leave the anchor's length disagreeing with its
     // bite by exactly the amount that was trimmed.
+    //
+    // A miss is counted with the plan and added on commit: planning writes
+    // nothing shared, and an anchor never committed has nothing to report.
+    PenetrationClampStats stats;
     const double anchor_penetration =
         clamped_head_penetration(m_sm.emesh, hitp, taildir,
                                  resolved_head_penetration_mm(m_sm, head.id),
-                                 &m_penetration_stats);
+                                 &stats);
+    plan.ray_misses = stats.ray_misses.load();
 
     double dist = (hitp - endp).norm() + anchor_penetration;
     double w = dist - 2 * head.r_pin_mm - head.r_back_mm;
 
     if (w < 0.) {
-        BOOST_LOG_TRIVIAL(warning) << "Pinhead width is negative!";
+        plan.negative_anchor_width = true; // "Pinhead width is negative!" on commit
         w = 0.;
     }
 
-    m_builder.add_anchor(head.r_back_mm, head.r_pin_mm, w,
-                         anchor_penetration, taildir, hitp);
+    plan.recipe.add_anchor(head.r_back_mm, head.r_pin_mm, w,
+                           anchor_penetration, taildir, hitp);
 
-    m_pillar_index.guarded_insert(pill.endpoint(), pill.id);
-
-    return true;
+    return plan;
 }
 
-bool DefaultSupportTree::search_pillar_and_connect(const Head &source)
+void DefaultSupportTree::plan_near_pillars(const RouteView        &view,
+                                           const Head             &head,
+                                           long                    skip,
+                                           size_t                  limit,
+                                           std::vector<RoutePlan> &out) const
 {
-    // Hope that a local copy takes less time than the whole search loop.
-    // We also need to remove elements progressively from the copied index.
-    PointIndex spindex = m_pillar_index.guarded_clone();
+    // Pillars by the distance of their feet from the ground under the
+    // junction, as the nearest neighbour search always took it.
+    const Vec3d jp = head.junction_point();
+    const Vec3d qp(jp.x(), jp.y(), ground_level(m_sm));
 
-    long nearest_id = SupportTreeNode::ID_UNSET;
+    // Only the pillars within the head's reach in plan view: plan_to_pillar()
+    // turns the others down on the same test. A pillar's foot is under its top.
+    const double reach = bridge_reach(head);
 
-    Vec3d querypt = source.junction_point();
+    std::vector<NearPillar> near;
+    near.reserve(view.feet.size());
+    const size_t pillarcount = view.builder.pillarcount();
+    for (const PointIndexEl &el : view.feet) {
+        const long id = long(el.second);
+        if (id != skip && size_t(id) < pillarcount &&
+            !(distance(to_2d(jp), to_2d(el.first)) > reach))
+            near.push_back({(el.first - qp).squaredNorm(), id});
+    }
 
-    while(nearest_id < 0 && !spindex.empty()) { m_thr();
-        // loop until a suitable head is not found
-        // if there is a pillar closer than the cluster center
-        // (this may happen as the clustering is not perfect)
-        // than we will bridge to this closer pillar
+    // Sorted by nearer(), a total order: the same pillars come in the same
+    // order, however the index lists them. A growing slice at a time: most
+    // heads find their pillars among the first few.
+    size_t next = 0;
+    for (size_t slice = 16; out.size() < limit && next < near.size(); slice *= 2) {
+        const size_t upto = std::min(near.size(), next + slice);
+        std::partial_sort(near.begin() + next, near.begin() + upto, near.end(), nearer);
 
-        Vec3d qp(querypt.x(), querypt.y(), ground_level(m_sm));
-        auto qres = spindex.nearest(qp, 1);
-        if(qres.empty()) break;
+        for (; next < upto && out.size() < limit; ++next) {
+            m_thr();
+            if (std::optional<RoutePlan> p = plan_to_pillar(view.builder, head, near[next].id))
+                out.emplace_back(std::move(*p));
+        }
+    }
+}
 
-        auto ne = qres.front();
-        nearest_id = ne.second;
+void DefaultSupportTree::plan_routes(RouteStep        step,
+                                     const RouteView &view,
+                                     const Head      &head,
+                                     long             center,
+                                     bool             recompute,
+                                     HeadRoutes      &routes) const
+{
+    routes.to_pillar.clear();
+    if (center >= 0)
+        if (std::optional<RoutePlan> p = plan_to_pillar(view.builder, head, center))
+            routes.to_pillar.emplace_back(std::move(*p));
+    plan_near_pillars(view, head, center, ROUTE_PILLAR_CANDIDATES, routes.to_pillar);
+    for (RoutePlan &p : routes.to_pillar)
+        p.prims = route_prims(p.recipe, head);
 
-        if(nearest_id >= 0) {
-            if (size_t(nearest_id) < m_builder.pillarcount()) {
-                if(!connect_to_nearpillar(source, nearest_id) ||
-                    m_builder.pillar(nearest_id).r_start < source.r_back_mm) {
-                    nearest_id = SupportTreeNode::ID_UNSET;    // continue searching
-                    spindex.remove(ne);       // without the current pillar
-                }
+    // The fallbacks cost the most, and the old flow only got to them with no
+    // pillar in reach.
+    if (!recompute && !routes.to_pillar.empty())
+        return;
+    routes.fallback_shown = true;
+    if (!routes.fallback_planned)
+        plan_fallbacks(step, head, routes);
+}
+
+void DefaultSupportTree::plan_fallbacks(RouteStep step, const Head &head, HeadRoutes &routes) const
+{
+    routes.fallback_planned = true;
+
+    auto add = [&routes, &head](std::optional<RoutePlan> &&p) {
+        if (!p) return;
+        p->prims = route_prims(p->recipe, head);
+        routes.fallback.emplace_back(std::move(*p));
+    };
+
+    if (step == RouteStep::ground) {
+        add(plan_ground_pillar(head.junction(), head.dir, head.id));
+    } else {
+        std::optional<RoutePlan> route = plan_ground_route(head);
+        if (!route)
+            route = plan_ground_detour(head);
+        add(std::move(route));
+        // No route to the ground, so connect to the model body as a last resort
+        add(plan_model_anchor(head));
+    }
+}
+
+DefaultSupportTree::RouteCounts DefaultSupportTree::route_heads(RouteStep             step,
+                                                                std::vector<RouteJob> jobs)
+{
+    std::sort(jobs.begin(), jobs.end(),
+              [](const RouteJob &a, const RouteJob &b) { return a.head < b.head; });
+
+    // Phase one: every head at once, against the state the step starts from.
+    // Each writes its own slot and nothing else. Each is planned in isolation:
+    // a thread waiting for the parallel mesh tests inside a detour search then
+    // takes no other head's planning meanwhile, whose own search would draw
+    // from the same per thread random state (see sla::plan_ground_detour()).
+    //
+    // A head whose every pillar candidate is too close already to what is
+    // built when the step starts is too close at commit too, but for the
+    // rare joint a head's carrier clips away later: what is built only grows.
+    // It is bound to plan again on one thread, so its fallbacks -
+    // the dear part, a detour search among them - are planned here, in
+    // parallel. They stay hidden until that recompute shows them, so which
+    // route is chosen does not change.
+    const clearance::PillarAxisFn axis_of = [this](long id) { return pillar_axis(id); };
+    std::vector<HeadRoutes> routes(jobs.size());
+    {
+        const RouteView view = route_view();
+        auto too_close = [this, &axis_of](const RoutePlan &p) {
+            return !m_clearance.violations(p.prims, clearance::SAFETY_CLEARANCE, axis_of).empty();
+        };
+        execution::for_each(
+            suptree_ex_policy, size_t(0), jobs.size(),
+            [this, step, &view, &jobs, &routes, &too_close](size_t i) {
+                m_thr();
+                tbb::this_task_arena::isolate([&] {
+                    const Head &head = view.builder.head(jobs[i].head);
+                    HeadRoutes &r    = routes[i];
+                    plan_routes(step, view, head, jobs[i].center, false, r);
+                    if (!r.fallback_planned &&
+                        std::all_of(r.to_pillar.begin(), r.to_pillar.end(), too_close))
+                        plan_fallbacks(step, head, r);
+                });
+            },
+            execution::max_concurrency(suptree_ex_policy));
+    }
+
+    // Phase two: one head after the other, smallest id first, each committing
+    // one route whole, the one select_route() picks on what is built now. A
+    // head none of whose candidates keeps the clearance plans once more,
+    // against what is there now - the pillars the heads before it made
+    // included - and with its fallbacks shown, planned now unless phase one
+    // planned them already.
+    RouteCounts counts;
+    for (size_t i = 0; i < jobs.size(); ++i) {
+        m_thr();
+
+        const Head &head = std::as_const(m_builder).head(jobs[i].head);
+
+        // The rules no level relaxes (design.md decision 8). The bridge cap
+        // is asked here, on the counts the routes before this one left.
+        auto hard_ok = [this, &head](const RoutePlan &p) {
+            return hard_rules_ok(m_builder, p, head, m_sm.cfg.max_bridges_on_pillar);
+        };
+        auto recompute = [&, i] {
+            plan_routes(step, route_view(), head, jobs[i].center, true, routes[i]);
+            return route_list(routes[i]);
+        };
+
+        const RouteChoice choice = select_route(route_list(routes[i]), m_clearance, axis_of,
+                                                hard_ok, recompute);
+        counts.recomputed += choice.recomputed;
+
+        if (choice.plan) {
+            commit(*choice.plan, head.id);
+            ++counts.routed;
+
+            if (choice.level != RouteLevel::L0) {
+                ++(choice.level == RouteLevel::L1 ? m_clearance_report.l1 :
+                                                    m_clearance_report.l2);
+                m_clearance_report.routes.push_back(
+                    {head.id, choice.plan->kind, choice.level, choice.contacts});
+                log_route_record(m_clearance_report.routes.back());
             }
+            continue;
+        }
+
+        ++counts.unrouted;
+        ++m_clearance_report.none;
+
+        // A ground facing head with no route is left as it was, a model
+        // facing one is dropped: both as they always were.
+        if (step == RouteStep::model) {
+            BOOST_LOG_TRIVIAL(warning)
+                << "Failed to route model facing support point. ID: " << jobs[i].head;
+
+            m_builder.head(jobs[i].head).invalidate();
         }
     }
 
-    return nearest_id >= 0;
+    return counts;
 }
 
 void DefaultSupportTree::routing_to_model()
@@ -925,31 +1130,18 @@ void DefaultSupportTree::routing_to_model()
     // We need to check if there is an easy way out to the bed surface.
     // If it can be routed there with a bridge shorter than
     // min_bridge_distance.
+    //
+    // Each head: a nearby pillar, else a route to the ground, else an anchor
+    // on the model body.
+    std::vector<RouteJob> jobs;
+    jobs.reserve(m_iheads_onmodel.size());
+    for (unsigned idx : m_iheads_onmodel)
+        jobs.push_back({idx, SupportTreeNode::ID_UNSET});
 
-    execution::for_each(
-        suptree_ex_policy, m_iheads_onmodel.begin(), m_iheads_onmodel.end(),
-        [this](const unsigned idx) {
-            m_thr();
-
-            auto &head = m_builder.head(idx);
-
-            // Search nearby pillar
-            if (search_pillar_and_connect(head)) { return; }
-
-            // Cannot connect to nearby pillar. We will try to search for
-            // a route to the ground.
-            if (connect_to_ground(head)) { return; }
-
-            // No route to the ground, so connect to the model body as a last resort
-            if (connect_to_model_body(head)) { return; }
-
-            // We have failed to route this head.
-            BOOST_LOG_TRIVIAL(warning)
-                << "Failed to route model facing support point. ID: " << idx;
-
-            head.invalidate();
-        },
-        execution::max_concurrency(suptree_ex_policy));
+    const RouteCounts counts = route_heads(RouteStep::model, std::move(jobs));
+    BOOST_LOG_TRIVIAL(info) << "Routing to model: " << counts.routed << " heads routed, "
+                            << counts.recomputed << " planned again, " << counts.unrouted
+                            << " without a route";
 }
 
 void DefaultSupportTree::adopt_prior_pillars()
@@ -960,8 +1152,16 @@ void DefaultSupportTree::adopt_prior_pillars()
     for (const PriorPillar &pp : m_sm.prior) {
         long pid = m_builder.add_frozen_pillar(pp.endpoint, pp.height,
                                                pp.r_start, pp.r_end,
-                                               pp.links, pp.bridges);
+                                               pp.links, pp.bridges, pp.pairs);
         m_pillar_index.insert(m_builder.pillar(pid).endpoint(), unsigned(pid));
+
+        // Only the pillar: the bars it came with are not handed in.
+        clearance::Prim p;
+        p.cap      = clearance::pillar_capsule(pp.endpoint, pp.height, pp.r_start, pp.r_end);
+        p.kind     = clearance::PrimKind::pillar;
+        p.pillar_a = pid;
+        m_clearance.insert(p);
+
         m_prior_pillar_ids.push_back(pid);
         m_prior_caller_ids[pid] = pp.id;
     }
@@ -984,7 +1184,7 @@ PriorAttachments DefaultSupportTree::prior_attachments() const
         if (it == m_prior_caller_ids.end())
             continue;
         const Pillar &p = m_builder.pillar(pid);
-        out.push_back(PriorAttachment{it->second, p.links, p.bridges});
+        out.push_back(PriorAttachment{it->second, p.links, p.bridges, p.pairs});
     }
     return out;
 }
@@ -993,102 +1193,108 @@ void DefaultSupportTree::interconnect_pillars()
 {
     // Now comes the algorithm that connects pillars with each other.
     // Ideally every pillar should be connected with at least one of its
-    // neighbors if that neighbor is within max_pillar_link_distance
+    // neighbors if that neighbor is within max_pillar_link_distance.
+    //
+    // Which pairs get braced is decided by the BracingPlanner: every candidate
+    // pair at once, shortest first, so a near neighbour is braced before a far
+    // one can reach over it; no two groups may cross or crowd each other in
+    // plan view, none may pass a third pillar, and every bar keeps its distance
+    // from the bars already there. See BracingPlanner.hpp and openspec change
+    // sla-bracing-planar-topology.
 
     // Pillars with height exceeding H1 will require at least one neighbor
     // to connect with. Height exceeding H2 require two neighbors.
     double H1 = m_sm.cfg.max_solo_pillar_height_mm;
     double H2 = m_sm.cfg.max_dual_pillar_height_mm;
-    double d = m_sm.cfg.max_pillar_link_distance_mm;
 
-    // A connection between two pillars only counts if the height ratio is
-    // bigger than 50%
-    double min_height_ratio = 0.5;
+    using namespace bracing;
 
-    std::set<unsigned long> pairs;
+    // The planner is pure geometry and does not see SupportTreeConfig; the pair
+    // cap it was given must still be the count the legacy cascade used.
+    static_assert(PAIR_CAP == SupportTreeConfig::pillar_cascade_neighbors,
+                  "PAIR_CAP must match legacy cascade neighbor count");
 
-    // A function to connect one pillar with its neighbors. THe number of
-    // neighbors is given in the configuration. This function if called
-    // for every pillar in the pillar index. A pair of pillar will not
-    // be connected multiple times this is ensured by the 'pairs' set which
-    // remembers the processed pillar pairs
-    auto cascadefn =
-        [this, d, &pairs, min_height_ratio, H1] (const PointIndexEl& el)
-    {
-        Vec3d qp = el.first;    // endpoint of the pillar
+    PlannerConfig pc;
+    pc.solo_height         = H1;
+    pc.max_link_distance   = m_sm.cfg.max_pillar_link_distance_mm;
+    pc.min_pillar_distance = 2 * m_sm.cfg.head_back_radius_mm;
+    pc.truss.bridge_slope_rad = m_sm.cfg.bridge_slope;
+    pc.truss.ground_z         = ground_level(m_sm);
+    pc.truss.base_height      = m_sm.cfg.base_height_mm;
+    pc.truss.base_radius      = m_sm.cfg.base_radius_mm;
+    pc.truss.mode             = m_sm.cfg.pillar_connection_mode;
 
-        const Pillar& pillar = m_builder.pillar(el.second); // actual pillar
+    // The model test interconnect() always made on a bar: clear for the bar's
+    // whole length, which is the pillar distance over cos(slope).
+    const double cos_slope = std::cos(-m_sm.cfg.bridge_slope);
+    BracingPlanner planner(pc, [this, cos_slope](const Vec3d &from, const Vec3d &to, double r) {
+        const double len = (Vec2d{to.x(), to.y()} - Vec2d{from.x(), from.y()}).norm() / cos_slope;
+        return bridge_mesh_distance(from, dirv(from, to), r) >= len;
+    });
 
-        // Get the max number of neighbors a pillar should connect to
-        unsigned neighbors = m_sm.cfg.pillar_cascade_neighbors;
+    // The pillars in the index are the ones bracing has always worked with.
+    // The rest (a head's own short pillar under a bar to a neighbour) are
+    // never braced, but stand in the way like every other pillar.
+    std::set<long> braceable;
+    m_pillar_index.foreach([&braceable](const PointIndexEl &el) {
+        braceable.insert(long(el.second));
+    });
 
-        // connections are already enough for the pillar
-        if(pillar.links >= neighbors) return;
-
-        double max_d = d * pillar.r_start / m_sm.cfg.head_back_radius_mm;
-        // Query all remaining points within reach
-        auto qres = m_pillar_index.query([qp, max_d](const PointIndexEl& e){
-            return distance(e.first, qp) < max_d;
-        });
-
-        // sort the result by distance (have to check if this is needed)
-        std::sort(qres.begin(), qres.end(),
-                  [qp](const PointIndexEl& e1, const PointIndexEl& e2){
-                      return distance(e1.first, qp) < distance(e2.first, qp);
-                  });
-
-        for(auto& re : qres) { // process the queried neighbors
-
-            if(re.second == el.second) continue; // Skip self
-
-            auto a = el.second, b = re.second;
-
-            // Get unique hash for the given pair (order doesn't matter)
-            auto hashval = pairhash(a, b);
-
-            // Search for the pair amongst the remembered pairs
-            if(pairs.find(hashval) != pairs.end()) continue;
-
-            const Pillar& neighborpillar = m_builder.pillar(re.second);
-
-            // this neighbor is occupied, skip
-            if (neighborpillar.links >= neighbors) continue;
-            if (neighborpillar.r_start < pillar.r_start) continue;
-
-            if(interconnect(pillar, neighborpillar)) {
-                pairs.insert(hashval);
-                // Bracing to a pillar carried in from an earlier generation is
-                // the whole point of additive support: report it, and report
-                // what it did to that pillar's link count.
-                note_prior_attachment(a);
-                note_prior_attachment(b);
-
-                // If the interconnection length between the two pillars is
-                // less than 50% of the longer pillar's height, don't count
-                if(pillar.height < H1 ||
-                    neighborpillar.height / pillar.height > min_height_ratio)
-                    m_builder.increment_links(pillar);
-
-                if(neighborpillar.height < H1 ||
-                    pillar.height / neighborpillar.height > min_height_ratio)
-                    m_builder.increment_links(neighborpillar);
-
-            }
-
-            // connections are enough for one pillar
-            if(pillar.links >= neighbors) break;
-        }
+    auto geom_of = [](const Pillar &p, bool can_brace) {
+        PillarGeom g;
+        g.id        = p.id;
+        g.xy        = {p.endpt.x(), p.endpt.y()};
+        g.foot_z    = p.endpt.z();
+        g.height    = p.height;
+        g.r         = p.r_start;
+        g.r_joint   = std::max(p.r_start, p.r_end);
+        g.links     = p.links;
+        g.pairs     = p.pairs;
+        g.frozen    = p.frozen;
+        g.braceable = can_brace;
+        return g;
     };
 
-    // Run the cascade for the pillars in the index. A frozen pillar is a
-    // neighbour, never a subject: cascading from it could add bracing that
-    // changes how the caller's existing support reads, which is exactly what
-    // an additive generation must not do. It can still be braced TO, because
-    // cascadefn queries the index and finds it.
-    m_pillar_index.foreach([this, &cascadefn](const PointIndexEl &el) {
-        if (!m_builder.pillar(el.second).frozen)
-            cascadefn(el);
-    });
+    for (const Pillar &p : m_builder.pillars())
+        planner.add_pillar(geom_of(p, braceable.count(p.id) > 0));
+
+    // Every bar that is already there - pins bridged to pillars, routes around
+    // the model - is in the way of the bracing, bar by bar in 3D.
+    for (const Bridge &b : m_builder.bridges())
+        planner.add_obstacle_bar({{b.startp, b.endp, b.r}, b.owner_a, b.owner_b});
+    for (const DiffBridge &b : m_builder.diffbridges())
+        planner.add_obstacle_bar({{b.startp, b.endp, std::max(b.r, b.end_r)},
+                                  b.owner_a, b.owner_b});
+    for (const Bridge &b : m_builder.crossbridges())
+        planner.add_truss_bar(b.owner_a, b.owner_b, {b.startp, b.endp, b.r});
+
+    // The planner keeps the counts as it decides; the builder follows it.
+    auto sync_counts = [this, &planner](long id) {
+        const PillarGeom &g = planner.pillar(id);
+        const Pillar     &p = m_builder.pillar(id);
+        while (p.links < g.links) m_builder.increment_links(p);
+        while (p.pairs < g.pairs) m_builder.increment_pairs(p);
+    };
+
+    auto lay = [this, &planner, &sync_counts](const Decision &d) {
+        if (d.reason != Reason::accepted) return false;
+        interconnect(planner.built()[size_t(d.truss)]);
+        sync_counts(d.edge.a);
+        sync_counts(d.edge.b);
+        // Bracing to a pillar carried in from an earlier generation is the
+        // whole point of additive support: report it, and what it did to that
+        // pillar's counts.
+        note_prior_attachment(d.edge.a);
+        note_prior_attachment(d.edge.b);
+        return true;
+    };
+
+    for (const Decision &d : planner.run_greedy()) lay(d);
+
+    // A tall pillar left with no link gets one more try, with the bars judged
+    // one by one in 3D instead of the plan rule between groups - before any
+    // prop is grown for it.
+    for (const Decision &d : planner.run_rescue()) lay(d);
 
     // We would be done here if we could allow some pillars to not be
     // connected with any neighbors. But this might leave the support tree
@@ -1098,11 +1304,41 @@ void DefaultSupportTree::interconnect_pillars()
     // lonely pillars. One or even two additional pillar might get inserted
     // depending on the length of the lonely pillar.
 
+    // Last of all, a tall pillar still without a link is braced to the
+    // nearest pillar that gives it one, even past the pair cap - whether or
+    // not props were grown.
+    auto safety_net = [&planner, &lay]() {
+        for (const Decision &d : planner.run_fallback()) lay(d);
+    };
+
     // Propping a lonely pillar is the engine deciding the user needs more
     // supports than they asked for. Where placement is the user's, it is not.
-    if (!m_sm.cfg.auxiliary_pillars) return;
+    if (!m_sm.cfg.auxiliary_pillars) {
+        safety_net();
+        return;
+    }
 
     size_t pillarcount = m_builder.pillarcount();
+
+    // An auxiliary pillar and its bar keep clear of the bars and heads
+    // committed before them, like every new pillar (openspec change
+    // sla-head-bridge-clearance, reverse C). It is not degraded: a place that
+    // is not clear is no place for it, like one it could not be braced from.
+    const clearance::PillarAxisFn axis_of = [this](long id) { return pillar_axis(id); };
+    auto clear_of_tree = [this, &axis_of](const std::vector<clearance::Prim> &prims) {
+        return m_clearance.violations(prims, clearance::SAFETY_CLEARANCE, axis_of).empty();
+    };
+    // Two props of one pillar, both still to be placed: the only pillar they
+    // can share is that one, which is built.
+    auto clear_of_each_other = [&axis_of](const std::vector<clearance::Prim> &x,
+                                          const std::vector<clearance::Prim> &y) {
+        clearance::Contact ct;
+        for (const clearance::Prim &px : x)
+            for (const clearance::Prim &py : y)
+                if (clearance::pair_contact(px, py, clearance::SAFETY_CLEARANCE, axis_of, ct))
+                    return false;
+        return true;
+    };
 
     // Again, go through all pillars, this time in the whole support tree
     // not just the index.
@@ -1142,10 +1378,33 @@ void DefaultSupportTree::interconnect_pillars()
         // A vector of bool for placement feasbility
         std::vector<bool>  canplace(needpillars, false);
         std::vector<Vec3d> spts(needpillars); // vector of starting points
+        // Whether the model leaves room for the bar to each prop (asked once
+        // per place), and what each prop would add, at the angle being tried.
+        std::vector<bool>  with_bar(needpillars, false);
+        std::vector<std::vector<clearance::Prim>> cand_prims(needpillars);
 
         double gnd      = ground_level(m_sm);
         double min_dist = m_sm.cfg.pillar_base_safety_distance_mm +
                           m_sm.cfg.base_radius_mm + EPSILON;
+
+        // A prop standing at s, under the id it will get, and the bar it gets
+        // from this pillar's top when the model leaves room for one.
+        auto prop_prims = [&](const Vec3d &s, long prop_id, bool bar_too) {
+            std::vector<clearance::Prim> out(1);
+            out[0].cap = clearance::pillar_capsule(Vec3d{s.x(), s.y(), gnd}, s.z() - gnd,
+                                                   pillar().r_start, pillar().r_start);
+            out[0].kind     = clearance::PrimKind::pillar;
+            out[0].pillar_a = prop_id;
+            if (bar_too) {
+                clearance::Prim bar;
+                bar.cap      = clearance::bar_capsule(pillarsp, s, pillar().r_start);
+                bar.kind     = clearance::PrimKind::prop_bar;
+                bar.pillar_a = pillar().id;
+                bar.pillar_b = prop_id;
+                out.push_back(bar);
+            }
+            return out;
+        };
 
         while(!found && alpha < 2*PI) {
             for (unsigned n = 0;
@@ -1167,6 +1426,29 @@ void DefaultSupportTree::interconnect_pillars()
                 canplace[n] = std::isinf(hr.distance()) &&
                               std::sqrt(m_sm.emesh.squared_distance(gndsp)) >
                                   min_dist;
+
+                // Nor is a place where the prop or its bar would come too
+                // close to what is built, or to the props before it at this
+                // angle.
+                if (canplace[n]) {
+                    with_bar[n] = distance(pillarsp, s) <
+                                  bridge_mesh_distance(pillarsp, dirv(pillarsp, s),
+                                                       pillar().r_start);
+                    cand_prims[n] = prop_prims(s, long(m_builder.pillarcount() + n),
+                                               with_bar[n]);
+                    canplace[n] = clear_of_tree(cand_prims[n]);
+                    for (unsigned k = 0; canplace[n] && k < n; ++k)
+                        canplace[n] = clear_of_each_other(cand_prims[n], cand_prims[k]);
+                }
+
+                // A place the prop could stand but not be braced from is no
+                // place for it: the next angle may be both.
+                if (canplace[n]) {
+                    PillarGeom prop = geom_of(Pillar(gndsp, s.z() - gnd, pillar().r_start), true);
+                    prop.id = long(m_builder.pillarcount() + n);
+                    canplace[n] = planner.try_attach(pillar().id, prop).reason ==
+                                  Reason::accepted;
+                }
             }
 
             found = std::all_of(canplace.begin(), canplace.end(),
@@ -1184,60 +1466,83 @@ void DefaultSupportTree::interconnect_pillars()
                 Vec3d s = spts[n];
                 Pillar p(Vec3d{s.x(), s.y(), gnd}, s.z() - gnd, pillar().r_start);
 
-                // The bracing is made against a pillar that does not exist yet:
-                // interconnect() is the test for whether this prop can be placed
-                // at all, and only a prop that passes is added. So the bars it
-                // makes have no id at that end until the pillar has one.
-                const size_t first_cross = m_builder.crossbridgecount();
+                // Whether this prop can be braced to its pillar is asked
+                // before it exists: only a prop that can is added. It is asked
+                // under the id it will get, so the pair is the same one
+                // attach() then builds.
+                // So is its clearance: a prop placed before it is in the way
+                // now.
+                PillarGeom prop = geom_of(p, true);
+                prop.id = long(m_builder.pillarcount());
+                if (!clear_of_tree(prop_prims(s, prop.id, with_bar[n])) ||
+                    planner.try_attach(pillar().id, prop).reason != Reason::accepted)
+                    continue;
 
-                if (interconnect(pillar(), p)) {
-                    Pillar &pp = m_builder.pillar(m_builder.add_pillar(p));
+                Pillar &pp = m_builder.pillar(m_builder.add_pillar(p));
+                assert(pp.id == prop.id);
+                planner.add_pillar(geom_of(pp, true));
 
-                    m_builder.own_crossbridges_from(first_cross, pp.id);
+                // An auxiliary pillar carries no head, so this is the only
+                // thing that says which support it belongs to.
+                pp.props_for = pillar().id;
 
-                    // An auxiliary pillar carries no head, so this is the only
-                    // thing that says which support it belongs to.
-                    pp.props_for = pillar().id;
+                const Decision braced = planner.attach(pillar().id, pp.id);
+                assert(braced.reason == Reason::accepted);
+                lay(braced);
 
-                    add_pillar_base(pp.id);
+                add_pillar_base(pp.id);
 
-                    m_pillar_index.insert(pp.endpoint(), unsigned(pp.id));
+                clearance::Prim prop_prim;
+                prop_prim.cap      = clearance::pillar_capsule(pp.endpt, pp.height, pp.r_start,
+                                                               pp.r_end);
+                prop_prim.kind     = clearance::PrimKind::pillar;
+                prop_prim.pillar_a = pp.id;
+                m_clearance.insert(prop_prim);
 
-                    size_t first_junction = m_builder.junctioncount();
-                    m_builder.add_junction(s, pillar().r_start);
-                    m_builder.own_junctions_from(first_junction, pp.id);
-                    double t = bridge_mesh_distance(pillarsp, dirv(pillarsp, s),
-                                                    pillar().r_start);
-                    if (distance(pillarsp, s) < t)
+                m_pillar_index.insert(pp.endpoint(), unsigned(pp.id));
+
+                size_t first_junction = m_builder.junctioncount();
+                m_builder.add_junction(s, pillar().r_start);
+                m_builder.own_junctions_from(first_junction, pp.id);
+                if (with_bar[n]) {
+                    const Bridge prop_bar =
                         m_builder.add_bridge_between(pp.id, pillarsp, s,
-                                                     pillar().r_start, pillar().id);
-
-                    if (pillar().endpoint().z() > ground_level(m_sm) + pillar().r_start) {
-                        first_junction = m_builder.junctioncount();
-                        m_builder.add_junction(pillar().endpoint(), pillar().r_start);
-                        m_builder.own_junctions_from(first_junction, pillar().id);
-                    }
-
-                    newpills.emplace_back(pp.id);
-                    m_builder.increment_links(pillar());
-                    m_builder.increment_links(pp);
+                                                     pillar().r_start, BridgeKind::prop,
+                                                     pillar().id);
+                    // Later bracing has to keep clear of it like of any bar,
+                    // and later props too.
+                    planner.add_obstacle_bar({{prop_bar.startp, prop_bar.endp, prop_bar.r},
+                                              prop_bar.owner_a, prop_bar.owner_b});
+                    clearance::Prim bar;
+                    bar.cap      = clearance::bar_capsule(prop_bar.startp, prop_bar.endp,
+                                                          prop_bar.r);
+                    bar.kind     = clearance::PrimKind::prop_bar;
+                    bar.pillar_a = prop_bar.owner_a;
+                    bar.pillar_b = prop_bar.owner_b;
+                    m_clearance.insert(bar);
                 }
+
+                if (pillar().endpoint().z() > ground_level(m_sm) + pillar().r_start) {
+                    first_junction = m_builder.junctioncount();
+                    m_builder.add_junction(pillar().endpoint(), pillar().r_start);
+                    m_builder.own_junctions_from(first_junction, pillar().id);
+                }
+
+                newpills.emplace_back(pp.id);
             }
 
         if(!newpills.empty()) {
             for(auto it = newpills.begin(), nx = std::next(it);
-                 nx != newpills.end(); ++it, ++nx) {
-                const Pillar& itpll = m_builder.pillar(*it);
-                const Pillar& nxpll = m_builder.pillar(*nx);
-                if(interconnect(itpll, nxpll)) {
-                    m_builder.increment_links(itpll);
-                    m_builder.increment_links(nxpll);
-                }
-            }
+                 nx != newpills.end(); ++it, ++nx)
+                lay(planner.attach(*it, *nx));
 
-            m_pillar_index.foreach(cascadefn);
+            // Only the new props are run again: a frozen pillar never asks,
+            // and the pillars that were here already have had their turn.
+            for (const Decision &d : planner.run_greedy_for(newpills)) lay(d);
         }
     }
+
+    safety_net();
 }
 
 }} // namespace Slic3r::sla

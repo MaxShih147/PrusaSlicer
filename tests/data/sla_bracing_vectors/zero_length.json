@@ -1,0 +1,20 @@
+{
+  "id": "zero_length",
+  "description": "Pillar 1 stands on the model right above pillar 0: a zero-length candidate is too_close; the two hug, so 1-2 leaves the cluster along 0-2 and is refused by angle.",
+  "cfg": {"safety_clearance":0.2,"min_shared_angle_deg":20,"pair_cap":3,"max_link_distance":10,"min_pillar_distance":1,"rescue_height":15,"bridge_slope_deg":45,"ground_z":0,"base_height":1,"base_radius":2,"connection_mode":"dynamic"},
+  "pillars": [
+    {"id":0,"endpoint":[0,0,0.0],"height":14,"r":0.5,"links":0,"pairs":0,"frozen":false},
+    {"id":1,"endpoint":[0,0,15],"height":5,"r":0.5,"links":0,"pairs":0,"frozen":false},
+    {"id":2,"endpoint":[5,0,0.0],"height":14,"r":0.5,"links":0,"pairs":0,"frozen":false}
+  ],
+  "bars": [],
+  "expect": {
+    "accepted": [
+      {"phase":"greedy","pair":[0,2],"bars_built":4}
+    ],
+    "rejected": [
+      {"phase":"greedy","pair":[0,1],"reason":"too_close"},
+      {"phase":"greedy","pair":[1,2],"reason":"shared_angle"}
+    ]
+  }
+}
